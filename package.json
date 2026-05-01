@@ -15,7 +15,8 @@
     "e2e": "tsx src/e2e/cli.ts",
     "prepare-samples": "bash scripts/prepare-samples.sh",
     "compile-contracts": "cd contracts && npm install --no-audit --no-fund && OPTIMIZER_RUNS=${OPTIMIZER_RUNS:-10} npx hardhat compile",
-    "smoke-llm": "tsx scripts/smoke-llm.ts"
+    "smoke-llm": "tsx scripts/smoke-llm.ts",
+    "test:vrf": "tsx src/scripts/test-vrf-proof.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.9.7",

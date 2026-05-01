@@ -14,6 +14,7 @@ import { ContentServiceClient } from "../shared/content-client.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { DOMAIN_RESEARCH, RequestStatus } from "../shared/types.js";
 import { CoreEventStream } from "../reviewer-agent/chain/events.js";
+import { makeSecp256k1VrfProvider } from "../reviewer-agent/chain/vrfProof.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(here, "../..");
@@ -122,6 +123,7 @@ function spawnAgent(opts: {
   reviewElectionDifficulty: bigint;
   auditElectionDifficulty: bigint;
   auditTargetLimit: bigint;
+  vrfPrivkey: string;
 }): ChildProcess {
   const child = spawn(
     "npx",
@@ -152,6 +154,8 @@ function spawnAgent(opts: {
       opts.auditElectionDifficulty.toString(),
       "--audit-target-limit",
       opts.auditTargetLimit.toString(),
+      "--vrf-privkey",
+      opts.vrfPrivkey,
     ],
     {
       cwd: ROOT,
@@ -272,6 +276,7 @@ async function main(): Promise<RunResult> {
   const treasuryKey = HARDHAT_PRIV_KEYS[1]!;
   const requesterKey = HARDHAT_PRIV_KEYS[2]!;
   const candidateKeys = HARDHAT_PRIV_KEYS.slice(3);
+  const candidateVrfKeys = candidateKeys.map((_, i) => `0x${BigInt(i + 1).toString(16).padStart(64, "0")}`);
 
   // 2. Deploy
   const deployment = await deployAll({
@@ -305,10 +310,7 @@ async function main(): Promise<RunResult> {
   const ownerWallet = new Wallet(ownerKey, provider);
   const ownerManaged = new NonceManager(ownerWallet);
   const handles = loadContracts(deployment, ownerManaged);
-  if (!deployment.vrfPublicKey || !deployment.vrfProof) {
-    throw new Error("E2E deployment must include mock vrfPublicKey and vrfProof");
-  }
-  const vrfPubKey: [bigint, bigint] = [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])];
+  const candidateVrfProviders = candidateVrfKeys.map((key) => makeSecp256k1VrfProvider(key, provider));
   const reviewerStake = parseEther(String(1000 * Math.max(1, E2E_MAX_ACTIVE_REQUESTS)));
 
   for (let i = 0; i < candidateKeys.length; i++) {
@@ -318,7 +320,7 @@ async function main(): Promise<RunResult> {
       ensName,
       agentId: BigInt(1001 + i),
       domainMask: DOMAIN_RESEARCH,
-      vrfPublicKey: vrfPubKey,
+      vrfPublicKey: candidateVrfProviders[i]!.publicKey,
       stakeAmount: reviewerStake,
     });
   }
@@ -394,13 +396,7 @@ async function main(): Promise<RunResult> {
     requests[i]!.predictedReviewPhaseStartBlock = lastCreateBlock + BigInt(i + 1);
   }
 
-  // 7. Prescreen for a passing committee
-  const proof: [bigint, bigint, bigint, bigint] = [
-    BigInt(deployment.vrfProof[0]),
-    BigInt(deployment.vrfProof[1]),
-    BigInt(deployment.vrfProof[2]),
-    BigInt(deployment.vrfProof[3]),
-  ];
+  // 7. Prescreen for a passing committee using real VRF proofs.
   const lifecycles = await Promise.all(requests.map((req) => handles.core.getRequestLifecycle(req.requestId)));
   const primaryRequest = requests[0]!;
   const primaryLifecycle = lifecycles[0]!;
@@ -410,8 +406,7 @@ async function main(): Promise<RunResult> {
   const prescreen = await preScreenCommittee({
     handles,
     candidateKeys,
-    publicKey: vrfPubKey,
-    proof,
+    vrfProviders: candidateVrfProviders,
     finalityFactor: 2n,
     reviewElectionDifficulty: E2E_REVIEW_VRF_DIFFICULTY,
     auditElectionDifficulty: E2E_AUDIT_VRF_DIFFICULTY,
@@ -467,6 +462,7 @@ async function main(): Promise<RunResult> {
       reviewElectionDifficulty: E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY,
       auditElectionDifficulty: E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY,
       auditTargetLimit: E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT,
+      vrfPrivkey: candidateVrfKeys[idx]!,
     });
     agentChildren.push(child);
     process.stdout.write(`[orchestrate] spawned agent R${i + 1} for ${wallet.address}\n`);

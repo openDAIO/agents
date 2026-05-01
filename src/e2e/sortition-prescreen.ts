@@ -2,12 +2,14 @@ import { Wallet, type JsonRpcProvider } from "ethers";
 import { sortitionPass } from "../reviewer-agent/chain/sortition.js";
 import { REVIEW_SORTITION, AUDIT_SORTITION } from "../shared/types.js";
 import type { ContractHandles } from "../reviewer-agent/chain/contracts.js";
+import type { VrfProofProvider } from "../reviewer-agent/chain/vrfProof.js";
+
+const SCALE = 10000n;
 
 export interface PreScreenInput {
   handles: ContractHandles;
   candidateKeys: string[]; // private keys of registered reviewers
-  publicKey: [bigint, bigint];
-  proof: [bigint, bigint, bigint, bigint];
+  vrfProviders: VrfProofProvider[];
   finalityFactor: bigint;
   reviewElectionDifficulty: bigint;
   auditElectionDifficulty: bigint;
@@ -52,6 +54,9 @@ function* combinations(values: number[], size: number, start = 0, picked: number
 // sortition, and those revealed reviewers can also satisfy audit quorum.
 export async function preScreenCommittee(input: PreScreenInput): Promise<PreScreenResult> {
   const wallets = input.candidateKeys.map((k) => new Wallet(k));
+  if (input.vrfProviders.length !== wallets.length) {
+    throw new Error("prescreen: vrfProviders length must match candidateKeys length");
+  }
   const coreAddress = await input.handles.core.getAddress();
   const requests = [
     {
@@ -74,14 +79,25 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
   const reviewCache = new Map<string, boolean>();
   const auditCache = new Map<string, boolean>();
 
-  const reviewPass = async (addr: string, req: (typeof requests)[number]): Promise<boolean> => {
+  const reviewPass = async (idx: number, req: (typeof requests)[number]): Promise<boolean> => {
+    const addr = wallets[idx]!.address;
     const key = `${req.requestId}|${req.reviewPhaseStartBlock}|${req.committeeEpoch}|${addr}`;
     if (reviewCache.has(key)) return reviewCache.get(key)!;
+    const vrf = input.vrfProviders[idx]!;
+    const proof = await vrf.proofFor({
+      coreAddress,
+      requestId: req.requestId,
+      phase: REVIEW_SORTITION,
+      epoch: req.committeeEpoch,
+      participant: addr,
+      phaseStartBlock: req.reviewPhaseStartBlock,
+      finalityFactor: input.finalityFactor,
+    });
     const ok = await sortitionPass({
       vrfCoordinator: input.handles.vrfCoordinator,
       coreAddress,
-      publicKey: input.publicKey,
-      proof: input.proof,
+      publicKey: vrf.publicKey,
+      proof,
       requestId: req.requestId,
       phase: REVIEW_SORTITION,
       epoch: req.committeeEpoch,
@@ -94,15 +110,39 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
     return ok;
   };
 
-  const auditPass = async (auditor: string, target: string, req: (typeof requests)[number]): Promise<boolean> => {
+  const auditPass = async (auditorIdx: number, targetIdx: number, req: (typeof requests)[number]): Promise<boolean> => {
+    const auditor = wallets[auditorIdx]!.address;
+    const target = wallets[targetIdx]!.address;
     const auditPhaseStartBlock = req.reviewPhaseStartBlock + req.auditPhaseStartBlockOffset;
     const key = `${req.requestId}|${auditPhaseStartBlock}|${req.auditEpoch}|${auditor}|${target}`;
     if (auditCache.has(key)) return auditCache.get(key)!;
+    if (input.auditElectionDifficulty >= SCALE) {
+      auditCache.set(key, true);
+      return true;
+    }
+    const auditStableBlock = auditPhaseStartBlock > input.finalityFactor ? auditPhaseStartBlock - input.finalityFactor : 0n;
+    const currentBlock = BigInt(await input.provider.getBlockNumber());
+    if (auditStableBlock > currentBlock) {
+      throw new Error(
+        `prescreen: cannot evaluate future audit VRF block ${auditStableBlock}; use audit difficulty ${SCALE} or prescreen after the stable block exists`,
+      );
+    }
+    const vrf = input.vrfProviders[auditorIdx]!;
+    const proof = await vrf.proofFor({
+      coreAddress,
+      requestId: req.requestId,
+      phase: AUDIT_SORTITION,
+      epoch: req.auditEpoch,
+      participant: auditor,
+      target,
+      phaseStartBlock: auditPhaseStartBlock,
+      finalityFactor: input.finalityFactor,
+    });
     const ok = await sortitionPass({
       vrfCoordinator: input.handles.vrfCoordinator,
       coreAddress,
-      publicKey: input.publicKey,
-      proof: input.proof,
+      publicKey: vrf.publicKey,
+      proof,
       requestId: req.requestId,
       phase: AUDIT_SORTITION,
       epoch: req.auditEpoch,
@@ -124,7 +164,7 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
     for (const req of requests) {
       const reviewPassIndexes: number[] = [];
       for (const idx of combo) {
-        if (await reviewPass(wallets[idx]!.address, req)) reviewPassIndexes.push(idx);
+        if (await reviewPass(idx, req)) reviewPassIndexes.push(idx);
       }
       if (reviewPassIndexes.length < input.quorum) {
         satisfiesAllRequests = false;
@@ -136,7 +176,7 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
         let selectedTargets = 0;
         for (const targetIdx of reviewPassIndexes) {
           if (auditorIdx === targetIdx) continue;
-          if (await auditPass(wallets[auditorIdx]!.address, wallets[targetIdx]!.address, req)) selectedTargets++;
+          if (await auditPass(auditorIdx, targetIdx, req)) selectedTargets++;
         }
         if (selectedTargets < reviewPassIndexes.length - 1 || selectedTargets < requiredAuditTargets) {
           completeAuditGraph = false;

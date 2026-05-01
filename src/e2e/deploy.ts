@@ -8,7 +8,6 @@ import {
 } from "ethers";
 import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
-import { decodeVRFTestVector } from "../reviewer-agent/chain/vrf.js";
 
 const FAST = 0;
 const STANDARD = 1;
@@ -103,7 +102,7 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   const commitReveal = await deploy(owner, Artifacts.DAIOCommitRevealManager(), []);
   const priorityQueue = await deploy(owner, Artifacts.DAIOPriorityQueue(), []);
   const vrfVerifier = await deploy(owner, Artifacts.FRAINVRFVerifier(), []);
-  const vrfCoordinator = await deploy(owner, Artifacts.MockVRFCoordinator(), []);
+  const vrfCoordinator = await deploy(owner, Artifacts.DAIOVRFCoordinator(), [vrfVerifier.address]);
   const core = await deploy(owner, Artifacts.DAIOCore(), [
     treasury.address,
     commitReveal.address,
@@ -244,7 +243,6 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   const requesterFunds = parseEther("1000");
   await (await tok.mint(requester.address, requesterFunds)).wait();
 
-  const vrf = await decodeVRFTestVector(vrfVerifier.contract);
   const network = await input.provider.getNetwork();
 
   return {
@@ -278,12 +276,5 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     reviewerKeys: input.reviewerKeys,
     ownerKey: input.ownerKey,
     requesterKey: input.requesterKey,
-    vrfPublicKey: [vrf.publicKey[0].toString(), vrf.publicKey[1].toString()],
-    vrfProof: [
-      vrf.proof[0].toString(),
-      vrf.proof[1].toString(),
-      vrf.proof[2].toString(),
-      vrf.proof[3].toString(),
-    ],
   };
 }

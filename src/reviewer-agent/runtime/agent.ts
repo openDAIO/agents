@@ -28,6 +28,37 @@ function formatError(err: unknown): string {
   return String(err);
 }
 
+function deepErrorText(err: unknown): string {
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+  const visit = (value: unknown): void => {
+    if (value === null || value === undefined || seen.has(value)) return;
+    seen.add(value);
+    if (typeof value === "string") {
+      parts.push(value);
+      return;
+    }
+    if (typeof value !== "object") return;
+    const obj = value as Record<string, unknown>;
+    for (const key of ["code", "errorName", "shortMessage", "message", "reason", "data", "info", "error", "revert"]) {
+      visit(obj[key]);
+    }
+  };
+  visit(err);
+  return parts.join(" ");
+}
+
+function nonceError(err: unknown): boolean {
+  const shaped = err as { code?: string };
+  const text = deepErrorText(err);
+  return (
+    shaped.code === "NONCE_EXPIRED" ||
+    text.includes("Nonce too low") ||
+    text.includes("Nonce too high") ||
+    text.includes("nonce has already been used")
+  );
+}
+
 function expectedQueueStartError(err: unknown): boolean {
   const shaped = err as {
     errorName?: string;
@@ -36,12 +67,13 @@ function expectedQueueStartError(err: unknown): boolean {
     revert?: { name?: string };
   };
   const name = shaped.errorName ?? shaped.revert?.name ?? "";
-  const message = shaped.shortMessage ?? shaped.message ?? String(err);
+  const message = `${shaped.shortMessage ?? ""} ${deepErrorText(err)}`;
   return (
     name === "QueueEmpty" ||
     name === "BadConfig" ||
     message.includes("QueueEmpty") ||
-    message.includes("BadConfig")
+    message.includes("BadConfig") ||
+    message.includes("TooManyActiveRequests")
   );
 }
 
@@ -69,6 +101,24 @@ export class ReviewerAgent {
 
   private log(msg: string): void {
     process.stdout.write(`[agent ${this.cfg.label} ${this.wallet.address.slice(0, 10)}] ${msg}\n`);
+  }
+
+  private async queuedTx<T>(task: () => Promise<T>): Promise<T> {
+    return this.txQueue.run(async () => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        this.txSigner.reset();
+        try {
+          return await task();
+        } catch (err) {
+          lastErr = err;
+          if (!nonceError(err) || attempt === 2) throw err;
+          this.log(`tx nonce retry ${attempt + 1}/2: ${formatError(err)}`);
+          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+      throw lastErr;
+    });
   }
 
   private async recordStatus(
@@ -202,7 +252,7 @@ export class ReviewerAgent {
       }
 
       try {
-        const receipt = await this.txQueue.run(async () => {
+        const receipt = await this.queuedTx(async () => {
           const tx = await core.startNextRequest();
           return tx.wait();
         });
@@ -233,7 +283,7 @@ export class ReviewerAgent {
       publicKey: this.cfg.publicKey,
       proof: this.cfg.proof,
       log: (m) => this.log(m),
-      txQueue: (task) => this.txQueue.run(task),
+      txQueue: (task) => this.queuedTx(task),
     };
     const auditDeps: AuditFlowDeps = reviewDeps;
 

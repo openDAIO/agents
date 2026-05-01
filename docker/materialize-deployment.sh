@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+GENERATED_DEPLOYMENT_DIR="${GENERATED_DEPLOYMENT_DIR:-/app/generated-deployments}"
+MOUNTED_DEPLOYMENT_DIR="${MOUNTED_DEPLOYMENT_DIR:-/app/deployments}"
+mkdir -p "$GENERATED_DEPLOYMENT_DIR"
+
+if [ -n "${DAIO_DEPLOYMENT_JSON_B64:-}" ]; then
+  DAIO_DEPLOYMENT_PATH="$GENERATED_DEPLOYMENT_DIR/env.json"
+  printf '%s' "$DAIO_DEPLOYMENT_JSON_B64" | base64 -d > "$DAIO_DEPLOYMENT_PATH"
+elif [ -n "${DAIO_DEPLOYMENT_JSON:-}" ]; then
+  DAIO_DEPLOYMENT_PATH="$GENERATED_DEPLOYMENT_DIR/env.json"
+  printf '%s' "$DAIO_DEPLOYMENT_JSON" > "$DAIO_DEPLOYMENT_PATH"
+else
+  DAIO_DEPLOYMENT_FILE="${DAIO_DEPLOYMENT_FILE:-sepolia.json}"
+  DAIO_DEPLOYMENT_PATH="${DAIO_DEPLOYMENT_PATH:-$MOUNTED_DEPLOYMENT_DIR/$DAIO_DEPLOYMENT_FILE}"
+fi
+
+if [ ! -f "$DAIO_DEPLOYMENT_PATH" ]; then
+  echo "deployment snapshot not found: $DAIO_DEPLOYMENT_PATH" >&2
+  echo "Set DAIO_DEPLOYMENT_JSON_B64 in .env, or place the file under ./.deployments and set DAIO_DEPLOYMENT_FILE." >&2
+  exit 1
+fi
+
+export DAIO_DEPLOYMENT_PATH

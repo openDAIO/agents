@@ -346,6 +346,8 @@ npm run agent -- --rpc … --privkey … …    # reviewer-agent alone
 npm run typecheck                         # tsc --noEmit
 ```
 
+Production-style Docker Compose setup is documented in [DOCKER.md](DOCKER.md). It runs the content API, five reviewer agents, and a MarkItDown conversion API from one `.env`.
+
 Manual probes during a run:
 
 ```bash

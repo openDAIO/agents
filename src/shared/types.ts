@@ -37,6 +37,7 @@ export interface DeploymentSnapshot {
     consensusScoring: string;
     settlement: string;
     reputationLedger: string;
+    roundLedger: string;
     commitReveal: string;
     priorityQueue: string;
     vrfCoordinator: string;

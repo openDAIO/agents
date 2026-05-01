@@ -8,6 +8,8 @@ export interface ReviewState {
   reportURI: string;
   resultHash: string;
   seed: string;
+  accepted?: boolean;
+  notAcceptedReason?: string;
   commitTx?: string;
   revealTx?: string;
 }
@@ -15,8 +17,13 @@ export interface ReviewState {
 export interface AuditState {
   targets: string[];
   scores: number[];
+  rationales?: string[];
+  auditHash?: string;
+  auditURI?: string;
   resultHash: string;
   seed: string;
+  accepted?: boolean;
+  notAcceptedReason?: string;
   commitTx?: string;
   revealTx?: string;
 }

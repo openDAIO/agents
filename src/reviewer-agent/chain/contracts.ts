@@ -14,6 +14,8 @@ export interface ContractHandles {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   assignmentManager: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  roundLedger: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   commitReveal: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   vrfCoordinator: any;
@@ -40,6 +42,11 @@ export function loadContracts(d: DeploymentSnapshot, runner: ContractRunner): Co
     assignmentManager: new Contract(
       d.contracts.assignmentManager,
       Artifacts.AssignmentManager().abi as never[],
+      runner,
+    ),
+    roundLedger: new Contract(
+      d.contracts.roundLedger,
+      Artifacts.DAIORoundLedger().abi as never[],
       runner,
     ),
     commitReveal: new Contract(

@@ -4,12 +4,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { JsonRpcProvider, NonceManager, Wallet, id, parseEther } from "ethers";
+import { JsonRpcProvider, NonceManager, Wallet, id, keccak256, parseEther, toUtf8Bytes } from "ethers";
 import { startHardhatNode, HARDHAT_PRIV_KEYS } from "./hardhat.js";
 import { deployAll } from "./deploy.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
 import { registerReviewerIfNeeded } from "../reviewer-agent/chain/registration.js";
-import { preScreenTriple } from "./sortition-prescreen.js";
+import { preScreenCommittee } from "./sortition-prescreen.js";
 import { ContentServiceClient } from "../shared/content-client.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { DOMAIN_RESEARCH, RequestStatus } from "../shared/types.js";
@@ -19,6 +19,17 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(here, "../..");
 
 const FAST = 0;
+const E2E_AGENT_COUNT = 5;
+const E2E_QUORUM = 3;
+const E2E_REVIEW_VRF_DIFFICULTY = 8000n;
+const E2E_AUDIT_VRF_DIFFICULTY = 10000n;
+const E2E_AUDIT_TARGET_LIMIT = 2n;
+const E2E_AUDIT_PHASE_START_BLOCK_OFFSET = 6n;
+const E2E_LLM_TIMEOUT_MS = "300000";
+const E2E_LLM_MAX_TOKENS = "2048";
+const E2E_LLM_PROPOSAL_CHAR_BUDGET = "16000";
+const E2E_MAX_ACTIVE_REQUESTS = Number(process.env.E2E_MAX_ACTIVE_REQUESTS ?? process.env.DAIO_MAX_ACTIVE_REQUESTS ?? "2");
+const E2E_REQUEST_COUNT = Number(process.env.E2E_REQUEST_COUNT ?? "2");
 
 interface RunResult {
   ok: boolean;
@@ -91,6 +102,9 @@ function spawnAgent(opts: {
   agentId: bigint;
   ensName: string;
   label: string;
+  reviewElectionDifficulty: bigint;
+  auditElectionDifficulty: bigint;
+  auditTargetLimit: bigint;
 }): ChildProcess {
   const child = spawn(
     "npx",
@@ -115,11 +129,22 @@ function spawnAgent(opts: {
       opts.agentId.toString(),
       "--ens-name",
       opts.ensName,
+      "--review-election-difficulty",
+      opts.reviewElectionDifficulty.toString(),
+      "--audit-election-difficulty",
+      opts.auditElectionDifficulty.toString(),
+      "--audit-target-limit",
+      opts.auditTargetLimit.toString(),
     ],
     {
       cwd: ROOT,
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: {
+        ...process.env,
+        LLM_TIMEOUT_MS: process.env.E2E_LLM_TIMEOUT_MS ?? E2E_LLM_TIMEOUT_MS,
+        LLM_MAX_TOKENS: process.env.E2E_LLM_MAX_TOKENS ?? E2E_LLM_MAX_TOKENS,
+        LLM_PROPOSAL_CHAR_BUDGET: process.env.E2E_LLM_PROPOSAL_CHAR_BUDGET ?? E2E_LLM_PROPOSAL_CHAR_BUDGET,
+      },
     },
   );
   child.stdout!.on("data", (b: Buffer) => process.stdout.write(b));
@@ -156,7 +181,45 @@ async function awaitFinalized(
   });
 }
 
+async function startQueuedRequests(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  core: any,
+  maxToPop: number,
+): Promise<Array<{ txHash: string; blockNumber: number }>> {
+  const started: Array<{ txHash: string; blockNumber: number }> = [];
+  let attempts = Math.max(0, maxToPop);
+  try {
+    const maxActive = (await core.maxActiveRequests()) as bigint;
+    attempts = Math.min(attempts, Number(maxActive > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : maxActive));
+    process.stdout.write(
+      `[orchestrate] active window: max=${maxActive} requestedPop=${maxToPop}\n`,
+    );
+  } catch (_err) {
+    process.stdout.write(`[orchestrate] active window views unavailable; falling back to requestedPop=${maxToPop}\n`);
+  }
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await core.startNextRequest.staticCall();
+      const tx = await core.startNextRequest();
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) throw new Error(`startNextRequest failed: ${receipt?.hash ?? "unknown tx"}`);
+      started.push({ txHash: receipt.hash, blockNumber: receipt.blockNumber });
+    } catch (err) {
+      const message = String((err as Error).message ?? err);
+      if (message.includes("QueueEmpty") || message.includes("TooManyActiveRequests") || message.includes("BadConfig")) break;
+      throw err;
+    }
+  }
+  return started;
+}
+
 async function main(): Promise<RunResult> {
+  if (!Number.isInteger(E2E_MAX_ACTIVE_REQUESTS) || E2E_MAX_ACTIVE_REQUESTS < 0) {
+    throw new Error("E2E_MAX_ACTIVE_REQUESTS must be a non-negative integer");
+  }
+  if (!Number.isInteger(E2E_REQUEST_COUNT) || E2E_REQUEST_COUNT <= 0) {
+    throw new Error("E2E_REQUEST_COUNT must be a positive integer");
+  }
   process.stdout.write(`[orchestrate] starting E2E\n`);
 
   // 1. Hardhat node
@@ -164,11 +227,13 @@ async function main(): Promise<RunResult> {
   process.stdout.write(`[orchestrate] hardhat ready at ${node.rpcUrl}\n`);
 
   const provider = new JsonRpcProvider(node.rpcUrl, undefined, { staticNetwork: true });
-  // signers: 0=owner, 1=treasury, 2=requester, 3..12 candidate reviewers
+  // signers: 0=owner, 1=treasury, 2=requester, 3.. candidate reviewers.
+  // Register the full local candidate pool, then spawn the deterministic 5-agent
+  // committee that satisfies quorum=3 under 60% review/audit sortition.
   const ownerKey = HARDHAT_PRIV_KEYS[0]!;
   const treasuryKey = HARDHAT_PRIV_KEYS[1]!;
   const requesterKey = HARDHAT_PRIV_KEYS[2]!;
-  const candidateKeys = HARDHAT_PRIV_KEYS.slice(3, 13); // 10 candidates
+  const candidateKeys = HARDHAT_PRIV_KEYS.slice(3);
 
   // 2. Deploy
   const deployment = await deployAll({
@@ -189,22 +254,21 @@ async function main(): Promise<RunResult> {
   const contentClient = new ContentServiceClient(content.baseUrl);
   process.stdout.write(`[orchestrate] content-service ready at ${content.baseUrl}\n`);
 
-  // 4. Upload sample paper
+  // 4. Prepare sample paper. The document is uploaded only after the on-chain
+  // request tx is verified by the content API.
   const samplePath = path.join(ROOT, "samples", "paper-001.md");
   const paperText = readFileSync(samplePath, "utf8");
-  const proposal = await contentClient.putProposal({
-    id: "paper-001",
-    text: paperText,
-    mimeType: "text/markdown",
-  });
-  process.stdout.write(
-    `[orchestrate] proposal uploaded: ${proposal.uri} hash=${proposal.hash} bytes=${paperText.length}\n`,
-  );
+  const proposalId = "paper-001";
+  const proposalURI = `content://proposals/${proposalId}`;
+  const proposalHash = keccak256(toUtf8Bytes(paperText));
+  process.stdout.write(`[orchestrate] proposal prepared: ${proposalURI} hash=${proposalHash} bytes=${paperText.length}\n`);
 
-  // 5. Register all 10 candidate reviewers (orchestrator pre-registers; agents won't need to)
+  // 5. Register all candidate reviewers (orchestrator pre-registers; agents won't need to)
   const ownerWallet = new Wallet(ownerKey, provider);
-  const handles = loadContracts(deployment, ownerWallet);
+  const ownerManaged = new NonceManager(ownerWallet);
+  const handles = loadContracts(deployment, ownerManaged);
   const vrfPubKey: [bigint, bigint] = [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])];
+  const reviewerStake = parseEther(String(1000 * Math.max(1, E2E_MAX_ACTIVE_REQUESTS)));
 
   for (let i = 0; i < candidateKeys.length; i++) {
     const wallet = new Wallet(candidateKeys[i]!, provider);
@@ -214,74 +278,124 @@ async function main(): Promise<RunResult> {
       agentId: BigInt(1001 + i),
       domainMask: DOMAIN_RESEARCH,
       vrfPublicKey: vrfPubKey,
+      stakeAmount: reviewerStake,
     });
   }
   process.stdout.write(`[orchestrate] registered ${candidateKeys.length} reviewers\n`);
 
-  // 6. Requester approve PaymentRouter + createRequest (Queued)
+  // 6. Requester approve PaymentRouter + create queued requests.
   const requesterWallet = new Wallet(requesterKey, provider);
   const requesterManaged = new NonceManager(requesterWallet);
   const requesterHandles = loadContracts(deployment, requesterManaged);
   await (
     await requesterHandles.usdaio.approve(deployment.contracts.paymentRouter, parseEther("1000"))
   ).wait();
-  const createTx = await requesterHandles.paymentRouter.createRequestWithUSDAIO(
-    proposal.uri,
-    proposal.hash,
-    id("paper-001:rubric"),
-    DOMAIN_RESEARCH,
-    FAST,
-    0n,
-  );
-  const createReceipt = await createTx.wait();
-  process.stdout.write(`[orchestrate] createRequest tx=${createReceipt!.hash}\n`);
+  const requests: Array<{
+    requestId: bigint;
+    proposalId: string;
+    proposalURI: string;
+    proposalHash: string;
+    createTxHash: string;
+    createBlock: bigint;
+    predictedReviewPhaseStartBlock: bigint;
+  }> = [];
+  for (let i = 0; i < E2E_REQUEST_COUNT; i++) {
+    const currentProposalId = i === 0 ? proposalId : `${proposalId}-${i + 1}`;
+    const currentProposalURI = `content://proposals/${currentProposalId}`;
+    const priorityFee = BigInt(E2E_REQUEST_COUNT - i);
+    const createTx = await requesterHandles.paymentRouter.createRequestWithUSDAIO(
+      currentProposalURI,
+      proposalHash,
+      id(`${currentProposalId}:rubric`),
+      DOMAIN_RESEARCH,
+      FAST,
+      priorityFee,
+    );
+    const createReceipt = await createTx.wait();
+    const requestId = BigInt(i + 1);
+    requests.push({
+      requestId,
+      proposalId: currentProposalId,
+      proposalURI: currentProposalURI,
+      proposalHash,
+      createTxHash: createReceipt!.hash,
+      createBlock: BigInt(createReceipt!.blockNumber),
+      predictedReviewPhaseStartBlock: 0n,
+    });
+    process.stdout.write(`[orchestrate] createRequest requestId=${requestId} tx=${createReceipt!.hash}\n`);
 
-  const requestId = 1n;
-  const blockBeforeStart = BigInt(await provider.getBlockNumber());
-  // Best-effort: prescreen at predicted phaseStartBlock. Actual block at
-  // startNextRequest may drift slightly because subprocess spawning + RPC
-  // chatter does not mine blocks but ethers' internal sequencing can race.
-  // Agents do their own sortition check at runtime, so drift only reduces
-  // the chance that all three pre-screened candidates pass. With 50%
-  // sortition probability and only 2 needed for quorum, the run usually
-  // succeeds anyway.
-  const predictedReviewPhaseStartBlock = blockBeforeStart + 1n;
+    const verifiedProposal = await contentClient.submitRequestDocument({
+      requestId,
+      txHash: createReceipt!.hash,
+      id: currentProposalId,
+      text: paperText,
+      mimeType: "text/markdown",
+    });
+    process.stdout.write(
+      `[orchestrate] proposal accepted requestId=${requestId}: ${verifiedProposal.proposal.uri} hash=${verifiedProposal.proposal.hash}\n`,
+    );
+  }
 
-  // 7. Prescreen for a passing pair
+  const lastCreateBlock = requests[requests.length - 1]!.createBlock;
+  for (let i = 0; i < requests.length; i++) {
+    requests[i]!.predictedReviewPhaseStartBlock = lastCreateBlock + BigInt(i + 1);
+  }
+
+  // 7. Prescreen for a passing committee
   const proof: [bigint, bigint, bigint, bigint] = [
     BigInt(deployment.vrfProof[0]),
     BigInt(deployment.vrfProof[1]),
     BigInt(deployment.vrfProof[2]),
     BigInt(deployment.vrfProof[3]),
   ];
-  const lifecycle = await handles.core.getRequestLifecycle(requestId);
-  const committeeEpoch = BigInt(lifecycle[5] as bigint | number);
-  const auditEpoch = BigInt(lifecycle[6] as bigint | number);
+  const lifecycles = await Promise.all(requests.map((req) => handles.core.getRequestLifecycle(req.requestId)));
+  const primaryRequest = requests[0]!;
+  const primaryLifecycle = lifecycles[0]!;
+  const committeeEpoch = BigInt(primaryLifecycle[5] as bigint | number);
+  const auditEpoch = BigInt(primaryLifecycle[6] as bigint | number);
 
-  const prescreen = await preScreenTriple({
+  const prescreen = await preScreenCommittee({
     handles,
     candidateKeys,
     publicKey: vrfPubKey,
     proof,
     finalityFactor: 2n,
-    reviewElectionDifficulty: 5000n,
-    auditElectionDifficulty: 5000n,
+    reviewElectionDifficulty: E2E_REVIEW_VRF_DIFFICULTY,
+    auditElectionDifficulty: E2E_AUDIT_VRF_DIFFICULTY,
+    agentCount: E2E_AGENT_COUNT,
+    quorum: E2E_QUORUM,
+    auditTargetLimit: E2E_AUDIT_TARGET_LIMIT,
     provider,
-    reviewPhaseStartBlock: predictedReviewPhaseStartBlock,
-    auditPhaseStartBlockOffset: 4n,
-    requestId,
+    reviewPhaseStartBlock: primaryRequest.predictedReviewPhaseStartBlock,
+    auditPhaseStartBlockOffset: E2E_AUDIT_PHASE_START_BLOCK_OFFSET,
+    requestId: primaryRequest.requestId,
     committeeEpoch,
     auditEpoch,
+    additionalRequests: requests.slice(1).map((req, idx) => {
+      const lifecycle = lifecycles[idx + 1]!;
+      return {
+        requestId: req.requestId,
+        reviewPhaseStartBlock: req.predictedReviewPhaseStartBlock,
+        committeeEpoch: BigInt(lifecycle[5] as bigint | number),
+        auditEpoch: BigInt(lifecycle[6] as bigint | number),
+      };
+    }),
   });
   process.stdout.write(
-    `[orchestrate] prescreen triple: ${prescreen.addresses.join(", ")}\n`,
+    `[orchestrate] prescreen committee: ${prescreen.addresses.join(", ")}\n`,
+  );
+  process.stdout.write(
+    `[orchestrate] expected review pass: ${prescreen.reviewPassAddresses.join(", ")}\n`,
   );
 
-  // 8. Spawn 3 agents
+  // 8. Spawn selected agents
   const stateKey = `0x${crypto.randomBytes(32).toString("hex")}`;
+  const runStateRoot = path.join(ROOT, ".state", `e2e-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
+  mkdirSync(runStateRoot, { recursive: true });
+  process.stdout.write(`[orchestrate] agent state root: ${runStateRoot}\n`);
   const agentChildren: ChildProcess[] = [];
-  for (let i = 0; i < 3; i++) {
-    const key = prescreen.triple[i]!;
+  for (let i = 0; i < prescreen.committee.length; i++) {
+    const key = prescreen.committee[i]!;
     const wallet = new Wallet(key, provider);
     const idx = candidateKeys.indexOf(key);
     const child = spawnAgent({
@@ -289,11 +403,14 @@ async function main(): Promise<RunResult> {
       privkey: key,
       contentSvc: content.baseUrl,
       deploymentPath,
-      stateDir: path.join(ROOT, ".state", `agent-${i + 1}`),
+      stateDir: path.join(runStateRoot, `agent-${i + 1}`),
       stateKey,
       agentId: BigInt(1001 + idx),
       ensName: `reviewer-${idx + 1}.daio.eth`,
       label: `R${i + 1}`,
+      reviewElectionDifficulty: E2E_REVIEW_VRF_DIFFICULTY,
+      auditElectionDifficulty: E2E_AUDIT_VRF_DIFFICULTY,
+      auditTargetLimit: E2E_AUDIT_TARGET_LIMIT,
     });
     agentChildren.push(child);
     process.stdout.write(`[orchestrate] spawned agent R${i + 1} for ${wallet.address}\n`);
@@ -302,45 +419,111 @@ async function main(): Promise<RunResult> {
   // give agents a moment to subscribe before we trigger phase change
   await delay(1500);
 
-  // 9. Trigger startNextRequest
-  const startTx = await handles.core.startNextRequest();
-  const startReceipt = await startTx.wait();
-  const startBlockNumber = startReceipt!.blockNumber;
+  // 9. Trigger startNextRequest. In production this is a keeper/scheduler
+  // policy knob bounded by the contract-level active request cap.
+  const finalWaits = requests.map((req) => awaitFinalized(provider, handles.rawCore, req.requestId));
+  const startedRequests = await startQueuedRequests(handles.core, E2E_MAX_ACTIVE_REQUESTS);
+  if (startedRequests.length < requests.length) {
+    throw new Error(`started ${startedRequests.length}/${requests.length} queued requests; increase E2E_MAX_ACTIVE_REQUESTS for full E2E`);
+  }
+  const firstStarted = startedRequests[0]!;
+  const startBlockNumber = firstStarted.blockNumber;
   process.stdout.write(
-    `[orchestrate] startNextRequest tx=${startReceipt!.hash} block=${startBlockNumber}\n`,
+    `[orchestrate] startNextRequest count=${startedRequests.length} tx=${firstStarted.txHash} block=${startBlockNumber}\n`,
   );
-  if (BigInt(startBlockNumber) !== predictedReviewPhaseStartBlock) {
-    process.stdout.write(
-      `[orchestrate] WARNING: predicted phaseStartBlock=${predictedReviewPhaseStartBlock} actual=${startBlockNumber}; sortition may diverge\n`,
-    );
+  for (let i = 0; i < startedRequests.length; i++) {
+    const req = requests[i]!;
+    const started = startedRequests[i]!;
+    if (BigInt(started.blockNumber) !== req.predictedReviewPhaseStartBlock) {
+      process.stdout.write(
+        `[orchestrate] WARNING requestId=${req.requestId}: predicted phaseStartBlock=${req.predictedReviewPhaseStartBlock} actual=${started.blockNumber}; sortition may diverge\n`,
+      );
+    }
   }
 
   // 10. Await finalized
-  const finalEvent = await awaitFinalized(provider, handles.rawCore, requestId);
-  process.stdout.write(
-    `[orchestrate] RequestFinalized requestId=${requestId} finalProposalScore=${finalEvent.score} confidence=${finalEvent.confidence}\n`,
-  );
-
-  // 11. Read final result and reviewer results
-  const finalResult = await handles.core.getRequestFinalResult(requestId);
-  process.stdout.write(`[orchestrate] final result: ${JSON.stringify({
-    status: Number(finalResult[0]),
-    finalProposalScore: (finalResult[1] as bigint).toString(),
-    confidence: (finalResult[2] as bigint).toString(),
-    auditCoverage: (finalResult[3] as bigint).toString(),
-    scoreDispersion: (finalResult[4] as bigint).toString(),
-    finalReliability: (finalResult[5] as bigint).toString(),
-    lowConfidence: Boolean(finalResult[6]),
-    faultSignal: (finalResult[7] as bigint).toString(),
-  })}\n`);
-  for (const addr of prescreen.addresses) {
-    const r = await handles.core.getReviewerResult(requestId, addr);
+  const finalEvents = await Promise.all(finalWaits);
+  for (let i = 0; i < requests.length; i++) {
+    const finalEvent = finalEvents[i]!;
     process.stdout.write(
-      `[orchestrate] reviewer ${addr}: reportQualityMedian=${r[0]} normalizedReportQuality=${r[1]} normalizedAuditReliability=${r[3]} finalContribution=${r[4]} reward=${r[6]} covered=${r[8]} fault=${r[9]}\n`,
+      `[orchestrate] RequestFinalized requestId=${requests[i]!.requestId} finalProposalScore=${finalEvent.score} confidence=${finalEvent.confidence}\n`,
     );
   }
 
-  // 12. Cleanup
+  // 11. Read final lifecycle and round ledger snapshots
+  const roundNames = ["review", "audit_consensus", "reputation_final"];
+  const finalLifecycles = [];
+  for (let reqIdx = 0; reqIdx < requests.length; reqIdx++) {
+    const req = requests[reqIdx]!;
+    const finalEvent = finalEvents[reqIdx]!;
+    const finalLifecycle = await handles.core.getRequestLifecycle(req.requestId);
+    finalLifecycles.push(finalLifecycle);
+    const status = Number(finalLifecycle[1]);
+    const attempt = BigInt(finalLifecycle[4] as bigint | number);
+    process.stdout.write(`[orchestrate] final result requestId=${req.requestId}: ${JSON.stringify({
+      status,
+      finalProposalScore: finalEvent.score.toString(),
+      confidence: finalEvent.confidence.toString(),
+      lowConfidence: Boolean(finalLifecycle[8]),
+      attempt: attempt.toString(),
+    })}\n`);
+    for (let round = 0; round < roundNames.length; round++) {
+      const agg = await handles.roundLedger.getRoundAggregate(req.requestId, attempt, round);
+      process.stdout.write(`[orchestrate] request ${req.requestId} round ${round} ${roundNames[round]} aggregate: ${JSON.stringify({
+        score: (agg[0] as bigint).toString(),
+        totalWeight: (agg[1] as bigint).toString(),
+        confidence: (agg[2] as bigint).toString(),
+        coverage: (agg[3] as bigint).toString(),
+        lowConfidence: Boolean(agg[4]),
+        closed: Boolean(agg[5]),
+        aborted: Boolean(agg[6]),
+      })}\n`);
+      for (const addr of prescreen.addresses) {
+        const score = await handles.roundLedger.getReviewerRoundScore(req.requestId, attempt, round, addr);
+        const accounting = await handles.roundLedger.getReviewerRoundAccounting(req.requestId, attempt, round, addr);
+        process.stdout.write(`[orchestrate] request ${req.requestId} round ${round} reviewer ${addr}: ${JSON.stringify({
+          score: (score[0] as bigint).toString(),
+          weight: (score[1] as bigint).toString(),
+          weightedScore: (score[2] as bigint).toString(),
+          auditScore: (score[3] as bigint).toString(),
+          reputationScore: (score[4] as bigint).toString(),
+          available: Boolean(score[5]),
+          reward: (accounting[0] as bigint).toString(),
+          slashed: (accounting[1] as bigint).toString(),
+          slashCount: (accounting[2] as bigint).toString(),
+          lastSlashReasonHash: String(accounting[3]),
+          protocolFault: Boolean(accounting[4]),
+          semanticFault: Boolean(accounting[5]),
+        })}\n`);
+      }
+    }
+  }
+
+  // 12. Verify convenience APIs backed by the content service.
+  const apiProbeAgent = prescreen.reviewPassAddresses[0]!;
+  const statusRecord = await contentClient.getAgentStatus(primaryRequest.requestId, apiProbeAgent);
+  const reasons = await contentClient.getAgentReasons(primaryRequest.requestId, apiProbeAgent);
+  process.stdout.write(`[orchestrate] agent status API: ${JSON.stringify({
+    agent: statusRecord.agent,
+    phase: statusRecord.phase,
+    status: statusRecord.status,
+  })}\n`);
+  process.stdout.write(`[orchestrate] agent reasons API: ${JSON.stringify({
+    agent: reasons.agent,
+    hasReview: Boolean(reasons.review),
+    hasAudit: Boolean(reasons.audit),
+    rawThinkingAvailable: reasons.rawThinking.available,
+  })}\n`);
+  if (!reasons.review || !reasons.audit) {
+    throw new Error(`agent reasons API missing review or audit reasons for ${apiProbeAgent}`);
+  }
+  if (statusRecord.phase !== "Finalized" || statusRecord.status !== "finalized") {
+    throw new Error(
+      `agent status API did not report finalized state for ${apiProbeAgent}: ${statusRecord.phase}/${statusRecord.status}`,
+    );
+  }
+
+  // 13. Cleanup
   process.stdout.write(`[orchestrate] cleaning up\n`);
   for (const child of agentChildren) {
     if (child.exitCode === null) child.kill("SIGTERM");
@@ -349,15 +532,14 @@ async function main(): Promise<RunResult> {
   await content.stop();
   await node.stop();
 
-  const status = Number(finalResult[0]);
-  const ok =
-    status === RequestStatus.Finalized &&
-    (finalResult[1] as bigint) >= 0n &&
-    (finalResult[1] as bigint) <= 10000n;
+  const ok = finalLifecycles.every((lifecycle, idx) => {
+    const finalEvent = finalEvents[idx]!;
+    return Number(lifecycle[1]) === RequestStatus.Finalized && finalEvent.score >= 0n && finalEvent.score <= 10000n;
+  });
   return {
     ok,
-    finalProposalScore: finalResult[1] as bigint,
-    confidence: finalResult[2] as bigint,
+    finalProposalScore: finalEvents[0]!.score,
+    confidence: finalEvents[0]!.confidence,
   };
 }
 

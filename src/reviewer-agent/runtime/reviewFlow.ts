@@ -1,16 +1,17 @@
 import crypto from "node:crypto";
-import { keccak256, toUtf8Bytes, type Wallet } from "ethers";
+import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } from "ethers";
 import { ContentServiceClient } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
+import { REVIEW_SORTITION, RequestStatus } from "../../shared/types.js";
 import { sortitionPass } from "../chain/sortition.js";
-import { REVIEW_SORTITION, RequestStatus, DOMAIN_RESEARCH } from "../../shared/types.js";
 import { buildReviewMessages } from "../llm/prompts.js";
 import { chat, extractJson } from "../llm/client.js";
 import { parseReview } from "../llm/validate.js";
 import type { ReviewArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
 import type { StateStore } from "./state.js";
+import { gasLimitWithHeadroom } from "./gas.js";
 
 export interface ReviewFlowDeps {
   handles: ContractHandles;
@@ -18,9 +19,11 @@ export interface ReviewFlowDeps {
   content: ContentServiceClient;
   state: StateStore;
   wallet: Wallet;
+  txSigner: ContractRunner;
   publicKey: [bigint, bigint];
   proof: [bigint, bigint, bigint, bigint];
   log: (msg: string) => void;
+  txQueue: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 export async function runReview(
@@ -28,14 +31,18 @@ export async function runReview(
   requestId: bigint,
   finalityFactor: bigint,
   reviewElectionDifficulty: bigint,
-): Promise<{ committed: boolean; reason?: string }> {
+): Promise<{ committed: boolean; reason?: string; commitTx?: string; reportHash?: string; reportURI?: string }> {
   const { handles, events, content, state, wallet, publicKey, proof, log } = deps;
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.ReviewCommit);
   if (startBlock === undefined) {
     return { committed: false, reason: "no review phase start block" };
   }
 
-  const eligible = (await handles.reviewerRegistry.isEligible(wallet.address, DOMAIN_RESEARCH)) as boolean;
+  const document = await content.getRequestDocument(requestId);
+  const domainMask = BigInt(document.verified.domainMask);
+  const tierName = document.verified.tierName;
+
+  const eligible = (await handles.reviewerRegistry.isEligible(wallet.address, domainMask)) as boolean;
   if (!eligible) return { committed: false, reason: "not eligible" };
 
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
@@ -60,15 +67,14 @@ export async function runReview(
   }
   log(`review: sortition passed; running review for request ${requestId}`);
 
-  const requestHandle = await handles.core.getRequestLifecycle(requestId);
-  const requesterStr = String(requestHandle[0]);
-  void requesterStr;
-  const proposalUri = "content://proposals/paper-001";
-  const proposal = await content.resolveProposal(proposalUri);
+  const proposal = document.proposal;
 
   const computedHash = keccak256(toUtf8Bytes(proposal.text));
-  if (computedHash !== proposal.hash) {
+  if (computedHash.toLowerCase() !== proposal.hash.toLowerCase()) {
     throw new Error(`proposal hash mismatch: stored=${proposal.hash} computed=${computedHash}`);
+  }
+  if (computedHash.toLowerCase() !== document.verified.proposalHash.toLowerCase()) {
+    throw new Error(`proposal hash mismatch: onchain=${document.verified.proposalHash} computed=${computedHash}`);
   }
 
   const ensName = `reviewer-${wallet.address.slice(2, 8).toLowerCase()}.daio.eth`;
@@ -86,21 +92,21 @@ export async function runReview(
       requestId: requestId.toString(),
       proposalURI: proposal.uri,
       proposalHash: proposal.hash,
-      rubricHash: keccak256(toUtf8Bytes("paper-001:rubric")),
-      domainMask: DOMAIN_RESEARCH.toString(),
-      tier: "Fast",
+      rubricHash: document.verified.rubricHash,
+      domainMask: domainMask.toString(),
+      tier: tierName,
       status: "ReviewCommit",
     },
     reviewer: {
       wallet: wallet.address,
       ensName,
       agentId: agentId.toString(),
-      domainMask: DOMAIN_RESEARCH.toString(),
+      domainMask: domainMask.toString(),
     },
     content: {
       proposal: { uri: proposal.uri, mimeType: proposal.mimeType, text: proposal.text },
       rubric: {
-        hash: keccak256(toUtf8Bytes("paper-001:rubric")),
+        hash: document.verified.rubricHash,
         text: "Evaluate clarity, novelty, technical correctness, evaluation quality, and presentation.",
       },
     },
@@ -124,7 +130,7 @@ export async function runReview(
     source: {
       proposalURI: proposal.uri,
       proposalHash: proposal.hash,
-      rubricHash: keccak256(toUtf8Bytes("paper-001:rubric")),
+      rubricHash: document.verified.rubricHash,
     },
     metadata: { model: parsed.metadata?.model, createdAt: new Date().toISOString() },
   };
@@ -144,6 +150,11 @@ export async function runReview(
     stored.uri,
   )) as string;
 
+  const stillEligible = (await handles.reviewerRegistry.isEligible(wallet.address, domainMask)) as boolean;
+  if (!stillEligible) {
+    return { committed: false, reason: "not eligible at commit time", reportHash, reportURI: stored.uri };
+  }
+
   state.save({
     requestId: requestId.toString(),
     reviewer: wallet.address,
@@ -157,40 +168,80 @@ export async function runReview(
     },
   });
 
-  const cr = handles.commitReveal.connect(wallet);
-  const tx = await cr.commitReview(requestId, resultHash, seedBigInt, proof);
-  const receipt = await tx.wait();
-  log(`review: committed (tx=${receipt?.hash})`);
+  const cr = handles.commitReveal.connect(deps.txSigner);
+  const commitArgs = [requestId, resultHash, seedBigInt, proof] as const;
+  const gasLimit = await gasLimitWithHeadroom(
+    cr.commitReview,
+    commitArgs,
+    "DAIO_REVIEW_COMMIT_GAS_FLOOR",
+    1_000_000n,
+  );
+  const receipt = await deps.txQueue(async () => {
+    const tx = await cr.commitReview(...commitArgs, { gasLimit });
+    return tx.wait();
+  });
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(`review commit transaction failed: ${receipt?.hash ?? "unknown tx"}`);
+  }
+
+  const attempt = BigInt((await handles.core.getRequestLifecycle(requestId))[4] as bigint | number);
+  const participants = (await handles.commitReveal.getReviewParticipants(requestId, attempt)) as readonly string[];
+  const accepted = participants.some((addr) => getAddress(addr) === getAddress(wallet.address));
 
   const cur = state.load(requestId.toString())!;
-  cur.review!.commitTx = receipt?.hash;
+  cur.review!.commitTx = receipt.hash;
+  cur.review!.accepted = accepted;
+  if (!accepted) {
+    cur.review!.notAcceptedReason = "late_not_accepted";
+    state.save(cur);
+    log(`review: commit tx succeeded but was not accepted (tx=${receipt.hash})`);
+    return {
+      committed: false,
+      reason: "late_not_accepted",
+      commitTx: receipt.hash,
+      reportHash,
+      reportURI: stored.uri,
+    };
+  }
   state.save(cur);
+  log(`review: committed (tx=${receipt.hash})`);
 
-  return { committed: true };
+  return { committed: true, commitTx: receipt.hash, reportHash, reportURI: stored.uri };
 }
 
 export async function runReviewReveal(
   deps: ReviewFlowDeps,
   requestId: bigint,
-): Promise<{ revealed: boolean; reason?: string }> {
+): Promise<{ revealed: boolean; reason?: string; revealTx?: string }> {
   const { handles, state, wallet, log } = deps;
   const cur = state.load(requestId.toString());
   if (!cur || !cur.review) return { revealed: false, reason: "no review state" };
+  if (cur.review.accepted === false) return { revealed: false, reason: cur.review.notAcceptedReason ?? "not accepted" };
   if (cur.review.revealTx) return { revealed: false, reason: "already revealed" };
 
   const seed = state.decryptSeed(cur.review.seed);
-  const cr = handles.commitReveal.connect(wallet);
-  const tx = await cr.revealReview(
+  const cr = handles.commitReveal.connect(deps.txSigner);
+  const args = [
     requestId,
     cur.review.proposalScore,
     cur.review.reportHash,
     cur.review.reportURI,
     BigInt(seed),
-  );
-  const receipt = await tx.wait();
-  log(`review: revealed (tx=${receipt?.hash})`);
-  cur.review.revealTx = receipt?.hash;
+  ] as const;
+  const gasLimit = await gasLimitWithHeadroom(cr.revealReview, args, "DAIO_REVIEW_REVEAL_GAS_FLOOR", 2_000_000n);
+  const receipt = await deps.txQueue(async () => {
+    const tx = await cr.revealReview(
+      ...args,
+      { gasLimit },
+    );
+    return tx.wait();
+  });
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(`review reveal transaction failed: ${receipt?.hash ?? "unknown tx"}`);
+  }
+  log(`review: revealed (tx=${receipt.hash})`);
+  cur.review.revealTx = receipt.hash;
   cur.phase = "ReviewReveal";
   state.save(cur);
-  return { revealed: true };
+  return { revealed: true, revealTx: receipt.hash };
 }

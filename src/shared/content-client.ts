@@ -20,6 +20,68 @@ export interface AuditRecord {
   artifact: AuditArtifact;
 }
 
+export interface VerifiedDocumentRecord {
+  verified: {
+    requestId: string;
+    requester: string;
+    proposalURI: string;
+    proposalHash: string;
+    rubricHash: string;
+    domainMask: string;
+    tier: number;
+    tierName: string;
+    priorityFee: string;
+    txHash: string;
+    paymentFunction: string;
+    paymentToken: string;
+    amountPaid: string;
+    blockNumber: number;
+    status: number;
+    statusName: string;
+  };
+  proposal: ProposalRecord;
+}
+
+export interface RequestDocumentRecord extends VerifiedDocumentRecord {
+  updatedAt: number;
+}
+
+export interface AgentStatusRecord {
+  requestId: string;
+  agent: string;
+  phase: string;
+  status: string;
+  detail: string | null;
+  payload: unknown;
+  updatedAt: number;
+}
+
+export interface AgentReasonsRecord {
+  requestId: string;
+  agent: string;
+  rawThinking: {
+    available: boolean;
+    reason: string;
+  };
+  review: null | {
+    reportHash: string;
+    proposalScore: number;
+    summary: string;
+    recommendation: string;
+    confidence: number;
+    rubricAssessments: unknown[];
+    strengths: string[];
+    weaknesses: string[];
+    risks: string[];
+    rawFinalArtifact: ReviewArtifact;
+  };
+  audit: null | {
+    auditHash: string;
+    targetEvaluations: Array<{ targetReviewer: string; score: number; rationale: string }>;
+    rawFinalArtifact: AuditArtifact;
+  };
+}
+
 export class ContentServiceClient {
   constructor(private readonly baseUrl: string) {}
 
@@ -44,6 +106,24 @@ export class ContentServiceClient {
     return (await res.json()) as ProposalRecord;
   }
 
+  async submitRequestDocument(input: {
+    requestId: string | bigint | number;
+    txHash: string;
+    id?: string;
+    requester?: string;
+    text: string;
+    mimeType?: string;
+  }): Promise<VerifiedDocumentRecord> {
+    const { requestId, ...body } = input;
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/document`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`submitRequestDocument: ${res.status} ${await res.text()}`);
+    return (await res.json()) as VerifiedDocumentRecord;
+  }
+
   async getProposal(id: string): Promise<ProposalRecord> {
     const res = await fetch(this.url(`/proposals/${encodeURIComponent(id)}`));
     if (!res.ok) throw new Error(`getProposal(${id}): ${res.status}`);
@@ -54,6 +134,12 @@ export class ContentServiceClient {
     const m = uri.match(/^content:\/\/proposals\/(.+)$/);
     if (!m) throw new Error(`unsupported proposal uri: ${uri}`);
     return this.getProposal(m[1]!);
+  }
+
+  async getRequestDocument(requestId: string | bigint | number): Promise<RequestDocumentRecord> {
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/document`));
+    if (!res.ok) throw new Error(`getRequestDocument: ${res.status} ${await res.text()}`);
+    return (await res.json()) as RequestDocumentRecord;
   }
 
   async putReport(artifact: ReviewArtifact): Promise<ReportRecord> {
@@ -86,5 +172,34 @@ export class ContentServiceClient {
     });
     if (!res.ok) throw new Error(`putAudit: ${res.status} ${await res.text()}`);
     return (await res.json()) as AuditRecord;
+  }
+
+  async putAgentStatus(input: {
+    requestId: string | bigint | number;
+    agent: string;
+    phase: string;
+    status: string;
+    detail?: string;
+    payload?: Record<string, unknown>;
+  }): Promise<AgentStatusRecord> {
+    const res = await fetch(this.url("/agent-status"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...input, requestId: input.requestId.toString() }),
+    });
+    if (!res.ok) throw new Error(`putAgentStatus: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentStatusRecord;
+  }
+
+  async getAgentStatus(requestId: string | bigint | number, agent: string): Promise<AgentStatusRecord> {
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/agents/${encodeURIComponent(agent)}/status`));
+    if (!res.ok) throw new Error(`getAgentStatus: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentStatusRecord;
+  }
+
+  async getAgentReasons(requestId: string | bigint | number, agent: string): Promise<AgentReasonsRecord> {
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/agents/${encodeURIComponent(agent)}/reasons`));
+    if (!res.ok) throw new Error(`getAgentReasons: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentReasonsRecord;
   }
 }

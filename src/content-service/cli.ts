@@ -4,8 +4,14 @@ import { buildServer } from "./server.js";
 const port = Number(process.env.CONTENT_SERVICE_PORT ?? 18002);
 const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
 const dbPath = process.env.CONTENT_DB_PATH ?? "./.data/content.sqlite";
+const deploymentPath = process.env.CONTENT_DEPLOYMENT_PATH ?? process.env.DAIO_DEPLOYMENT_PATH ?? "./.deployments/local.json";
+const rpcUrl = process.env.CONTENT_CHAIN_RPC_URL ?? process.env.RPC_URL;
 
-const { app, db } = buildServer({ dbPath, logger: process.env.CONTENT_SERVICE_LOG === "1" });
+const { app, db } = buildServer({
+  dbPath,
+  logger: process.env.CONTENT_SERVICE_LOG === "1",
+  chain: { deploymentPath, rpcUrl },
+});
 
 async function main() {
   await app.listen({ host, port });

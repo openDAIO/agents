@@ -14,7 +14,17 @@ const FAST = 0;
 const STANDARD = 1;
 const CRITICAL = 2;
 
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+  return parsed;
+}
+
 function tierConfig(opts: {
+  reviewElectionDifficulty?: number;
+  auditElectionDifficulty?: number;
   reviewCommitQuorum: number;
   reviewRevealQuorum: number;
   auditCommitQuorum: number;
@@ -32,10 +42,15 @@ function tierConfig(opts: {
   auditCommitTimeout: number;
   auditRevealTimeout: number;
 }): unknown {
+  const {
+    reviewElectionDifficulty = 8000,
+    auditElectionDifficulty = 10000,
+    ...rest
+  } = opts;
   return {
-    reviewElectionDifficulty: 5000,
-    auditElectionDifficulty: 5000,
-    ...opts,
+    reviewElectionDifficulty,
+    auditElectionDifficulty,
+    ...rest,
     minorityThreshold: 1500,
     semanticStrikeThreshold: 3,
     protocolFaultSlashBps: 500,
@@ -73,6 +88,10 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   const treasury = new Wallet(input.treasuryKey, input.provider);
   const requester = new Wallet(input.requesterKey, input.provider);
   const reviewers = input.reviewerKeys.map((k) => new Wallet(k, input.provider));
+  const maxActiveRequests = nonNegativeIntEnv(
+    "E2E_MAX_ACTIVE_REQUESTS",
+    nonNegativeIntEnv("DAIO_MAX_ACTIVE_REQUESTS", 2),
+  );
 
   const usdaio = await deploy(owner, Artifacts.USDAIOToken(), [ownerWallet.address]);
   const stakeVault = await deploy(owner, Artifacts.StakeVault(), [usdaio.address]);
@@ -90,7 +109,9 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     commitReveal.address,
     priorityQueue.address,
     vrfCoordinator.address,
+    maxActiveRequests,
   ]);
+  const roundLedger = await deploy(owner, Artifacts.DAIORoundLedger(), []);
 
   // Wire modules
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -115,6 +136,10 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   const rl: any = reputationLedger.contract;
   await (await rl.setCore(core.address)).wait();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ledger: any = roundLedger.contract;
+  await (await ledger.setCore(core.address)).wait();
+  await (await c.setRoundLedger(roundLedger.address)).wait();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const cr: any = commitReveal.contract;
   await (await cr.setCore(core.address)).wait();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -126,10 +151,12 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       FAST,
       tierConfig({
-        reviewCommitQuorum: 2,
-        reviewRevealQuorum: 2,
-        auditCommitQuorum: 2,
-        auditRevealQuorum: 2,
+        reviewElectionDifficulty: 8000,
+        auditElectionDifficulty: 10000,
+        reviewCommitQuorum: 3,
+        reviewRevealQuorum: 3,
+        auditCommitQuorum: 3,
+        auditRevealQuorum: 3,
         auditTargetLimit: 2,
         minIncomingAudit: 1,
         auditCoverageQuorum: 7000,
@@ -210,7 +237,7 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   // Fund reviewers and requester
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tok: any = usdaio.contract;
-  const reviewerStake = parseEther("1000");
+  const reviewerStake = parseEther(String(1000 * Math.max(1, maxActiveRequests)));
   for (const r of reviewers) {
     await (await tok.mint(r.address, reviewerStake)).wait();
   }
@@ -231,6 +258,7 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
       consensusScoring: consensusScoring.address,
       settlement: settlement.address,
       reputationLedger: reputationLedger.address,
+      roundLedger: roundLedger.address,
       commitReveal: commitReveal.address,
       priorityQueue: priorityQueue.address,
       vrfCoordinator: vrfCoordinator.address,

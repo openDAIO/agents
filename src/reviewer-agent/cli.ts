@@ -23,6 +23,9 @@ async function main() {
       "auto-register": { type: "boolean", default: false },
       "agent-id": { type: "string" },
       "ens-name": { type: "string" },
+      "review-election-difficulty": { type: "string" },
+      "audit-election-difficulty": { type: "string" },
+      "audit-target-limit": { type: "string" },
     },
     strict: false,
   });
@@ -38,6 +41,14 @@ async function main() {
   if (!privkey) throw new Error("--privkey required");
   if (!deploymentPath) throw new Error("--deployment required");
   if (!stateKey) throw new Error("--state-key or AGENT_STATE_KEY required");
+
+  const bigintSetting = (flag: string | undefined, envName: string, fallback: bigint): bigint => {
+    const raw = flag ?? process.env[envName];
+    if (!raw) return fallback;
+    const parsed = BigInt(raw);
+    if (parsed <= 0n) throw new Error(`${envName} must be positive`);
+    return parsed;
+  };
 
   const deployment = JSON.parse(readFileSync(deploymentPath as string, "utf8")) as DeploymentSnapshot;
   const ctx = makeChainContext(rpc as string, privkey as string);
@@ -59,9 +70,21 @@ async function main() {
 
   const cfg: AgentConfig = {
     finalityFactor: 2n,
-    reviewElectionDifficulty: 5000n,
-    auditElectionDifficulty: 5000n,
-    auditTargetLimit: 2n,
+    reviewElectionDifficulty: bigintSetting(
+      values["review-election-difficulty"] as string | undefined,
+      "DAIO_REVIEW_ELECTION_DIFFICULTY",
+      5000n,
+    ),
+    auditElectionDifficulty: bigintSetting(
+      values["audit-election-difficulty"] as string | undefined,
+      "DAIO_AUDIT_ELECTION_DIFFICULTY",
+      5000n,
+    ),
+    auditTargetLimit: bigintSetting(
+      values["audit-target-limit"] as string | undefined,
+      "DAIO_AUDIT_TARGET_LIMIT",
+      2n,
+    ),
     publicKey: [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])],
     proof: [
       BigInt(deployment.vrfProof[0]),

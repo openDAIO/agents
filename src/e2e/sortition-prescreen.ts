@@ -11,6 +11,9 @@ export interface PreScreenInput {
   finalityFactor: bigint;
   reviewElectionDifficulty: bigint;
   auditElectionDifficulty: bigint;
+  agentCount: number;
+  quorum: number;
+  auditTargetLimit: bigint;
   provider: JsonRpcProvider;
   reviewPhaseStartBlock: bigint;
   // approximate auditPhaseStartedBlock = reviewPhaseStartBlock + 4 (mirrors test helper).
@@ -18,39 +21,72 @@ export interface PreScreenInput {
   requestId: bigint;
   committeeEpoch: bigint;
   auditEpoch: bigint;
+  additionalRequests?: Array<{
+    requestId: bigint;
+    reviewPhaseStartBlock: bigint;
+    auditPhaseStartBlockOffset?: bigint;
+    committeeEpoch: bigint;
+    auditEpoch: bigint;
+  }>;
 }
 
 export interface PreScreenResult {
-  triple: [string, string, string];
-  addresses: [string, string, string];
+  committee: string[];
+  addresses: string[];
+  reviewPassAddresses: string[];
 }
 
-// Find a pair of candidates such that:
-//   both pass review sortition at reviewPhaseStartBlock
-//   each can audit the other at reviewPhaseStartBlock + offset
-// Then append a third candidate (any unused one) so we can spawn 3 agents.
-export async function preScreenTriple(input: PreScreenInput): Promise<PreScreenResult> {
+function* combinations(values: number[], size: number, start = 0, picked: number[] = []): Generator<number[]> {
+  if (picked.length === size) {
+    yield picked.slice();
+    return;
+  }
+  for (let i = start; i <= values.length - (size - picked.length); i++) {
+    picked.push(values[i]!);
+    yield* combinations(values, size, i + 1, picked);
+    picked.pop();
+  }
+}
+
+// Find a fixed-size agent committee where exactly `quorum` agents pass review
+// sortition, and those revealed reviewers can also satisfy audit quorum.
+export async function preScreenCommittee(input: PreScreenInput): Promise<PreScreenResult> {
   const wallets = input.candidateKeys.map((k) => new Wallet(k));
   const coreAddress = await input.handles.core.getAddress();
-  const auditPhaseStartBlock = input.reviewPhaseStartBlock + input.auditPhaseStartBlockOffset;
+  const requests = [
+    {
+      requestId: input.requestId,
+      reviewPhaseStartBlock: input.reviewPhaseStartBlock,
+      auditPhaseStartBlockOffset: input.auditPhaseStartBlockOffset,
+      committeeEpoch: input.committeeEpoch,
+      auditEpoch: input.auditEpoch,
+    },
+    ...(input.additionalRequests ?? []).map((req) => ({
+      ...req,
+      auditPhaseStartBlockOffset: req.auditPhaseStartBlockOffset ?? input.auditPhaseStartBlockOffset,
+    })),
+  ];
+  const requiredAuditTargets = Math.min(Number(input.auditTargetLimit), input.quorum - 1);
+  if (input.agentCount < input.quorum) throw new Error("prescreen: agentCount must be >= quorum");
+  if (requiredAuditTargets <= 0) throw new Error("prescreen: audit target requirement must be positive");
 
   // Memoize sortition checks
   const reviewCache = new Map<string, boolean>();
   const auditCache = new Map<string, boolean>();
 
-  const reviewPass = async (addr: string): Promise<boolean> => {
-    const key = addr;
+  const reviewPass = async (addr: string, req: (typeof requests)[number]): Promise<boolean> => {
+    const key = `${req.requestId}|${req.reviewPhaseStartBlock}|${req.committeeEpoch}|${addr}`;
     if (reviewCache.has(key)) return reviewCache.get(key)!;
     const ok = await sortitionPass({
       vrfCoordinator: input.handles.vrfCoordinator,
       coreAddress,
       publicKey: input.publicKey,
       proof: input.proof,
-      requestId: input.requestId,
+      requestId: req.requestId,
       phase: REVIEW_SORTITION,
-      epoch: input.committeeEpoch,
+      epoch: req.committeeEpoch,
       participant: addr,
-      phaseStartBlock: input.reviewPhaseStartBlock,
+      phaseStartBlock: req.reviewPhaseStartBlock,
       finalityFactor: input.finalityFactor,
       difficulty: input.reviewElectionDifficulty,
     });
@@ -58,17 +94,18 @@ export async function preScreenTriple(input: PreScreenInput): Promise<PreScreenR
     return ok;
   };
 
-  const auditPass = async (auditor: string, target: string): Promise<boolean> => {
-    const key = `${auditor}|${target}`;
+  const auditPass = async (auditor: string, target: string, req: (typeof requests)[number]): Promise<boolean> => {
+    const auditPhaseStartBlock = req.reviewPhaseStartBlock + req.auditPhaseStartBlockOffset;
+    const key = `${req.requestId}|${auditPhaseStartBlock}|${req.auditEpoch}|${auditor}|${target}`;
     if (auditCache.has(key)) return auditCache.get(key)!;
     const ok = await sortitionPass({
       vrfCoordinator: input.handles.vrfCoordinator,
       coreAddress,
       publicKey: input.publicKey,
       proof: input.proof,
-      requestId: input.requestId,
+      requestId: req.requestId,
       phase: AUDIT_SORTITION,
-      epoch: input.auditEpoch,
+      epoch: req.auditEpoch,
       participant: auditor,
       target,
       phaseStartBlock: auditPhaseStartBlock,
@@ -79,24 +116,48 @@ export async function preScreenTriple(input: PreScreenInput): Promise<PreScreenR
     return ok;
   };
 
-  for (let i = 0; i < wallets.length; i++) {
-    if (!(await reviewPass(wallets[i]!.address))) continue;
-    for (let j = 0; j < wallets.length; j++) {
-      if (i === j) continue;
-      if (!(await reviewPass(wallets[j]!.address))) continue;
-      if (!(await auditPass(wallets[i]!.address, wallets[j]!.address))) continue;
-      if (!(await auditPass(wallets[j]!.address, wallets[i]!.address))) continue;
-      // Found pair. Pick any third candidate.
-      const third = wallets.find((_, idx) => idx !== i && idx !== j);
-      if (!third) continue;
-      const thirdIdx = wallets.indexOf(third);
-      return {
-        triple: [input.candidateKeys[i]!, input.candidateKeys[j]!, input.candidateKeys[thirdIdx]!],
-        addresses: [wallets[i]!.address, wallets[j]!.address, third.address],
-      };
+  const indexes = wallets.map((_, i) => i);
+  for (const combo of combinations(indexes, input.agentCount)) {
+    let firstReviewPassIndexes: number[] | undefined;
+    let satisfiesAllRequests = true;
+
+    for (const req of requests) {
+      const reviewPassIndexes: number[] = [];
+      for (const idx of combo) {
+        if (await reviewPass(wallets[idx]!.address, req)) reviewPassIndexes.push(idx);
+      }
+      if (reviewPassIndexes.length < input.quorum) {
+        satisfiesAllRequests = false;
+        break;
+      }
+
+      let completeAuditGraph = true;
+      for (const auditorIdx of reviewPassIndexes) {
+        let selectedTargets = 0;
+        for (const targetIdx of reviewPassIndexes) {
+          if (auditorIdx === targetIdx) continue;
+          if (await auditPass(wallets[auditorIdx]!.address, wallets[targetIdx]!.address, req)) selectedTargets++;
+        }
+        if (selectedTargets < reviewPassIndexes.length - 1 || selectedTargets < requiredAuditTargets) {
+          completeAuditGraph = false;
+          break;
+        }
+      }
+      if (!completeAuditGraph) {
+        satisfiesAllRequests = false;
+        break;
+      }
+      firstReviewPassIndexes ??= reviewPassIndexes;
     }
+    if (!satisfiesAllRequests || !firstReviewPassIndexes) continue;
+
+    return {
+      committee: combo.map((idx) => input.candidateKeys[idx]!),
+      addresses: combo.map((idx) => wallets[idx]!.address),
+      reviewPassAddresses: firstReviewPassIndexes.map((idx) => wallets[idx]!.address),
+    };
   }
   throw new Error(
-    `prescreen: no candidate pair passes review+audit sortition at reviewPhaseStartBlock=${input.reviewPhaseStartBlock}; tried ${wallets.length} candidates`,
+    `prescreen: no ${input.agentCount}-agent committee satisfies quorum=${input.quorum} across ${requests.length} request(s); tried ${wallets.length} candidates`,
   );
 }

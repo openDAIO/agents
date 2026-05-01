@@ -34,6 +34,7 @@ export const Artifacts = {
   ConsensusScoring: () => load(".", "ConsensusScoring"),
   Settlement: () => load(".", "Settlement"),
   ReputationLedger: () => load("reputation", "ReputationLedger"),
+  DAIORoundLedger: () => load(".", "DAIORoundLedger"),
   DAIOCommitRevealManager: () => load("wrappers", "DAIOCommitRevealManager"),
   DAIOPriorityQueue: () => load("wrappers", "DAIOPriorityQueue"),
   DAIOVRFCoordinator: () => load(".", "DAIOVRFCoordinator"),

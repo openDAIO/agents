@@ -14,7 +14,8 @@ export async function registerReviewerIfNeeded(
   wallet: Wallet,
   params: RegisterParams,
 ): Promise<{ registered: boolean; txHash?: string }> {
-  const stake = params.stakeAmount ?? parseEther("1000");
+  const maxActiveRequests = BigInt((await handles.core.maxActiveRequests()) as bigint | number);
+  const stake = params.stakeAmount ?? parseEther((1000n * (maxActiveRequests > 0n ? maxActiveRequests : 1n)).toString());
   const reviewerInfo = await handles.reviewerRegistry.getReviewer(wallet.address);
   const registered = Boolean(reviewerInfo[0]);
   if (registered) return { registered: false };

@@ -56,7 +56,7 @@ export function loadContracts(d: DeploymentSnapshot, runner: ContractRunner): Co
     ),
     vrfCoordinator: new Contract(
       d.contracts.vrfCoordinator,
-      Artifacts.MockVRFCoordinator().abi as never[],
+      Artifacts.DAIOVRFCoordinator().abi as never[],
       runner,
     ),
     vrfVerifier: new Contract(

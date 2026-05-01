@@ -364,9 +364,11 @@ curl http://127.0.0.1:18002/reports/0x643abeef31189c116d28ed73e4d9162355b4ecddd7
 
 ### VRF and sortition
 
-The deployed `MockVRFCoordinator` accepts any non-zero proof tuple and returns
+The E2E `MockVRFCoordinator` accepts any non-zero proof tuple and returns
 `randomness = keccak256(publicKey, proof, core, requestId, phase, epoch, reviewer, target, phaseStartBlock, finalityFactor)`.
-All ten candidate reviewers register with the same VRF public key from `contracts/lib/vrf-solidity/test/data.json`, so per-reviewer sortition divergence is driven entirely by the participant address term. Production deployments should swap in `FRAINVRFVerifier` and per-reviewer keypairs.
+Candidate reviewers in the local E2E register with the same fixture VRF public key from `contracts/lib/vrf-solidity/test/data.json`, so per-reviewer sortition divergence is driven entirely by the participant address term.
+
+Production Sepolia deployments use `DAIOVRFCoordinator` + `FRAINVRFVerifier`. Each agent must be configured with its own `AGENT_N_VRF_PRIVATE_KEY`; the runtime derives the public key for registration and generates request/phase/epoch/target-specific secp256k1 VRF proofs before review and audit commits.
 
 The orchestrator's prescreen routine reproduces the same `randomness % 10000 < electionDifficulty` check off-chain (in [src/reviewer-agent/chain/sortition.ts](src/reviewer-agent/chain/sortition.ts)) so it can pick three candidates that, at the predicted `phaseStartBlock`, all pass review sortition and form valid mutual audit pairs.
 
@@ -401,7 +403,7 @@ State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a
 
 ## Known Limitations
 
-- The mock VRF coordinator means `vrfProof` is reused across agents. Real BN254 signing is out of scope for this run; swap to `DAIOVRFCoordinator` + `FRAINVRFVerifier` plus per-agent keypairs for production-like testing.
+- The local E2E still uses `MockVRFCoordinator` and a fixture `vrfProof` to keep committee selection deterministic. The Docker/Sepolia path uses per-agent VRF private keys and dynamic proofs.
 - `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review/audit sortition.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
 - `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested.

@@ -305,6 +305,9 @@ async function main(): Promise<RunResult> {
   const ownerWallet = new Wallet(ownerKey, provider);
   const ownerManaged = new NonceManager(ownerWallet);
   const handles = loadContracts(deployment, ownerManaged);
+  if (!deployment.vrfPublicKey || !deployment.vrfProof) {
+    throw new Error("E2E deployment must include mock vrfPublicKey and vrfProof");
+  }
   const vrfPubKey: [bigint, bigint] = [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])];
   const reviewerStake = parseEther(String(1000 * Math.max(1, E2E_MAX_ACTIVE_REQUESTS)));
 

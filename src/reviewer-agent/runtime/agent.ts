@@ -14,6 +14,7 @@ import {
   runtimeConfigSummary,
   type RuntimeConfig,
 } from "./contractConfig.js";
+import type { VrfProofProvider } from "../chain/vrfProof.js";
 
 export interface AgentConfig {
   finalityFactor: bigint;
@@ -24,8 +25,7 @@ export interface AgentConfig {
   startRequestsMaxPerTick?: number;
   startRequestsMinIntervalMs?: number;
   startRequestsJitterMs?: number;
-  publicKey: [bigint, bigint];
-  proof: [bigint, bigint, bigint, bigint];
+  vrf: VrfProofProvider;
   label: string;
 }
 
@@ -341,8 +341,7 @@ export class ReviewerAgent {
       state: this.state,
       wallet: this.wallet,
       txSigner: this.txSigner,
-      publicKey: this.cfg.publicKey,
-      proof: this.cfg.proof,
+      vrf: this.cfg.vrf,
       log: (m) => this.log(m),
       txQueue: (task) => this.queuedTx(task),
     };

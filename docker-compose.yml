@@ -97,6 +97,7 @@ services:
     environment:
       <<: *agent-env
       AGENT_PRIVATE_KEY: ${AGENT_1_PRIVATE_KEY:?set AGENT_1_PRIVATE_KEY in .env}
+      AGENT_VRF_PRIVATE_KEY: ${AGENT_1_VRF_PRIVATE_KEY:?set AGENT_1_VRF_PRIVATE_KEY in .env}
       AGENT_LABEL: R1
       AGENT_STATE_DIR: /app/state/agent-1
       AGENT_ID: ${AGENT_1_ID:-1001}
@@ -107,6 +108,7 @@ services:
     environment:
       <<: *agent-env
       AGENT_PRIVATE_KEY: ${AGENT_2_PRIVATE_KEY:?set AGENT_2_PRIVATE_KEY in .env}
+      AGENT_VRF_PRIVATE_KEY: ${AGENT_2_VRF_PRIVATE_KEY:?set AGENT_2_VRF_PRIVATE_KEY in .env}
       AGENT_LABEL: R2
       AGENT_STATE_DIR: /app/state/agent-2
       AGENT_ID: ${AGENT_2_ID:-1002}
@@ -117,6 +119,7 @@ services:
     environment:
       <<: *agent-env
       AGENT_PRIVATE_KEY: ${AGENT_3_PRIVATE_KEY:?set AGENT_3_PRIVATE_KEY in .env}
+      AGENT_VRF_PRIVATE_KEY: ${AGENT_3_VRF_PRIVATE_KEY:?set AGENT_3_VRF_PRIVATE_KEY in .env}
       AGENT_LABEL: R3
       AGENT_STATE_DIR: /app/state/agent-3
       AGENT_ID: ${AGENT_3_ID:-1003}
@@ -127,6 +130,7 @@ services:
     environment:
       <<: *agent-env
       AGENT_PRIVATE_KEY: ${AGENT_4_PRIVATE_KEY:?set AGENT_4_PRIVATE_KEY in .env}
+      AGENT_VRF_PRIVATE_KEY: ${AGENT_4_VRF_PRIVATE_KEY:?set AGENT_4_VRF_PRIVATE_KEY in .env}
       AGENT_LABEL: R4
       AGENT_STATE_DIR: /app/state/agent-4
       AGENT_ID: ${AGENT_4_ID:-1004}
@@ -137,6 +141,7 @@ services:
     environment:
       <<: *agent-env
       AGENT_PRIVATE_KEY: ${AGENT_5_PRIVATE_KEY:?set AGENT_5_PRIVATE_KEY in .env}
+      AGENT_VRF_PRIVATE_KEY: ${AGENT_5_VRF_PRIVATE_KEY:?set AGENT_5_VRF_PRIVATE_KEY in .env}
       AGENT_LABEL: R5
       AGENT_STATE_DIR: /app/state/agent-5
       AGENT_ID: ${AGENT_5_ID:-1005}

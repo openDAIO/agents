@@ -20,6 +20,10 @@ set -- npm run agent -- \
   --state-key "$AGENT_STATE_KEY" \
   --label "$AGENT_LABEL"
 
+if [ -n "${AGENT_VRF_PRIVATE_KEY:-}" ]; then
+  set -- "$@" --vrf-privkey "$AGENT_VRF_PRIVATE_KEY"
+fi
+
 if [ "${AGENT_AUTO_REGISTER:-false}" = "true" ] || [ "${AGENT_AUTO_REGISTER:-false}" = "1" ]; then
   : "${AGENT_ID:?AGENT_ID is required when AGENT_AUTO_REGISTER=true}"
   AGENT_ENS_NAME="${AGENT_ENS_NAME:-$AGENT_LABEL.daio.eth}"

@@ -9,6 +9,7 @@ import { ReviewerAgent, type AgentConfig } from "./runtime/agent.js";
 import { StateStore } from "./runtime/state.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { DOMAIN_RESEARCH } from "../shared/types.js";
+import { makeFixtureVrfProvider, makeSecp256k1VrfProvider } from "./chain/vrfProof.js";
 
 async function main() {
   const { values } = parseArgs({
@@ -23,6 +24,7 @@ async function main() {
       "auto-register": { type: "boolean", default: false },
       "agent-id": { type: "string" },
       "ens-name": { type: "string" },
+      "vrf-privkey": { type: "string" },
       "review-election-difficulty": { type: "string" },
       "audit-election-difficulty": { type: "string" },
       "audit-target-limit": { type: "string" },
@@ -89,6 +91,23 @@ async function main() {
   const handles = loadContracts(deployment, ctx.wallet);
   const content = new ContentServiceClient(contentUrl as string);
   const state = StateStore.fromKey(stateDir as string, stateKey as string);
+  const vrfPrivateKey = (values["vrf-privkey"] as string | undefined) ?? process.env.AGENT_VRF_PRIVATE_KEY;
+  const vrf = vrfPrivateKey
+    ? makeSecp256k1VrfProvider(vrfPrivateKey, ctx.provider)
+    : deployment.vrfPublicKey && deployment.vrfProof
+      ? makeFixtureVrfProvider(
+          [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])],
+          [
+            BigInt(deployment.vrfProof[0]),
+            BigInt(deployment.vrfProof[1]),
+            BigInt(deployment.vrfProof[2]),
+            BigInt(deployment.vrfProof[3]),
+          ],
+        )
+      : undefined;
+  if (!vrf) {
+    throw new Error("AGENT_VRF_PRIVATE_KEY is required unless the deployment snapshot provides mock vrfPublicKey and vrfProof");
+  }
 
   if (values["auto-register"]) {
     const agentId = BigInt(values["agent-id"] ?? "1001");
@@ -97,9 +116,21 @@ async function main() {
       ensName,
       agentId,
       domainMask: DOMAIN_RESEARCH,
-      vrfPublicKey: [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])],
+      vrfPublicKey: vrf.publicKey,
     });
     process.stdout.write(`[agent ${label}] register: ${JSON.stringify(res)}\n`);
+  }
+
+  const reviewerInfo = await handles.reviewerRegistry.getReviewer(ctx.wallet.address);
+  if (Boolean(reviewerInfo[0])) {
+    const registeredVrf = (await handles.reviewerRegistry.vrfPublicKey(ctx.wallet.address)) as readonly [bigint, bigint];
+    if (registeredVrf[0] !== vrf.publicKey[0] || registeredVrf[1] !== vrf.publicKey[1]) {
+      throw new Error(
+        `registered VRF public key does not match AGENT_VRF_PRIVATE_KEY for ${ctx.wallet.address}; re-register with the matching VRF key or use the original VRF secret`,
+      );
+    }
+  } else {
+    process.stdout.write(`[agent ${label}] reviewer is not registered; set AGENT_AUTO_REGISTER=true or register before serving\n`);
   }
 
   const cfg: AgentConfig = {
@@ -144,13 +175,7 @@ async function main() {
       250,
       0,
     ),
-    publicKey: [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])],
-    proof: [
-      BigInt(deployment.vrfProof[0]),
-      BigInt(deployment.vrfProof[1]),
-      BigInt(deployment.vrfProof[2]),
-      BigInt(deployment.vrfProof[3]),
-    ],
+    vrf,
     label: label as string,
   };
 

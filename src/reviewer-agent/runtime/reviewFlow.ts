@@ -12,6 +12,7 @@ import type { ReviewArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
+import type { VrfProofProvider } from "../chain/vrfProof.js";
 
 export interface ReviewFlowDeps {
   handles: ContractHandles;
@@ -20,8 +21,7 @@ export interface ReviewFlowDeps {
   state: StateStore;
   wallet: Wallet;
   txSigner: ContractRunner;
-  publicKey: [bigint, bigint];
-  proof: [bigint, bigint, bigint, bigint];
+  vrf: VrfProofProvider;
   log: (msg: string) => void;
   txQueue: <T>(task: () => Promise<T>) => Promise<T>;
 }
@@ -32,7 +32,7 @@ export async function runReview(
   finalityFactor: bigint,
   reviewElectionDifficulty: bigint,
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; reportHash?: string; reportURI?: string }> {
-  const { handles, events, content, state, wallet, publicKey, proof, log } = deps;
+  const { handles, events, content, state, wallet, vrf, log } = deps;
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.ReviewCommit);
   if (startBlock === undefined) {
     return { committed: false, reason: "no review phase start block" };
@@ -47,11 +47,21 @@ export async function runReview(
 
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
   const committeeEpoch = BigInt(lifecycle[5] as bigint | number);
+  const coreAddress = await handles.core.getAddress();
+  const proof = await vrf.proofFor({
+    coreAddress,
+    requestId,
+    phase: REVIEW_SORTITION,
+    epoch: committeeEpoch,
+    participant: wallet.address,
+    phaseStartBlock: BigInt(startBlock),
+    finalityFactor,
+  });
 
   const passed = await sortitionPass({
     vrfCoordinator: handles.vrfCoordinator,
-    coreAddress: await handles.core.getAddress(),
-    publicKey,
+    coreAddress,
+    publicKey: vrf.publicKey,
     proof,
     requestId,
     phase: REVIEW_SORTITION,

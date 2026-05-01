@@ -3,7 +3,7 @@ import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } 
 import { ContentServiceClient } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
-import { RequestStatus } from "../../shared/types.js";
+import { AUDIT_SORTITION, RequestStatus } from "../../shared/types.js";
 import { buildAuditMessages } from "../llm/prompts.js";
 import { chat, extractJson } from "../llm/client.js";
 import { parseAudit } from "../llm/validate.js";
@@ -11,6 +11,7 @@ import type { AuditArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
+import type { VrfProofProvider } from "../chain/vrfProof.js";
 
 export interface AuditFlowDeps {
   handles: ContractHandles;
@@ -19,8 +20,7 @@ export interface AuditFlowDeps {
   state: StateStore;
   wallet: Wallet;
   txSigner: ContractRunner;
-  publicKey: [bigint, bigint];
-  proof: [bigint, bigint, bigint, bigint];
+  vrf: VrfProofProvider;
   log: (msg: string) => void;
   txQueue: <T>(task: () => Promise<T>) => Promise<T>;
 }
@@ -32,7 +32,7 @@ export async function runAudit(
   auditElectionDifficulty: bigint,
   auditTargetLimit: bigint,
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; auditHash?: string; auditURI?: string }> {
-  const { handles, events, content, state, wallet, publicKey, proof, log } = deps;
+  const { handles, events, content, state, wallet, vrf, log } = deps;
 
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.AuditCommit);
   if (startBlock === undefined) return { committed: false, reason: "no audit phase start block" };
@@ -42,22 +42,39 @@ export async function runAudit(
   if (!selfRevealed) return { committed: false, reason: "self did not reveal" };
 
   const reviewers = revealedReviewers.map((r) => getAddress(r.reviewer));
-  const targetProofs = reviewers.filter((r) => r !== getAddress(wallet.address)).map(() => proof);
-  if (targetProofs.length === 0) return { committed: false, reason: "no candidate targets" };
+  const candidateTargets = reviewers.filter((r) => r !== getAddress(wallet.address));
+  if (candidateTargets.length === 0) return { committed: false, reason: "no candidate targets" };
 
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
   const auditEpoch = BigInt(lifecycle[6] as bigint | number);
+  const startBlockBigInt = BigInt(startBlock);
+  const coreAddress = await handles.core.getAddress();
+  const targetProofs = await Promise.all(
+    candidateTargets.map((target) =>
+      vrf.proofFor({
+        coreAddress,
+        requestId,
+        phase: AUDIT_SORTITION,
+        epoch: auditEpoch,
+        participant: wallet.address,
+        target,
+        phaseStartBlock: startBlockBigInt,
+        finalityFactor,
+      }),
+    ),
+  );
+  if (targetProofs.length === 0) return { committed: false, reason: "no candidate targets" };
 
   const verified = (await handles.assignmentManager.verifiedCanonicalAuditTargets(
     await handles.vrfCoordinator.getAddress(),
-    publicKey,
-    await handles.core.getAddress(),
+    vrf.publicKey,
+    coreAddress,
     requestId,
     wallet.address,
     reviewers,
     targetProofs,
     auditEpoch,
-    BigInt(startBlock),
+    startBlockBigInt,
     finalityFactor,
     auditElectionDifficulty,
     auditTargetLimit,

@@ -9,7 +9,7 @@ On a fresh EC2 instance, install Docker Engine and the Docker Compose plugin, th
 ```sh
 git clone --recursive <repo-url> daio-agents
 cd daio-agents
-cp .env.example .env
+cp .env.sample .env
 mkdir -p .deployments .data .state
 chmod 700 .data .state
 chmod 600 .env
@@ -29,10 +29,15 @@ Required values:
 RPC_URL=https://sepolia.infura.io/v3/...
 AGENT_STATE_KEY=0x...
 AGENT_1_PRIVATE_KEY=0x...
+AGENT_1_VRF_PRIVATE_KEY=0x...
 AGENT_2_PRIVATE_KEY=0x...
+AGENT_2_VRF_PRIVATE_KEY=0x...
 AGENT_3_PRIVATE_KEY=0x...
+AGENT_3_VRF_PRIVATE_KEY=0x...
 AGENT_4_PRIVATE_KEY=0x...
+AGENT_4_VRF_PRIVATE_KEY=0x...
 AGENT_5_PRIVATE_KEY=0x...
+AGENT_5_VRF_PRIVATE_KEY=0x...
 ```
 
 Optional relayer value for gas-sponsored request creation:
@@ -44,7 +49,7 @@ CONTENT_RELAYER_CONFIRMATIONS=1
 
 If `CONTENT_RELAYER_PRIVATE_KEY` is set, the content API can accept an EIP-712 request signature from the requester and call `PaymentRouter.createRequestWithUSDAIOBySig(...)` itself. The requester still needs USDAIO balance and must approve the deployed `PaymentRouter`; the relayer only pays gas.
 
-These keys must be funded on Sepolia and allowed by the deployed contracts. If you set `AGENT_AUTO_REGISTER=true`, the agent entrypoint will attempt registry registration with `AGENT_N_ID` and `AGENT_N_ENS_NAME`; funding, staking, and any contract-side permissions still need to be satisfied for the deployment you point at.
+The `AGENT_N_PRIVATE_KEY` values are transaction signers and must be funded with Sepolia ETH. The `AGENT_N_VRF_PRIVATE_KEY` values are separate secp256k1 VRF secrets; the agents derive the matching VRF public keys at boot, register those keys on-chain when `AGENT_AUTO_REGISTER=true`, and generate request-specific VRF proofs during review/audit commits.
 
 Generate a state key:
 
@@ -52,7 +57,7 @@ Generate a state key:
 printf '0x%s\n' "$(openssl rand -hex 32)"
 ```
 
-The deployment snapshot can be provided in either form:
+The Sepolia deployment snapshot is committed at `./.deployments/sepolia.json`. Override it only when you deploy a new contract set:
 
 ```sh
 cp /path/to/sepolia.json .deployments/sepolia.json
@@ -197,6 +202,7 @@ Use this checklist before opening a new EC2 deployment to real traffic.
 - Fund all five agent wallets with Sepolia ETH.
 - Fund the relayer wallet in `CONTENT_RELAYER_PRIVATE_KEY` with Sepolia ETH.
 - Register all five agent wallets as reviewers.
+- If a reviewer is already registered, confirm its on-chain `vrfPublicKey(address)` matches the configured `AGENT_N_VRF_PRIVATE_KEY`; the agent refuses to serve with a mismatched VRF key.
 - Stake enough USDAIO for the active request window. With `maxActiveRequests=2`, each reviewer should have at least `2000 USDAIO` staked.
 - Confirm requesters have USDAIO balance and have approved the deployed `PaymentRouter`.
 - Confirm `DAIOCore.maxActiveRequests()`, the Fast tier quorum, and review/audit sortition settings match the intended production profile.
@@ -210,6 +216,7 @@ Use this checklist before opening a new EC2 deployment to real traffic.
 - Set `CONTENT_RELAYER_PRIVATE_KEY` if the content API should relay signed USDAIO request intents.
 - Set `AGENT_STATE_KEY` to a 32-byte hex value.
 - Set `AGENT_1_PRIVATE_KEY` through `AGENT_5_PRIVATE_KEY`.
+- Set `AGENT_1_VRF_PRIVATE_KEY` through `AGENT_5_VRF_PRIVATE_KEY`; these are required for the deployed `DAIOVRFCoordinator` + `FRAINVRFVerifier` path.
 - Keep fallback values in `.env`: `DAIO_REVIEW_ELECTION_DIFFICULTY=8000`, `DAIO_AUDIT_ELECTION_DIFFICULTY=10000`, and `DAIO_AUDIT_TARGET_LIMIT=2`.
 - Ensure `./.deployments/sepolia.json` exists when using `DAIO_DEPLOYMENT_FILE`.
 - Ensure `./.data` and `./.state` exist and are included in the backup plan.

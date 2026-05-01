@@ -8,7 +8,9 @@ dist/
 
 # Runtime artifacts (per E2E run)
 .data/
-.deployments/
+.deployments/*
+!.deployments/
+!.deployments/sepolia.json
 .state/
 
 # Generated content (regenerable from contracts/BRAIN.pdf via scripts/prepare-samples.sh)

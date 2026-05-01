@@ -48,15 +48,15 @@ export interface DeploymentSnapshot {
     swapAdapter: string;
     universalRouter: string;
   };
-  signers: {
+  signers?: {
     owner: string;
     treasury: string;
     requester: string;
     reviewers: string[];
   };
-  reviewerKeys: string[];
-  ownerKey: string;
-  requesterKey: string;
-  vrfPublicKey: [string, string];
-  vrfProof: [string, string, string, string];
+  reviewerKeys?: string[];
+  ownerKey?: string;
+  requesterKey?: string;
+  vrfPublicKey?: [string, string];
+  vrfProof?: [string, string, string, string];
 }

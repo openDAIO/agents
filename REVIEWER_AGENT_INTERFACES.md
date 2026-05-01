@@ -114,9 +114,9 @@ For `task = "review"`, `content.proposal` and `content.rubric` are required. The
 
 | Check | Required behavior |
 | --- | --- |
-| `proposalURI` fetch | Fetch immutable content from IPFS, Arweave, or an approved content gateway. |
+| `proposalURI` fetch | Fetch immutable content from IPFS, Arweave, an approved content gateway, or a hash-addressed content service (`content://...`). |
 | `proposalHash` | Verify against the configured canonical bytes. If the requester hash scheme is unknown, record that verification was not possible. |
-| `rubricHash` | Verify rubric content if the rubric is available off-chain. |
+| `rubricHash` | Verify rubric content if the rubric is available off-chain. An inline rubric literal supplied directly to the LLM (without a separate content store) is also acceptable provided the runtime records a deterministic `keccak256` placeholder. |
 
 ### 3.3 Review LLM Output
 
@@ -310,9 +310,9 @@ The official reviewer-facing write entrypoint is `DAIOCommitRevealManager`. The 
 | `DAIOCore` | Read request lifecycle/results and emits phase events. |
 | `DAIOCommitRevealManager` | Submit review/audit commits and reveals. |
 | `ReviewerRegistry` | Read registration, eligibility, public VRF key, and agent ID. |
-| `DAIOVRFCoordinator` | Build and verify VRF messages/randomness. |
+| `DAIOVRFCoordinator` | Build and verify VRF messages/randomness. In test/MVP deployments, `MockVRFCoordinator` exposes the same `randomness(...)` view and is a drop-in substitute. |
 | `AssignmentManager` | Preflight canonical audit targets. |
-| `ReputationReader` | Read request-level and long-term reputation signals. |
+| `ReputationReader` (optional) | Read long-term and request-level reputation signals. Request-level signals are also available directly from `DAIOCore.getReviewerResult(requestId, reviewer)` (see § 4.4), so a runtime that only needs request-level data may skip this contract. |
 | `StakeVault` / `USDAIO` | Registration stake approval and balance checks. |
 
 ### 4.2 Registration and Eligibility
@@ -343,20 +343,27 @@ ReviewerRegistry.agentId(address reviewer)
 
 Eligibility requires registration, active state, no suspension, enough available stake, no cooldown, matching domain mask, and passing the reputation gate.
 
+A test/MVP runtime that registered every reviewer with a single shared VRF public key (e.g. when targeting `MockVRFCoordinator`) may load that key from its deployment configuration instead of issuing a per-call `vrfPublicKey(...)` read. Production deployments with per-reviewer keypairs must read `vrfPublicKey(reviewer)` from the registry on every VRF operation.
+
 ### 4.3 Request and Event Indexing
 
 The current contracts do not expose every phase-internal field through getters. The runtime must index events and transaction block numbers.
 
-Required indexed state:
+Indexed state required for the core review/audit flow:
+
+| State | Source |
+| --- | --- |
+| Phase changes | `StatusChanged(requestId, status)` and the block number of that event transaction |
+| Review committee order | `ReviewRevealed(requestId, reviewer, proposalScore, reportHash, reportURI)` in log order |
+| Final result | `RequestFinalized` and `getRequestFinalResult` |
+
+Indexed state recommended for observability and debugging (not required for correctness):
 
 | State | Source |
 | --- | --- |
 | Request creation | `RequestCreated(requestId, requester, tier, feePaid, priorityFee)` |
-| Phase changes | `StatusChanged(requestId, status)` and the block number of that event transaction |
-| Review committee order | `ReviewRevealed(requestId, reviewer, proposalScore, reportHash, reportURI)` in log order |
 | Audit commits/reveals | `AuditCommitted`, `AuditRevealed` |
 | Faults | `ProtocolFault` |
-| Final result | `RequestFinalized` and `getRequestFinalResult` |
 
 The phase start block needed for VRF messages is the block number of the transaction that emitted the latest relevant `StatusChanged` event:
 
@@ -462,6 +469,8 @@ pass = score < electionDifficulty
 ```
 
 `target` is `address(0)` for review sortition and the target reviewer address for audit sortition.
+
+When the deployment uses `MockVRFCoordinator` (test/MVP path), the runtime may bypass `messageFor` and the VRF signing step entirely: any non-zero `uint256[4]` is accepted as a proof, and `randomness(...)` is computed deterministically by hashing the same inputs that `messageFor` would have encoded. A common pattern is to load a single `(publicKey, proof)` pair from a known VRF test vector (e.g. `lib/vrf-solidity/test/data.json` decoded via `FRAINVRFVerifier.decodePoint` / `decodeProof`) and reuse it across all phases. Sortition divergence between participants then comes from the participant address term inside the local `score = keccak256(...) % 10000` check, which is identical to the production formula. Production deployments with `DAIOVRFCoordinator` + `FRAINVRFVerifier` and per-reviewer keypairs must perform the full `messageFor` + sign + submit flow.
 
 ### 4.6 Review Commit/Reveal Interface
 
@@ -581,7 +590,7 @@ The `targets` and `scores` arrays revealed on-chain must exactly match the commi
 
 ### 4.8 Reputation Reads
 
-After finalization, the runtime can read:
+After finalization, the runtime can read long-term reputation through `ReputationReader`:
 
 ```solidity
 ReputationReader.longTermSignals(address reviewer)
@@ -605,6 +614,8 @@ returns (
     bool protocolFault
 )
 ```
+
+Request-level signals are also a strict subset of `DAIOCore.getReviewerResult(requestId, reviewer)` (see § 4.4). A runtime that only consumes request-level data may use `getReviewerResult` directly and skip `ReputationReader` entirely; only long-term signals require the dedicated reader.
 
 ERC-8004 feedback is written by `ReputationLedger` through `ERC8004Adapter`; the reviewer agent should treat the official adapter as the canonical external reputation writer.
 
@@ -667,7 +678,7 @@ The runtime must avoid these cases because the current contracts can slash or ma
 
 ## 7. Minimal Runtime State
 
-The agent runtime must persist at least:
+The agent runtime must persist at least the fields required to reveal without recomputing the LLM output:
 
 ```json
 {
@@ -690,7 +701,16 @@ The agent runtime must persist at least:
     "seed": "0x...",
     "commitTx": "0x...",
     "revealTx": "0x..."
-  },
+  }
+}
+```
+
+The `review` and `audit` blocks are required once the corresponding commit has been submitted. Seeds must be encrypted at rest until reveal.
+
+The following `vrf` block is recommended but not required, since each value can be re-derived from the chain on reveal:
+
+```json
+{
   "vrf": {
     "reviewPhaseStartBlock": "123",
     "auditPhaseStartBlock": "127",
@@ -700,7 +720,9 @@ The agent runtime must persist at least:
 }
 ```
 
-Seeds must be encrypted at rest until reveal. If the process restarts after commit, it must be able to reveal without recomputing LLM outputs.
+Persisting it explicitly makes crash recovery cheaper and decouples reveal from the state of the agent's event poller.
+
+If the process restarts after commit, it must be able to reveal without recomputing LLM outputs. A production-grade runtime should additionally replay historical `StatusChanged` and `ReviewRevealed` events from the request's creation block on startup so it can pick up reveal phases that fired while the agent was down. The reference implementation in this repository starts polling from the chain head on boot, so it relies on the agent process staying alive across the commit/reveal window; full crash-recovery replay is left as future work.
 
 ## 8. Current Implementation Notes
 
@@ -719,6 +741,8 @@ Current contract limitations relevant to agent builders:
 | --- | --- |
 | `phaseStartedBlock` is not exposed by a getter. | Index `StatusChanged` event block numbers. |
 | Revealed reviewer list is internal. | Reconstruct from `ReviewRevealed` events in log order. |
-| Tier config is not exposed by a getter. | Load deployment config off-chain or add a view getter in a future contract change. |
+| Tier config is not exposed by a getter. | Load deployment config off-chain or add a view getter in a future contract change. The reference implementation reads tier-config values (`reviewElectionDifficulty`, `auditElectionDifficulty`, `auditTargetLimit`, `finalityFactor`) from a deployment snapshot or an agent flag. |
 | Audit rationale is not stored on-chain. | Store optional audit artifacts off-chain; only target scores affect current contracts. |
+| Test/MVP VRF | The reference implementation deploys `MockVRFCoordinator` and registers all reviewers with a single VRF public key derived from a known test vector. This is sufficient to exercise sortition, commit/reveal, audit, and finalization but does not produce real BN254 randomness. Production should swap in `DAIOVRFCoordinator` + `FRAINVRFVerifier` plus per-reviewer keypairs. |
+| Crash recovery | The reference implementation polls events from the chain head on startup and does not replay historical `StatusChanged` / `ReviewRevealed` events. An agent that crashes between commit and reveal cannot resume on its own. Production should replay events from the request's creation block on boot. |
 

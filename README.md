@@ -2,7 +2,7 @@
 
 Off-chain reviewer-agent runtime, content service, and end-to-end orchestrator for the [DAIO](https://github.com/openDAIO/contracts) review-consensus protocol.
 
-This repository implements the off-chain side of the contract specified in [REVIEWER_AGENT_INTERFACES.md](REVIEWER_AGENT_INTERFACES.md): three independent AI-powered reviewer-agent processes register with the deployed DAIO contracts, evaluate one document, audit each other, and converge on a finalized consensus score.
+This repository implements the off-chain side of the contract specified in [REVIEWER_AGENT_INTERFACES.md](REVIEWER_AGENT_INTERFACES.md): independent AI-powered reviewer-agent processes register with the deployed DAIO contracts, evaluate documents, audit each other, and converge on finalized consensus scores.
 
 ## What Runs Where
 
@@ -19,7 +19,7 @@ This repository implements the off-chain side of the contract specified in [REVI
                 ┌───────────────────────────────┼──────────────────────────────────┐
                 │                               │                                  │
         ┌───────▼────────┐             ┌────────▼─────────┐               ┌────────▼────────┐
-        │ hardhat node   │             │ content-service  │               │ reviewer-agent  │ × 3
+        │ hardhat node   │             │ content-service  │               │ reviewer-agent  │ × 5
         │ port 8545      │             │ Fastify+SQLite   │               │ - watches RPC   │
         │ chainId 31337  │             │ port 18002       │               │ - calls LLM     │
         │ DAIO contracts │             │ proposals/       │               │ - signs txs     │
@@ -29,7 +29,7 @@ This repository implements the off-chain side of the contract specified in [REVI
                 └───────────────────────────────┴──────────────────────────────────┘
 ```
 
-The three agent processes are fully independent OS-level processes. They share only the chain (RPC) and the content service (HTTP). No in-memory or filesystem coupling.
+The agent processes are fully independent OS-level processes. They share only the chain (RPC) and the content service (HTTP). No in-memory or filesystem coupling.
 
 ## Repository Layout
 
@@ -69,16 +69,16 @@ agents/
 
 1. Orchestrator spawns `npx hardhat node` and waits for the JSON-RPC banner.
 2. Orchestrator deploys the DAIO stack (USDAIO, StakeVault, ReviewerRegistry, AssignmentManager, ConsensusScoring, Settlement, ReputationLedger, DAIOCommitRevealManager, DAIOPriorityQueue, FRAINVRFVerifier, MockVRFCoordinator, DAIOCore, payment stack) using ethers v6 + the compiled artifacts under `contracts/artifacts/`. Tier configs (Fast/Standard/Critical) match the reference fixture.
-3. Orchestrator spawns the content-service and uploads `samples/paper-001.md`. The service computes `keccak256(text)` and stores both, returning a `content://proposals/paper-001` URI plus the canonical hash.
-4. Orchestrator mints USDAIO and pre-registers ten candidate reviewers (each with ENS, agent ID, the shared mock VRF public key, and a 1000 USDAIO stake).
-5. Requester wallet approves the PaymentRouter and calls `createRequestWithUSDAIO(...)`. Request is now `Queued`.
-6. Orchestrator pre-screens reviewer triples by simulating local sortition at the predicted `phaseStartBlock`, picking three addresses where at least two pass review and audit each other.
-7. Three reviewer-agent child processes are spawned (one per chosen address), each given its private key, the deployment snapshot, the content-service URL, and a per-agent state directory. They subscribe to chain events.
-8. Orchestrator calls `core.startNextRequest()`. The request advances to `ReviewCommit` and a `StatusChanged` event fires.
-9. Each agent independently runs the `Review` flow defined in [REVIEWER_AGENT_INTERFACES § 5.1](REVIEWER_AGENT_INTERFACES.md#5-end-to-end-runtime-flow): eligibility check → local sortition pre-check → fetch proposal → call LLM with `task=review` → validate → store canonical artifact → `commitReview(...)` → `revealReview(...)`.
-10. After two reveals, status advances to `AuditCommit`. Each revealed agent runs the `Audit` flow defined in § 5.2: reconstruct revealed reviewers → preflight `AssignmentManager.verifiedCanonicalAuditTargets(...)` → fetch target reports → call LLM with `task=audit` → validate → `commitAudit(...)` → `revealAudit(...)`.
+3. Orchestrator spawns the content-service with a relayer key and prepares `samples/paper-001.md`. The service computes `keccak256(text)` when it builds the request intent and when it stores the verified document.
+4. Orchestrator mints USDAIO and pre-registers candidate reviewers (each with ENS, agent ID, the shared mock VRF public key, and enough stake for the active request window).
+5. Requester wallet approves the PaymentRouter, asks the content API for `/request-intents/usdaio`, signs the returned EIP-712 payload, and submits `/requests/relayed-document`. The content API calls `createRequestWithUSDAIOBySig(...)`, pays gas from the relayer wallet, stores the document, and leaves the on-chain requester as the requester wallet.
+6. Orchestrator pre-screens a five-agent committee by simulating local sortition at the predicted `phaseStartBlock`, checking quorum 3 under the configured review/audit election difficulties.
+7. Five reviewer-agent child processes are spawned, each given its private key, the deployment snapshot, the content-service URL, and a per-agent state directory. They subscribe to chain events.
+8. Orchestrator or the agent keeper loop calls `core.startNextRequest()`. The request advances to `ReviewCommit` and a `StatusChanged` event fires.
+9. Each agent reads the request's copied runtime config snapshot from DAIOCore storage, then independently runs the `Review` flow defined in [REVIEWER_AGENT_INTERFACES § 5.1](REVIEWER_AGENT_INTERFACES.md#5-end-to-end-runtime-flow): eligibility check → local sortition pre-check → fetch proposal → call LLM with `task=review` → validate → store canonical artifact → `commitReview(...)` → `revealReview(...)`.
+10. After the review reveal quorum is met, status advances to `AuditCommit`. Each revealed agent rereads the same request config snapshot and runs the `Audit` flow defined in § 5.2: reconstruct revealed reviewers → preflight `AssignmentManager.verifiedCanonicalAuditTargets(...)` → fetch target reports → call LLM with `task=audit` → validate → `commitAudit(...)` → `revealAudit(...)`.
 11. Once the audit reveal quorum is met, the contract runs `ConsensusScoring`, `Settlement`, and `ReputationLedger` in the same transaction. `RequestFinalized` is emitted.
-12. Orchestrator listens for `RequestFinalized`, reads `getRequestFinalResult(requestId)` and `getReviewerResult(requestId, addr)` for each chosen reviewer, prints a summary, and tears down the agent processes, content-service, and hardhat node.
+12. Orchestrator listens for `RequestFinalized`, reads round-ledger aggregate/reviewer views plus the content API reason/status endpoints, prints a summary, and tears down the agent processes, content-service, and hardhat node.
 
 ## Recorded Run
 
@@ -110,7 +110,7 @@ mechanism,whichallowspipelinedprocessingofinferenceortrainingtransactions. ...
 | `proposalHash` | `0x48271267013cff731a3a8609192fe561ee69256a449d26794363b5b18a8f6a58` |
 | `rubricHash` | `0x2047e2d0856cc3f51b9cf3d7055c2e469d68d58609dafe553151c530a428cb4e` |
 | `requestId` | `1` |
-| `tier` | `Fast` (election difficulty 5000/10000, quorum 2, audit-target limit 2) |
+| `tier` | `Fast` (current E2E default: review election difficulty 8000/10000, audit election difficulty 10000/10000, quorum 3, audit-target limit 2) |
 
 #### Reviewers chosen
 
@@ -255,7 +255,7 @@ Each agent only audited the canonical target returned by `AssignmentManager.veri
 | R2 (`0x976E…`) | 8500 | 9883 | 10000 | **9883** | **44.7352…** | true | false |
 | R3 (`0x90F7…`) | 8600 | 10000 | 10000 | **10000** | **45.2647…** | true | false |
 
-R1 was correctly excluded by VRF sortition (≈ 50 % per-agent pass rate at FAST-tier difficulty 5000/10000). The protocol still met `reviewCommitQuorum=2`, formed a committee from R2 and R3, audited mutually, and finalized. The `min(reportQuality, auditReliability)` BlockFlow contribution rule and the reward pool split are visible in the table above.
+In the recorded legacy run, R1 was excluded by VRF sortition and the protocol still finalized with the configured quorum. Current E2E runs use five spawned agents, quorum 3, review difficulty 8000/10000, and audit difficulty 10000/10000.
 
 ### Verbatim orchestrator stdout
 
@@ -374,6 +374,13 @@ The orchestrator's prescreen routine reproduces the same `randomness % 10000 < e
 
 The content-service holds two kinds of artifact: `proposals` (the document under review, addressed by id) and `reports` (review artifacts, addressed by hash). Its `POST /reports` endpoint canonicalizes the artifact (sorted keys + UTF-8) and recomputes `keccak256` server-side, so a report URI is structurally `content://reports/0x<hash>` where the hash matches what the on-chain `ReviewRevealed` event will carry. Audit-time hash verification against `reportHash` is therefore exact.
 
+For requester UX, the content-service also exposes a relayed USDAIO flow:
+
+- `POST /request-intents/usdaio` returns the exact EIP-712 `RequestIntent` payload for `PaymentRouter.createRequestWithUSDAIOBySig(...)`.
+- `POST /requests/relayed-document` accepts the requester signature and document, sends the relayed transaction with `CONTENT_RELAYER_PRIVATE_KEY`, verifies the emitted `RequestPaid` event and lifecycle requester, then stores the document.
+
+The requester still pays the protocol fee from their own USDAIO balance through `PaymentRouter` allowance; the relayer only pays gas.
+
 ### Event ordering
 
 The agent's chain-event poller in [src/reviewer-agent/chain/events.ts](src/reviewer-agent/chain/events.ts) merges `StatusChanged`, `ReviewRevealed`, and `RequestFinalized` log batches into a single chronological stream sorted by `(blockNumber, logIndex)` before emitting. This is important because a `ReviewRevealed` and the subsequent `StatusChanged(AuditCommit)` can land in the same transaction (the contract calls `_advance` immediately after `emit ReviewRevealed`); without chronological merging, an `AuditCommit` listener can fire before the matching `ReviewRevealed` is recorded into the agent's local state, causing the auditor to skip itself.
@@ -395,7 +402,7 @@ State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a
 ## Known Limitations
 
 - The mock VRF coordinator means `vrfProof` is reused across agents. Real BN254 signing is out of scope for this run; swap to `DAIOVRFCoordinator` + `FRAINVRFVerifier` plus per-agent keypairs for production-like testing.
-- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. This usually still produces a valid quorum because the contract only requires two of three reviewers to pass.
+- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review/audit sortition.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
 - `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested.
 

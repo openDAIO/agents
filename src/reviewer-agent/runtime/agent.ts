@@ -8,6 +8,12 @@ import { runAudit, runAuditReveal, type AuditFlowDeps } from "./auditFlow.js";
 import type { StateStore } from "./state.js";
 import type { JsonRpcProvider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
+import {
+  resolveRequestRuntimeConfig,
+  resolveTierRuntimeConfig,
+  runtimeConfigSummary,
+  type RuntimeConfig,
+} from "./contractConfig.js";
 
 export interface AgentConfig {
   finalityFactor: bigint;
@@ -152,6 +158,7 @@ export class ReviewerAgent {
     this.events.on("status", (e) => {
       void this.handlePhaseChange(e as PhaseChange);
     });
+    await this.logStartupChainConfig();
     await this.events.start();
     this.log(`started; watching events`);
     this.scheduleActiveRefill("startup");
@@ -271,6 +278,60 @@ export class ReviewerAgent {
     }
   }
 
+  private fallbackRuntimeConfig(): RuntimeConfig {
+    return {
+      finalityFactor: this.cfg.finalityFactor,
+      reviewElectionDifficulty: this.cfg.reviewElectionDifficulty,
+      auditElectionDifficulty: this.cfg.auditElectionDifficulty,
+      auditTargetLimit: this.cfg.auditTargetLimit,
+    };
+  }
+
+  private async requestRuntimeConfig(requestId: bigint): Promise<RuntimeConfig> {
+    const resolved = await resolveRequestRuntimeConfig(
+      this.provider,
+      this.handles,
+      requestId,
+      this.fallbackRuntimeConfig(),
+    );
+    const summary = runtimeConfigSummary(resolved.config);
+    if (resolved.source === "contract-storage") {
+      this.log(
+        `request ${requestId} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}`,
+      );
+    } else {
+      this.log(
+        `request ${requestId} config fallback finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}; read failed: ${resolved.error ?? "unknown"}`,
+      );
+    }
+    return resolved.config;
+  }
+
+  private async logStartupChainConfig(): Promise<void> {
+    const maxActive = await this.handles.core.maxActiveRequests().catch(() => undefined);
+    if (maxActive !== undefined) {
+      this.log(`chain maxActiveRequests=${maxActive.toString()}`);
+    }
+
+    for (const [tier, name] of ["Fast", "Standard", "Critical"].entries()) {
+      const resolved = await resolveTierRuntimeConfig(
+        this.provider,
+        this.handles,
+        BigInt(tier),
+        this.fallbackRuntimeConfig(),
+      );
+      const summary = runtimeConfigSummary(resolved.config);
+      if (resolved.source === "contract-storage") {
+        this.log(
+          `tier ${name} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}`,
+        );
+      } else {
+        this.log(`tier ${name} config fallback; storage read failed: ${resolved.error ?? "unknown"}`);
+        break;
+      }
+    }
+  }
+
   private async dispatch(change: PhaseChange): Promise<void> {
     const phase = RequestStatus[change.status] ?? `Status${change.status}`;
     const reviewDeps: ReviewFlowDeps = {
@@ -291,11 +352,12 @@ export class ReviewerAgent {
       switch (change.status) {
         case RequestStatus.ReviewCommit: {
           await this.recordStatus(change.requestId, phase, "running", "phase event received");
+          const runtimeConfig = await this.requestRuntimeConfig(change.requestId);
           const res = await runReview(
             reviewDeps,
             change.requestId,
-            this.cfg.finalityFactor,
-            this.cfg.reviewElectionDifficulty,
+            runtimeConfig.finalityFactor,
+            runtimeConfig.reviewElectionDifficulty,
           );
           if (!res.committed) {
             this.log(`review skip: ${res.reason}`);
@@ -324,12 +386,13 @@ export class ReviewerAgent {
         }
         case RequestStatus.AuditCommit: {
           await this.recordStatus(change.requestId, phase, "running", "phase event received");
+          const runtimeConfig = await this.requestRuntimeConfig(change.requestId);
           const res = await runAudit(
             auditDeps,
             change.requestId,
-            this.cfg.finalityFactor,
-            this.cfg.auditElectionDifficulty,
-            this.cfg.auditTargetLimit,
+            runtimeConfig.finalityFactor,
+            runtimeConfig.auditElectionDifficulty,
+            runtimeConfig.auditTargetLimit,
           );
           if (!res.committed) {
             this.log(`audit skip: ${res.reason}`);

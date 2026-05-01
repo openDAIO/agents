@@ -15,7 +15,7 @@ COPY contracts/package.json contracts/package-lock.json ./contracts/
 RUN cd contracts && npm ci --include=dev --no-audit --no-fund
 
 COPY contracts ./contracts
-RUN cd contracts && npx hardhat compile
+RUN cd contracts && OPTIMIZER_RUNS=${OPTIMIZER_RUNS:-10} npx hardhat compile
 
 COPY src ./src
 COPY scripts ./scripts

@@ -24,6 +24,9 @@ const E2E_QUORUM = 3;
 const E2E_REVIEW_VRF_DIFFICULTY = 8000n;
 const E2E_AUDIT_VRF_DIFFICULTY = 10000n;
 const E2E_AUDIT_TARGET_LIMIT = 2n;
+const E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY ?? "1");
+const E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY ?? "1");
+const E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT ?? "1");
 const E2E_AUDIT_PHASE_START_BLOCK_OFFSET = 6n;
 const E2E_LLM_TIMEOUT_MS = "300000";
 const E2E_LLM_MAX_TOKENS = "2048";
@@ -50,7 +53,7 @@ function booleanEnv(raw: string | undefined, fallback: boolean): boolean {
   throw new Error(`invalid boolean env value: ${raw}`);
 }
 
-async function startContentService(): Promise<{
+async function startContentService(relayerKey?: string): Promise<{
   process: ChildProcess;
   baseUrl: string;
   stop: () => Promise<void>;
@@ -60,7 +63,12 @@ async function startContentService(): Promise<{
   const child = spawn("npx", ["tsx", "src/content-service/cli.ts"], {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, CONTENT_SERVICE_PORT: String(port), CONTENT_SERVICE_HOST: host },
+    env: {
+      ...process.env,
+      CONTENT_SERVICE_PORT: String(port),
+      CONTENT_SERVICE_HOST: host,
+      ...(relayerKey ? { CONTENT_RELAYER_PRIVATE_KEY: relayerKey } : {}),
+    },
   });
   const baseUrl = `http://${host}:${port}`;
   const client = new ContentServiceClient(baseUrl);
@@ -258,8 +266,8 @@ async function main(): Promise<RunResult> {
 
   const provider = new JsonRpcProvider(node.rpcUrl, undefined, { staticNetwork: true });
   // signers: 0=owner, 1=treasury, 2=requester, 3.. candidate reviewers.
-  // Register the full local candidate pool, then spawn the deterministic 5-agent
-  // committee that satisfies quorum=3 under 60% review/audit sortition.
+  // Register the full local candidate pool, then spawn a deterministic 5-agent
+  // committee that satisfies quorum=3 under the configured review/audit sortition.
   const ownerKey = HARDHAT_PRIV_KEYS[0]!;
   const treasuryKey = HARDHAT_PRIV_KEYS[1]!;
   const requesterKey = HARDHAT_PRIV_KEYS[2]!;
@@ -280,7 +288,7 @@ async function main(): Promise<RunResult> {
   process.stdout.write(`[orchestrate] deployment written to ${deploymentPath}\n`);
 
   // 3. Content service
-  const content = await startContentService();
+  const content = await startContentService(treasuryKey);
   const contentClient = new ContentServiceClient(content.baseUrl);
   process.stdout.write(`[orchestrate] content-service ready at ${content.baseUrl}\n`);
 
@@ -313,7 +321,7 @@ async function main(): Promise<RunResult> {
   }
   process.stdout.write(`[orchestrate] registered ${candidateKeys.length} reviewers\n`);
 
-  // 6. Requester approve PaymentRouter + create queued requests.
+  // 6. Requester approves PaymentRouter, then the content API relays signed USDAIO request intents.
   const requesterWallet = new Wallet(requesterKey, provider);
   const requesterManaged = new NonceManager(requesterWallet);
   const requesterHandles = loadContracts(deployment, requesterManaged);
@@ -333,36 +341,48 @@ async function main(): Promise<RunResult> {
     const currentProposalId = i === 0 ? proposalId : `${proposalId}-${i + 1}`;
     const currentProposalURI = `content://proposals/${currentProposalId}`;
     const priorityFee = BigInt(E2E_REQUEST_COUNT - i);
-    const createTx = await requesterHandles.paymentRouter.createRequestWithUSDAIO(
-      currentProposalURI,
-      proposalHash,
-      id(`${currentProposalId}:rubric`),
-      DOMAIN_RESEARCH,
-      FAST,
-      priorityFee,
+    const intent = await contentClient.createUSDAIORequestIntent({
+      requester: requesterWallet.address,
+      proposalURI: currentProposalURI,
+      text: paperText,
+      rubricHash: id(`${currentProposalId}:rubric`),
+      domainMask: DOMAIN_RESEARCH.toString(),
+      tier: FAST,
+      priorityFee: priorityFee.toString(),
+      mimeType: "text/markdown",
+    });
+    const signature = await requesterWallet.signTypedData(
+      intent.typedData.domain,
+      intent.typedData.types,
+      intent.typedData.message,
     );
-    const createReceipt = await createTx.wait();
-    const requestId = BigInt(i + 1);
+    const relayed = await contentClient.submitRelayedRequestDocument({
+      requester: requesterWallet.address,
+      signature,
+      deadline: intent.deadline,
+      proposalURI: currentProposalURI,
+      text: paperText,
+      rubricHash: intent.rubricHash,
+      domainMask: intent.domainMask,
+      tier: intent.tier,
+      priorityFee: intent.priorityFee,
+      mimeType: "text/markdown",
+    });
+    const requestId = BigInt(relayed.relayed.requestId);
     requests.push({
       requestId,
       proposalId: currentProposalId,
       proposalURI: currentProposalURI,
       proposalHash,
-      createTxHash: createReceipt!.hash,
-      createBlock: BigInt(createReceipt!.blockNumber),
+      createTxHash: relayed.relayed.txHash,
+      createBlock: BigInt(relayed.relayed.blockNumber),
       predictedReviewPhaseStartBlock: 0n,
     });
-    process.stdout.write(`[orchestrate] createRequest requestId=${requestId} tx=${createReceipt!.hash}\n`);
-
-    const verifiedProposal = await contentClient.submitRequestDocument({
-      requestId,
-      txHash: createReceipt!.hash,
-      id: currentProposalId,
-      text: paperText,
-      mimeType: "text/markdown",
-    });
     process.stdout.write(
-      `[orchestrate] proposal accepted requestId=${requestId}: ${verifiedProposal.proposal.uri} hash=${verifiedProposal.proposal.hash}\n`,
+      `[orchestrate] relayed createRequest requestId=${requestId} relayer=${relayed.relayed.relayer} tx=${relayed.relayed.txHash}\n`,
+    );
+    process.stdout.write(
+      `[orchestrate] proposal accepted requestId=${requestId}: ${relayed.document.proposal.uri} hash=${relayed.document.proposal.hash}\n`,
     );
   }
 
@@ -417,6 +437,9 @@ async function main(): Promise<RunResult> {
   process.stdout.write(
     `[orchestrate] expected review pass: ${prescreen.reviewPassAddresses.join(", ")}\n`,
   );
+  process.stdout.write(
+    `[orchestrate] agent local config fallback: review=${E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY} audit=${E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY} targetLimit=${E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT}; request config should come from chain\n`,
+  );
 
   // 8. Spawn selected agents
   const stateKey = `0x${crypto.randomBytes(32).toString("hex")}`;
@@ -438,9 +461,9 @@ async function main(): Promise<RunResult> {
       agentId: BigInt(1001 + idx),
       ensName: `reviewer-${idx + 1}.daio.eth`,
       label: `R${i + 1}`,
-      reviewElectionDifficulty: E2E_REVIEW_VRF_DIFFICULTY,
-      auditElectionDifficulty: E2E_AUDIT_VRF_DIFFICULTY,
-      auditTargetLimit: E2E_AUDIT_TARGET_LIMIT,
+      reviewElectionDifficulty: E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY,
+      auditElectionDifficulty: E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY,
+      auditTargetLimit: E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT,
     });
     agentChildren.push(child);
     process.stdout.write(`[orchestrate] spawned agent R${i + 1} for ${wallet.address}\n`);

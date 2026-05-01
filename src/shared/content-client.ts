@@ -82,6 +82,42 @@ export interface AgentReasonsRecord {
   };
 }
 
+export interface USDAIORequestIntentRecord {
+  requester: string;
+  id: string;
+  proposalURI: string;
+  proposalURIHash: string;
+  proposalHash: string;
+  rubricHash: string;
+  domainMask: string;
+  tier: number;
+  tierName: string;
+  priorityFee: string;
+  nonce: string;
+  deadline: string;
+  typedData: {
+    domain: {
+      name: string;
+      version: string;
+      chainId: number;
+      verifyingContract: string;
+    };
+    primaryType: "RequestIntent";
+    types: Record<string, Array<{ name: string; type: string }>>;
+    message: Record<string, string | number>;
+  };
+}
+
+export interface RelayedDocumentRecord {
+  relayed: {
+    relayer: string;
+    requestId: string;
+    txHash: string;
+    blockNumber: number;
+  };
+  document: RequestDocumentRecord;
+}
+
 export class ContentServiceClient {
   constructor(private readonly baseUrl: string) {}
 
@@ -104,6 +140,49 @@ export class ContentServiceClient {
     });
     if (!res.ok) throw new Error(`putProposal: ${res.status} ${await res.text()}`);
     return (await res.json()) as ProposalRecord;
+  }
+
+  async createUSDAIORequestIntent(input: {
+    requester: string;
+    id?: string;
+    proposalURI?: string;
+    text: string;
+    rubricHash?: string;
+    domainMask?: string | number;
+    tier?: number;
+    priorityFee?: string | number;
+    deadline?: string | number;
+    mimeType?: string;
+  }): Promise<USDAIORequestIntentRecord> {
+    const res = await fetch(this.url("/request-intents/usdaio"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(`createUSDAIORequestIntent: ${res.status} ${await res.text()}`);
+    return (await res.json()) as USDAIORequestIntentRecord;
+  }
+
+  async submitRelayedRequestDocument(input: {
+    requester: string;
+    signature: string;
+    deadline: string | number;
+    id?: string;
+    proposalURI?: string;
+    text: string;
+    rubricHash?: string;
+    domainMask?: string | number;
+    tier?: number;
+    priorityFee?: string | number;
+    mimeType?: string;
+  }): Promise<RelayedDocumentRecord> {
+    const res = await fetch(this.url("/requests/relayed-document"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(`submitRelayedRequestDocument: ${res.status} ${await res.text()}`);
+    return (await res.json()) as RelayedDocumentRecord;
   }
 
   async submitRequestDocument(input: {

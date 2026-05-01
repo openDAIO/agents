@@ -30,6 +30,7 @@ const E2E_LLM_MAX_TOKENS = "2048";
 const E2E_LLM_PROPOSAL_CHAR_BUDGET = "16000";
 const E2E_MAX_ACTIVE_REQUESTS = Number(process.env.E2E_MAX_ACTIVE_REQUESTS ?? process.env.DAIO_MAX_ACTIVE_REQUESTS ?? "2");
 const E2E_REQUEST_COUNT = Number(process.env.E2E_REQUEST_COUNT ?? "2");
+const E2E_AGENT_AUTO_START_REQUESTS = booleanEnv(process.env.E2E_AGENT_AUTO_START_REQUESTS, false);
 
 interface RunResult {
   ok: boolean;
@@ -39,6 +40,14 @@ interface RunResult {
 
 async function delay(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
+}
+
+function booleanEnv(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  throw new Error(`invalid boolean env value: ${raw}`);
 }
 
 async function startContentService(): Promise<{
@@ -144,6 +153,7 @@ function spawnAgent(opts: {
         LLM_TIMEOUT_MS: process.env.E2E_LLM_TIMEOUT_MS ?? E2E_LLM_TIMEOUT_MS,
         LLM_MAX_TOKENS: process.env.E2E_LLM_MAX_TOKENS ?? E2E_LLM_MAX_TOKENS,
         LLM_PROPOSAL_CHAR_BUDGET: process.env.E2E_LLM_PROPOSAL_CHAR_BUDGET ?? E2E_LLM_PROPOSAL_CHAR_BUDGET,
+        DAIO_AUTO_START_REQUESTS: String(E2E_AGENT_AUTO_START_REQUESTS),
       },
     },
   );
@@ -211,6 +221,26 @@ async function startQueuedRequests(
     }
   }
   return started;
+}
+
+async function waitForRequestsStarted(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  core: any,
+  requestIds: readonly bigint[],
+  timeoutMs = 60_000,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const statuses = await Promise.all(
+      requestIds.map(async (requestId) => {
+        const lifecycle = await core.getRequestLifecycle(requestId);
+        return Number(lifecycle[1] as bigint | number) as RequestStatus;
+      }),
+    );
+    if (statuses.every((status) => status !== RequestStatus.Queued)) return;
+    await delay(500);
+  }
+  throw new Error(`timed out waiting for agents to auto-start ${requestIds.length} queued requests`);
 }
 
 async function main(): Promise<RunResult> {
@@ -419,25 +449,30 @@ async function main(): Promise<RunResult> {
   // give agents a moment to subscribe before we trigger phase change
   await delay(1500);
 
-  // 9. Trigger startNextRequest. In production this is a keeper/scheduler
-  // policy knob bounded by the contract-level active request cap.
+  // 9. Trigger startNextRequest. The default E2E path keeps this deterministic;
+  // E2E_AGENT_AUTO_START_REQUESTS=true verifies the production keeper path.
   const finalWaits = requests.map((req) => awaitFinalized(provider, handles.rawCore, req.requestId));
-  const startedRequests = await startQueuedRequests(handles.core, E2E_MAX_ACTIVE_REQUESTS);
-  if (startedRequests.length < requests.length) {
-    throw new Error(`started ${startedRequests.length}/${requests.length} queued requests; increase E2E_MAX_ACTIVE_REQUESTS for full E2E`);
-  }
-  const firstStarted = startedRequests[0]!;
-  const startBlockNumber = firstStarted.blockNumber;
-  process.stdout.write(
-    `[orchestrate] startNextRequest count=${startedRequests.length} tx=${firstStarted.txHash} block=${startBlockNumber}\n`,
-  );
-  for (let i = 0; i < startedRequests.length; i++) {
-    const req = requests[i]!;
-    const started = startedRequests[i]!;
-    if (BigInt(started.blockNumber) !== req.predictedReviewPhaseStartBlock) {
-      process.stdout.write(
-        `[orchestrate] WARNING requestId=${req.requestId}: predicted phaseStartBlock=${req.predictedReviewPhaseStartBlock} actual=${started.blockNumber}; sortition may diverge\n`,
-      );
+  if (E2E_AGENT_AUTO_START_REQUESTS) {
+    await waitForRequestsStarted(handles.core, requests.map((req) => req.requestId));
+    process.stdout.write(`[orchestrate] agents auto-started queued requests\n`);
+  } else {
+    const startedRequests = await startQueuedRequests(handles.core, E2E_MAX_ACTIVE_REQUESTS);
+    if (startedRequests.length < requests.length) {
+      throw new Error(`started ${startedRequests.length}/${requests.length} queued requests; increase E2E_MAX_ACTIVE_REQUESTS for full E2E`);
+    }
+    const firstStarted = startedRequests[0]!;
+    const startBlockNumber = firstStarted.blockNumber;
+    process.stdout.write(
+      `[orchestrate] startNextRequest count=${startedRequests.length} tx=${firstStarted.txHash} block=${startBlockNumber}\n`,
+    );
+    for (let i = 0; i < startedRequests.length; i++) {
+      const req = requests[i]!;
+      const started = startedRequests[i]!;
+      if (BigInt(started.blockNumber) !== req.predictedReviewPhaseStartBlock) {
+        process.stdout.write(
+          `[orchestrate] WARNING requestId=${req.requestId}: predicted phaseStartBlock=${req.predictedReviewPhaseStartBlock} actual=${started.blockNumber}; sortition may diverge\n`,
+        );
+      }
     }
   }
 

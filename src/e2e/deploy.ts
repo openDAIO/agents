@@ -21,7 +21,7 @@ function nonNegativeIntEnv(name: string, fallback: number): number {
   return parsed;
 }
 
-function tierConfig(opts: {
+export function tierConfig(opts: {
   reviewElectionDifficulty?: number;
   auditElectionDifficulty?: number;
   reviewCommitQuorum: number;

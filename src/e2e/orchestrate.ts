@@ -1,12 +1,12 @@
 import "dotenv/config";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { JsonRpcProvider, NonceManager, Wallet, id, keccak256, parseEther, toUtf8Bytes } from "ethers";
+import { JsonRpcProvider, JsonRpcSigner, NonceManager, Wallet, ZeroAddress, getAddress, id, keccak256, parseEther, toUtf8Bytes } from "ethers";
 import { startHardhatNode, HARDHAT_PRIV_KEYS } from "./hardhat.js";
-import { deployAll } from "./deploy.js";
+import { deployAll, tierConfig } from "./deploy.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
 import { registerReviewerIfNeeded } from "../reviewer-agent/chain/registration.js";
 import { preScreenCommittee } from "./sortition-prescreen.js";
@@ -35,6 +35,15 @@ const E2E_LLM_PROPOSAL_CHAR_BUDGET = "16000";
 const E2E_MAX_ACTIVE_REQUESTS = Number(process.env.E2E_MAX_ACTIVE_REQUESTS ?? process.env.DAIO_MAX_ACTIVE_REQUESTS ?? "2");
 const E2E_REQUEST_COUNT = Number(process.env.E2E_REQUEST_COUNT ?? "2");
 const E2E_AGENT_AUTO_START_REQUESTS = booleanEnv(process.env.E2E_AGENT_AUTO_START_REQUESTS, false);
+const E2E_CHAIN_MODE = process.env.E2E_CHAIN_MODE ?? (booleanEnv(process.env.E2E_SEPOLIA_FORK, false) ? "sepolia-fork" : "local");
+const E2E_SEPOLIA_DEPLOYMENT_PATH = path.resolve(
+  ROOT,
+  process.env.E2E_SEPOLIA_DEPLOYMENT_PATH ?? ".deployments/sepolia.json",
+);
+const E2E_SEPOLIA_FORK_BLOCK =
+  process.env.E2E_SEPOLIA_FORK_BLOCK && process.env.E2E_SEPOLIA_FORK_BLOCK.trim() !== ""
+    ? Number(process.env.E2E_SEPOLIA_FORK_BLOCK)
+    : undefined;
 
 interface RunResult {
   ok: boolean;
@@ -58,9 +67,32 @@ async function startContentService(relayerKey?: string): Promise<{
   process: ChildProcess;
   baseUrl: string;
   stop: () => Promise<void>;
+}>;
+async function startContentService(opts: {
+  relayerKey?: string;
+  rpcUrl: string;
+  deploymentPath: string;
+  dbPath: string;
+}): Promise<{
+  process: ChildProcess;
+  baseUrl: string;
+  stop: () => Promise<void>;
+}>;
+async function startContentService(input?: string | {
+  relayerKey?: string;
+  rpcUrl: string;
+  deploymentPath: string;
+  dbPath: string;
+}): Promise<{
+  process: ChildProcess;
+  baseUrl: string;
+  stop: () => Promise<void>;
 }> {
+  const opts = typeof input === "string" ? undefined : input;
+  const relayerKey = typeof input === "string" ? input : input?.relayerKey;
   const port = Number(process.env.CONTENT_SERVICE_PORT ?? 18002);
   const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
+  if (opts?.dbPath) mkdirSync(path.dirname(opts.dbPath), { recursive: true });
   const child = spawn("npx", ["tsx", "src/content-service/cli.ts"], {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
@@ -68,6 +100,11 @@ async function startContentService(relayerKey?: string): Promise<{
       ...process.env,
       CONTENT_SERVICE_PORT: String(port),
       CONTENT_SERVICE_HOST: host,
+      ...(opts ? {
+        CONTENT_CHAIN_RPC_URL: opts.rpcUrl,
+        CONTENT_DEPLOYMENT_PATH: opts.deploymentPath,
+        CONTENT_DB_PATH: opts.dbPath,
+      } : {}),
       ...(relayerKey ? { CONTENT_RELAYER_PRIVATE_KEY: relayerKey } : {}),
     },
   });
@@ -108,6 +145,89 @@ async function startContentService(relayerKey?: string): Promise<{
       }
     },
   };
+}
+
+function optionalRpcUrl(): string | undefined {
+  return process.env.E2E_FORK_RPC_URL || process.env.SEPOLIA_RPC_URL || process.env.HARDHAT_FORK_URL || process.env.RPC_URL;
+}
+
+function loadDeploymentSnapshot(deploymentPath: string): DeploymentSnapshot {
+  if (!existsSync(deploymentPath)) throw new Error(`deployment snapshot not found at ${deploymentPath}`);
+  return JSON.parse(readFileSync(deploymentPath, "utf8")) as DeploymentSnapshot;
+}
+
+function quantityHex(value: bigint): string {
+  return `0x${value.toString(16)}`;
+}
+
+async function impersonateAccount(provider: JsonRpcProvider, address: string): Promise<NonceManager> {
+  const account = getAddress(address);
+  await provider.send("hardhat_impersonateAccount", [account]);
+  await provider.send("hardhat_setBalance", [account, quantityHex(parseEther("100"))]);
+  return new NonceManager(new JsonRpcSigner(provider, account));
+}
+
+async function prepareSepoliaForkState(input: {
+  provider: JsonRpcProvider;
+  deployment: DeploymentSnapshot;
+  candidateKeys: string[];
+  requesterKey: string;
+  localFunderKey: string;
+  reviewerStake: bigint;
+}): Promise<void> {
+  const readHandles = loadContracts(input.deployment, input.provider);
+  const registryOwner = process.env.E2E_FORK_OWNER_ADDRESS ?? String(await readHandles.reviewerRegistry.owner());
+  const owner = await impersonateAccount(input.provider, registryOwner);
+  const ownerHandles = loadContracts(input.deployment, owner);
+
+  if (booleanEnv(process.env.E2E_FORK_DISABLE_IDENTITY_MODULES, true)) {
+    const ensVerifier = getAddress(String(await readHandles.reviewerRegistry.ensVerifier()));
+    const erc8004Adapter = getAddress(String(await readHandles.reviewerRegistry.erc8004Adapter()));
+    if (ensVerifier !== ZeroAddress || erc8004Adapter !== ZeroAddress) {
+      await (await ownerHandles.reviewerRegistry.setIdentityModules(ZeroAddress, ZeroAddress)).wait();
+      process.stdout.write(`[orchestrate] sepolia fork: disabled reviewer ENS/ERC8004 gates for local test agents\n`);
+    }
+  }
+
+  if (booleanEnv(process.env.E2E_FORK_CONFIGURE_FAST_TIER, true)) {
+    await (
+      await ownerHandles.core.setTierConfig(
+        FAST,
+        tierConfig({
+          reviewElectionDifficulty: Number(E2E_REVIEW_VRF_DIFFICULTY),
+          auditElectionDifficulty: Number(E2E_AUDIT_VRF_DIFFICULTY),
+          reviewCommitQuorum: E2E_QUORUM,
+          reviewRevealQuorum: E2E_QUORUM,
+          auditCommitQuorum: E2E_QUORUM,
+          auditRevealQuorum: E2E_QUORUM,
+          auditTargetLimit: Number(E2E_AUDIT_TARGET_LIMIT),
+          minIncomingAudit: 1,
+          auditCoverageQuorum: 7000,
+          contributionThreshold: 1000,
+          reviewEpochSize: 25,
+          auditEpochSize: 25,
+          finalityFactor: 2,
+          maxRetries: 0,
+          reviewCommitTimeout: 30 * 60,
+          reviewRevealTimeout: 30 * 60,
+          auditCommitTimeout: 30 * 60,
+          auditRevealTimeout: 30 * 60,
+        }),
+      )
+    ).wait();
+    process.stdout.write(
+      `[orchestrate] sepolia fork: configured Fast tier for agents=${E2E_AGENT_COUNT} quorum=${E2E_QUORUM} reviewDiff=${E2E_REVIEW_VRF_DIFFICULTY} auditDiff=${E2E_AUDIT_VRF_DIFFICULTY}\n`,
+    );
+  }
+
+  const funder = new NonceManager(new Wallet(input.localFunderKey, input.provider));
+  const funderHandles = loadContracts(input.deployment, funder);
+  const requester = new Wallet(input.requesterKey);
+  await (await funderHandles.usdaio.mint(requester.address, parseEther("1000"))).wait();
+  for (const key of input.candidateKeys) {
+    await (await funderHandles.usdaio.mint(new Wallet(key).address, input.reviewerStake)).wait();
+  }
+  process.stdout.write(`[orchestrate] sepolia fork: minted USDAIO to local requester and reviewer wallets\n`);
 }
 
 function spawnAgent(opts: {
@@ -256,6 +376,12 @@ async function waitForRequestsStarted(
 }
 
 async function main(): Promise<RunResult> {
+  if (!["local", "sepolia-fork"].includes(E2E_CHAIN_MODE)) {
+    throw new Error("E2E_CHAIN_MODE must be either local or sepolia-fork");
+  }
+  if (E2E_SEPOLIA_FORK_BLOCK !== undefined && (!Number.isInteger(E2E_SEPOLIA_FORK_BLOCK) || E2E_SEPOLIA_FORK_BLOCK <= 0)) {
+    throw new Error("E2E_SEPOLIA_FORK_BLOCK must be a positive integer when set");
+  }
   if (!Number.isInteger(E2E_MAX_ACTIVE_REQUESTS) || E2E_MAX_ACTIVE_REQUESTS < 0) {
     throw new Error("E2E_MAX_ACTIVE_REQUESTS must be a non-negative integer");
   }
@@ -265,7 +391,15 @@ async function main(): Promise<RunResult> {
   process.stdout.write(`[orchestrate] starting E2E\n`);
 
   // 1. Hardhat node
-  const node = await startHardhatNode({ port: 8545, host: "127.0.0.1" });
+  const forkRpcUrl = E2E_CHAIN_MODE === "sepolia-fork" ? optionalRpcUrl() : undefined;
+  if (E2E_CHAIN_MODE === "sepolia-fork" && !forkRpcUrl) {
+    throw new Error("set E2E_FORK_RPC_URL, SEPOLIA_RPC_URL, HARDHAT_FORK_URL, or RPC_URL for sepolia-fork E2E");
+  }
+  const node = await startHardhatNode({
+    port: 8545,
+    host: "127.0.0.1",
+    fork: forkRpcUrl ? { url: forkRpcUrl, blockNumber: E2E_SEPOLIA_FORK_BLOCK } : undefined,
+  });
   process.stdout.write(`[orchestrate] hardhat ready at ${node.rpcUrl}\n`);
 
   const provider = new JsonRpcProvider(node.rpcUrl, undefined, { staticNetwork: true });
@@ -278,22 +412,39 @@ async function main(): Promise<RunResult> {
   const candidateKeys = HARDHAT_PRIV_KEYS.slice(3);
   const candidateVrfKeys = candidateKeys.map((_, i) => `0x${BigInt(i + 1).toString(16).padStart(64, "0")}`);
 
-  // 2. Deploy
-  const deployment = await deployAll({
-    rpcUrl: node.rpcUrl,
-    ownerKey,
-    treasuryKey,
-    requesterKey,
-    reviewerKeys: candidateKeys,
-    provider,
-  });
+  // 2. Deploy locally or attach to deployed Sepolia addresses on a local fork.
+  let deployment: DeploymentSnapshot;
   mkdirSync(path.join(ROOT, ".deployments"), { recursive: true });
-  const deploymentPath = path.join(ROOT, ".deployments", "local.json");
+  const deploymentPath = path.join(ROOT, ".deployments", E2E_CHAIN_MODE === "sepolia-fork" ? "sepolia-fork-local.json" : "local.json");
+  if (E2E_CHAIN_MODE === "sepolia-fork") {
+    const network = await provider.getNetwork();
+    deployment = {
+      ...loadDeploymentSnapshot(E2E_SEPOLIA_DEPLOYMENT_PATH),
+      chainId: Number(network.chainId),
+      rpcUrl: node.rpcUrl,
+    };
+    process.stdout.write(`[orchestrate] using Sepolia deployment snapshot ${E2E_SEPOLIA_DEPLOYMENT_PATH}\n`);
+  } else {
+    deployment = await deployAll({
+      rpcUrl: node.rpcUrl,
+      ownerKey,
+      treasuryKey,
+      requesterKey,
+      reviewerKeys: candidateKeys,
+      provider,
+    });
+  }
   writeFileSync(deploymentPath, JSON.stringify(deployment, null, 2));
-  process.stdout.write(`[orchestrate] deployment written to ${deploymentPath}\n`);
+  process.stdout.write(`[orchestrate] runtime deployment written to ${deploymentPath}\n`);
 
   // 3. Content service
-  const content = await startContentService(treasuryKey);
+  const contentDbPath = path.join(ROOT, ".data", `content-e2e-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.sqlite`);
+  const content = await startContentService({
+    relayerKey: treasuryKey,
+    rpcUrl: node.rpcUrl,
+    deploymentPath,
+    dbPath: contentDbPath,
+  });
   const contentClient = new ContentServiceClient(content.baseUrl);
   process.stdout.write(`[orchestrate] content-service ready at ${content.baseUrl}\n`);
 
@@ -312,6 +463,17 @@ async function main(): Promise<RunResult> {
   const handles = loadContracts(deployment, ownerManaged);
   const candidateVrfProviders = candidateVrfKeys.map((key) => makeSecp256k1VrfProvider(key, provider));
   const reviewerStake = parseEther(String(1000 * Math.max(1, E2E_MAX_ACTIVE_REQUESTS)));
+
+  if (E2E_CHAIN_MODE === "sepolia-fork") {
+    await prepareSepoliaForkState({
+      provider,
+      deployment,
+      candidateKeys,
+      requesterKey,
+      localFunderKey: ownerKey,
+      reviewerStake,
+    });
+  }
 
   for (let i = 0; i < candidateKeys.length; i++) {
     const wallet = new Wallet(candidateKeys[i]!, provider);

@@ -40,12 +40,23 @@ export async function startHardhatNode(opts: {
   port?: number;
   host?: string;
   silent?: boolean;
+  fork?: {
+    url: string;
+    blockNumber?: number;
+  };
 }): Promise<SpawnedNode> {
   const port = opts.port ?? 8545;
   const host = opts.host ?? "127.0.0.1";
+  const args = ["hardhat", "node", "--hostname", host, "--port", String(port)];
+  if (opts.fork) {
+    args.push("--fork", opts.fork.url);
+    if (opts.fork.blockNumber !== undefined) {
+      args.push("--fork-block-number", String(opts.fork.blockNumber));
+    }
+  }
   const child = spawn(
     "npx",
-    ["hardhat", "node", "--hostname", host, "--port", String(port)],
+    args,
     {
       cwd: CONTRACTS_DIR,
       stdio: ["ignore", "pipe", "pipe"],

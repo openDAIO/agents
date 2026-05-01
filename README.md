@@ -10,9 +10,9 @@ This repository implements the off-chain side of the contract specified in [REVI
                                        ┌────────────────────────────────────┐
                                        │  E2E Orchestrator (npm run e2e)    │
                                        │  - spawns hardhat node             │
-                                       │  - deploys DAIO contracts          │
+                                       │  - deploys or forks DAIO contracts │
                                        │  - spawns content-service          │
-                                       │  - spawns 3 agent processes        │
+                                       │  - spawns 5 agent processes        │
                                        │  - submits request, awaits final   │
                                        └────────┬───────────────────────────┘
                                                 │ child_process.spawn
@@ -67,10 +67,10 @@ agents/
 
 ## How an E2E Run Goes
 
-1. Orchestrator spawns `npx hardhat node` and waits for the JSON-RPC banner.
-2. Orchestrator deploys the DAIO stack (USDAIO, StakeVault, ReviewerRegistry, AssignmentManager, ConsensusScoring, Settlement, ReputationLedger, DAIOCommitRevealManager, DAIOPriorityQueue, FRAINVRFVerifier, MockVRFCoordinator, DAIOCore, payment stack) using ethers v6 + the compiled artifacts under `contracts/artifacts/`. Tier configs (Fast/Standard/Critical) match the reference fixture.
+1. Orchestrator spawns `npx hardhat node` and waits for the JSON-RPC banner. With `E2E_CHAIN_MODE=sepolia-fork`, it starts Hardhat with `--fork` and attaches to the deployed addresses in `.deployments/sepolia.json`.
+2. In local mode, orchestrator deploys the DAIO stack (USDAIO, StakeVault, ReviewerRegistry, AssignmentManager, ConsensusScoring, Settlement, ReputationLedger, DAIOCommitRevealManager, DAIOPriorityQueue, FRAINVRFVerifier, DAIOVRFCoordinator, DAIOCore, payment stack) using ethers v6 + the compiled artifacts under `contracts/artifacts/`. In Sepolia fork mode, it keeps the deployed Sepolia contract code and addresses, then mutates only fork-local state needed for test agents.
 3. Orchestrator spawns the content-service with a relayer key and prepares `samples/paper-001.md`. The service computes `keccak256(text)` when it builds the request intent and when it stores the verified document.
-4. Orchestrator mints USDAIO and pre-registers candidate reviewers (each with ENS, agent ID, the shared mock VRF public key, and enough stake for the active request window).
+4. Orchestrator mints USDAIO and pre-registers candidate reviewers (each with ENS, agent ID, its own derived VRF public key, and enough stake for the active request window). In Sepolia fork mode, it impersonates the deployed owner only inside the fork to disable ENS/ERC8004 reviewer gates and set the Fast tier to the E2E quorum/sortition config.
 5. Requester wallet approves the PaymentRouter, asks the content API for `/request-intents/usdaio`, signs the returned EIP-712 payload, and submits `/requests/relayed-document`. The content API calls `createRequestWithUSDAIOBySig(...)`, pays gas from the relayer wallet, stores the document, and leaves the on-chain requester as the requester wallet.
 6. Orchestrator pre-screens a five-agent committee by simulating local sortition at the predicted `phaseStartBlock`, checking quorum 3 under the configured review/audit election difficulties.
 7. Five reviewer-agent child processes are spawned, each given its private key, the deployment snapshot, the content-service URL, and a per-agent state directory. They subscribe to chain events.
@@ -338,6 +338,21 @@ Run the full E2E:
 npm run e2e
 ```
 
+Run the deployed-contract Sepolia fork E2E:
+
+```bash
+RPC_URL=https://sepolia.infura.io/v3/... npm run e2e:sepolia-fork
+```
+
+Optional fork controls:
+
+```bash
+E2E_SEPOLIA_FORK_BLOCK=10769290
+E2E_SEPOLIA_DEPLOYMENT_PATH=.deployments/sepolia.json
+E2E_FORK_DISABLE_IDENTITY_MODULES=true
+E2E_FORK_CONFIGURE_FAST_TIER=true
+```
+
 Standalone binaries (for debugging):
 
 ```bash
@@ -364,11 +379,7 @@ curl http://127.0.0.1:18002/reports/0x643abeef31189c116d28ed73e4d9162355b4ecddd7
 
 ### VRF and sortition
 
-The E2E `MockVRFCoordinator` accepts any non-zero proof tuple and returns
-`randomness = keccak256(publicKey, proof, core, requestId, phase, epoch, reviewer, target, phaseStartBlock, finalityFactor)`.
-Candidate reviewers in the local E2E register with the same fixture VRF public key from `contracts/lib/vrf-solidity/test/data.json`, so per-reviewer sortition divergence is driven entirely by the participant address term.
-
-Production Sepolia deployments use `DAIOVRFCoordinator` + `FRAINVRFVerifier`. Each agent must be configured with its own `AGENT_N_VRF_PRIVATE_KEY`; the runtime derives the public key for registration and generates request/phase/epoch/target-specific secp256k1 VRF proofs before review and audit commits.
+Both local and Sepolia fork E2E runs use `DAIOVRFCoordinator` + `FRAINVRFVerifier`, not `MockVRFCoordinator`. Each spawned E2E agent receives its own secp256k1 VRF private key; the runtime derives the public key for registration and generates request/phase/epoch/target-specific VRF proofs before review and audit commits.
 
 The orchestrator's prescreen routine reproduces the same `randomness % 10000 < electionDifficulty` check off-chain (in [src/reviewer-agent/chain/sortition.ts](src/reviewer-agent/chain/sortition.ts)) so it can pick three candidates that, at the predicted `phaseStartBlock`, all pass review sortition and form valid mutual audit pairs.
 
@@ -403,7 +414,7 @@ State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a
 
 ## Known Limitations
 
-- The local E2E still uses `MockVRFCoordinator` and a fixture `vrfProof` to keep committee selection deterministic. The Docker/Sepolia path uses per-agent VRF private keys and dynamic proofs.
+- The Sepolia fork E2E mutates fork-local state to register local test reviewers and set a deterministic Fast-tier E2E config. It does not send transactions to Sepolia and does not replace deployed contract code.
 - `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review/audit sortition.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
 - `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested.

@@ -13,6 +13,7 @@
     "content-service": "tsx src/content-service/cli.ts",
     "agent": "tsx src/reviewer-agent/cli.ts",
     "e2e": "tsx src/e2e/cli.ts",
+    "e2e:sepolia-fork": "E2E_CHAIN_MODE=sepolia-fork tsx src/e2e/cli.ts",
     "prepare-samples": "bash scripts/prepare-samples.sh",
     "compile-contracts": "cd contracts && npm install --no-audit --no-fund && OPTIMIZER_RUNS=${OPTIMIZER_RUNS:-10} npx hardhat compile",
     "smoke-llm": "tsx scripts/smoke-llm.ts",

@@ -1,55 +1,305 @@
-# Docker Compose Operation
+# Production Serving Runbook
 
-This stack runs one content API, one MarkItDown conversion API, and five reviewer agents. It is meant for a Sepolia deployment, but the same shape works with any RPC URL and matching deployment snapshot.
+This runbook describes how to serve the current DAIO agent stack on a fresh AWS
+EC2 instance with Docker Compose. It is written for the live Sepolia deployment
+recorded in `./.deployments/sepolia.json`, not for local mock contracts.
 
-## 1. Prepare the host
+The stack runs:
 
-On a fresh EC2 instance, install Docker Engine and the Docker Compose plugin, then clone with submodules:
+- one content API
+- one MarkItDown conversion API
+- five reviewer agent containers
+- one local SQLite database used by the content API
+- persistent local agent state directories
+
+The agents submit transactions to Sepolia, read the deployed contracts, derive
+VRF proofs from their configured VRF private keys, and actively try to join
+eligible requests when the contract allows it.
+
+## 1. Production Topology
+
+Services:
+
+| Service | Container | Host port | Exposure |
+| --- | --- | --- | --- |
+| Content API | `content-service` | `CONTENT_SERVICE_PORT`, default `18002` | expose only to your frontend/backend, VPN, or reverse proxy |
+| MarkItDown API | `markitdown` | `MARKITDOWN_PORT`, default `18003` | keep private unless there is a specific trusted caller |
+| Reviewer nodes | `agent-1` through `agent-5` | none | internal only |
+
+Persistent files:
+
+| Path | Purpose | Backup |
+| --- | --- | --- |
+| `.env` | RPC, wallet keys, VRF keys, LLM config, service config | yes, encrypted |
+| `.deployments/sepolia.json` | contract deployment snapshot used by services | yes |
+| `.data/content.sqlite` | content API documents, statuses, reasons, request metadata | yes |
+| `.state/agent-*` | local reviewer runtime state | yes |
+
+The requester is normally an external user. The requester does not need to run
+inside this stack. If relayed request creation is enabled, the requester signs an
+EIP-712 payload and the content API relayer wallet pays Sepolia gas.
+
+## 2. AWS Instance
+
+Recommended baseline for the five-agent Sepolia stack:
+
+- AMI: Ubuntu Server 22.04 LTS or 24.04 LTS
+- Instance: 8 vCPU / 32 GiB RAM, for example `c7i.2xlarge`, `m7i.2xlarge`, or
+  equivalent
+- Minimum for light traffic with a remote LLM: 4 vCPU / 16 GiB RAM
+- Disk: 100 GiB gp3 EBS
+- Network: Elastic IP if any upstream service uses IP allowlists
+
+The current stack does not run the LLM locally. CPU and memory are mostly used by
+Node.js services, MarkItDown conversions, Docker builds, and concurrent request
+processing. Use a larger instance if you expect large PDFs, high conversion
+volume, or a local LLM sidecar.
+
+Security group baseline:
+
+| Port | Source | Purpose |
+| --- | --- | --- |
+| `22/tcp` | operator IPs only | SSH |
+| `443/tcp` | public or trusted clients | reverse proxy or API gateway, if used |
+| `18002/tcp` | trusted frontend/backend, VPN, or Tailscale only | content API if exposed directly |
+| `18003/tcp` | private/internal only | MarkItDown API |
+
+Outbound HTTPS must be allowed for Sepolia RPC, the LLM endpoint, GitHub, npm,
+Docker registries, and package indexes.
+
+## 3. External Prerequisites
+
+Before booting the instance, prepare these external dependencies.
+
+Sepolia RPC:
+
+- A Sepolia RPC URL with enough rate limit for five agents, the content service,
+  and request traffic.
+- If the provider uses IP allowlists, allow the EC2 Elastic IP.
+
+LLM endpoint:
+
+- An OpenAI-compatible endpoint reachable from the EC2 instance.
+- Allow the EC2 Elastic IP on the LLM firewall.
+- Confirm the endpoint supports the configured model and token budget.
+
+Wallets:
+
+- Five reviewer transaction wallets, one per agent.
+- Five reviewer VRF private keys, one per agent. These are separate from the
+  transaction private keys.
+- One optional relayer transaction wallet for `CONTENT_RELAYER_PRIVATE_KEY`.
+- External requester wallets, operated by users or your frontend flow.
+
+Funds and permissions:
+
+- Each reviewer transaction wallet needs Sepolia ETH for transactions.
+- The relayer wallet needs Sepolia ETH if relayed request creation is enabled.
+- Each reviewer must be registered on-chain with the VRF public key derived from
+  its configured `AGENT_N_VRF_PRIVATE_KEY`.
+- Each reviewer must have enough USDAIO staked for the active request window.
+  With `maxActiveRequests=2`, use at least `2000 USDAIO` staked per reviewer.
+- Requesters need USDAIO balance and must approve the deployed `PaymentRouter`
+  before using the relayed USDAIO request API.
+
+For the current Sepolia test deployment, USDAIO is a test token used for service
+validation. Follow the deployment's token minting policy for test funding; do
+not assume the same policy for a mainnet deployment.
+
+## 4. Install Docker on a Fresh EC2 Host
+
+SSH into the instance:
+
+```sh
+ssh ubuntu@<ec2-public-ip>
+```
+
+Install Docker Engine and the Compose plugin:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg git jq openssl
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"
+```
+
+Start a new shell so the Docker group applies:
+
+```sh
+newgrp docker
+docker version
+docker compose version
+```
+
+Enable clock sync:
+
+```sh
+sudo timedatectl set-ntp true
+timedatectl status
+```
+
+Optional but recommended Docker log rotation:
+
+```sh
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5"
+  }
+}
+JSON
+sudo systemctl restart docker
+```
+
+## 5. Clone the Repository
+
+Clone with submodules:
 
 ```sh
 git clone --recursive <repo-url> daio-agents
 cd daio-agents
-cp .env.sample .env
-mkdir -p .deployments .data .state
-chmod 700 .data .state
-chmod 600 .env
-```
-
-If you cloned without submodules:
-
-```sh
 git submodule update --init --recursive
 ```
 
-## 2. Fill `.env`
-
-Required values:
+Create persistent directories:
 
 ```sh
-RPC_URL=https://sepolia.infura.io/v3/...
-AGENT_STATE_KEY=0x...
-AGENT_1_PRIVATE_KEY=0x...
-AGENT_1_VRF_PRIVATE_KEY=0x...
-AGENT_2_PRIVATE_KEY=0x...
-AGENT_2_VRF_PRIVATE_KEY=0x...
-AGENT_3_PRIVATE_KEY=0x...
-AGENT_3_VRF_PRIVATE_KEY=0x...
-AGENT_4_PRIVATE_KEY=0x...
-AGENT_4_VRF_PRIVATE_KEY=0x...
-AGENT_5_PRIVATE_KEY=0x...
-AGENT_5_VRF_PRIVATE_KEY=0x...
+mkdir -p .deployments .data .state
+chmod 700 .data .state
+cp .env.sample .env
+chmod 600 .env
 ```
 
-Optional relayer value for gas-sponsored request creation:
+Confirm the submodule commits:
 
 ```sh
-CONTENT_RELAYER_PRIVATE_KEY=0x...
-CONTENT_RELAYER_CONFIRMATIONS=1
+git submodule status --recursive
 ```
 
-If `CONTENT_RELAYER_PRIVATE_KEY` is set, the content API can accept an EIP-712 request signature from the requester and call `PaymentRouter.createRequestWithUSDAIOBySig(...)` itself. The requester still needs USDAIO balance and must approve the deployed `PaymentRouter`; the relayer only pays gas.
+The `contracts` submodule must match the ABI/spec for the deployed Sepolia
+contracts. Do not replace the deployment snapshot or submodule commit unless you
+are intentionally moving the service to a new deployment.
 
-The `AGENT_N_PRIVATE_KEY` values are transaction signers and must be funded with Sepolia ETH. The `AGENT_N_VRF_PRIVATE_KEY` values are separate secp256k1 VRF secrets; the agents derive the matching VRF public keys at boot, register those keys on-chain when `AGENT_AUTO_REGISTER=true`, and generate request-specific VRF proofs during review/audit commits.
+## 6. Deployment Snapshot
+
+The production Sepolia snapshot is committed as:
+
+```sh
+.deployments/sepolia.json
+```
+
+Use it by setting:
+
+```sh
+DAIO_DEPLOYMENT_FILE=sepolia.json
+```
+
+Verify the snapshot before boot:
+
+```sh
+jq '.chainId, .contracts' .deployments/sepolia.json
+```
+
+If a new contract set is deployed, either replace `.deployments/sepolia.json` or
+provide an environment override:
+
+```sh
+DAIO_DEPLOYMENT_JSON_B64=<base64-encoded deployment json>
+```
+
+Linux encoding:
+
+```sh
+base64 -w0 .deployments/sepolia.json
+```
+
+macOS encoding:
+
+```sh
+base64 < .deployments/sepolia.json | tr -d '\n'
+```
+
+## 7. Configure `.env`
+
+Edit `.env` on the EC2 host:
+
+```sh
+nano .env
+```
+
+Required chain fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `RPC_URL` | yes | Sepolia RPC used by all services |
+| `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
+| `DAIO_DEPLOYMENT_JSON_B64` | optional | use only when overriding the mounted snapshot |
+
+Public deployment address fields in `.env.sample` are documentation for
+operators and downstream services. Runtime services read the deployment snapshot.
+
+LLM fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `LLM_BASE_URL` | yes | OpenAI-compatible base URL, for example `http://host:port/v1` |
+| `LLM_MODEL` | yes | model served by the LLM endpoint |
+| `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
+| `LLM_MAX_TOKENS` | yes | response token budget |
+| `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
+| `LLM_REASONING_EFFORT` | optional | forwarded when the endpoint supports it |
+
+Content API fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `CONTENT_SERVICE_BIND` | yes | host bind address, default `127.0.0.1` |
+| `CONTENT_SERVICE_PORT` | yes | host port, default `18002` |
+| `CONTENT_DB_PATH` | informational | compose stores DB at `/app/data/content.sqlite` mapped from `.data` |
+| `CONTENT_RELAYER_PRIVATE_KEY` | optional | enables relayed request creation |
+| `CONTENT_RELAYER_CONFIRMATIONS` | optional | confirmation wait count after relayer tx |
+
+MarkItDown fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `MARKITDOWN_BIND` | yes | host bind address, default `127.0.0.1` |
+| `MARKITDOWN_PORT` | yes | host port, default `18003` |
+| `MARKITDOWN_MAX_UPLOAD_BYTES` | yes | upload limit, default 50 MiB |
+| `MARKITDOWN_ENABLE_PLUGINS` | optional | keep `false` unless explicitly needed |
+
+Agent runtime fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `AGENT_STATE_KEY` | yes | 32-byte local state encryption/signing key |
+| `AGENT_AUTO_REGISTER` | optional | if `true`, agents attempt reviewer registration at boot |
+| `DAIO_AUTO_START_REQUESTS` | yes | keep `true` for active production serving |
+| `DAIO_START_REQUESTS_MAX_PER_TICK` | yes | max start attempts per polling tick, default `2` |
+| `DAIO_START_REQUESTS_MIN_INTERVAL_MS` | yes | polling interval floor |
+| `DAIO_START_REQUESTS_JITTER_MS` | yes | spreads agent tx timing |
+| `DAIO_REVIEW_ELECTION_DIFFICULTY` | fallback | agents prefer on-chain request config |
+| `DAIO_AUDIT_ELECTION_DIFFICULTY` | fallback | agents prefer on-chain request config |
+| `DAIO_AUDIT_TARGET_LIMIT` | fallback | agents prefer on-chain request config |
+
+Per-agent fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `AGENT_N_PRIVATE_KEY` | yes | transaction signer, must hold Sepolia ETH |
+| `AGENT_N_VRF_PRIVATE_KEY` | yes | secp256k1 VRF secret used to derive proofs |
+| `AGENT_N_ID` | if auto-registering | identity id passed to reviewer registration |
+| `AGENT_N_ENS_NAME` | if auto-registering | ENS name passed to reviewer registration |
 
 Generate a state key:
 
@@ -57,88 +307,185 @@ Generate a state key:
 printf '0x%s\n' "$(openssl rand -hex 32)"
 ```
 
-The Sepolia deployment snapshot is committed at `./.deployments/sepolia.json`. Override it only when you deploy a new contract set:
+Generate candidate VRF keys:
 
 ```sh
-cp /path/to/sepolia.json .deployments/sepolia.json
-DAIO_DEPLOYMENT_FILE=sepolia.json
+for i in 1 2 3 4 5; do printf 'AGENT_%s_VRF_PRIVATE_KEY=0x%s\n' "$i" "$(openssl rand -hex 32)"; done
 ```
 
-or as an environment value:
+If an agent rejects a VRF key as invalid, generate a new one. Do not reuse the
+same private key for transaction signing and VRF.
+
+Do not put E2E-only fields such as `E2E_CHAIN_MODE`, `E2E_FORK_RPC_URL`, or
+`E2E_FORK_DISABLE_IDENTITY_MODULES` into the production operational path. They
+are for local validation and Sepolia fork tests only.
+
+## 8. On-chain Preparation
+
+Perform these checks before starting the containers.
+
+Reviewer registration:
+
+- If reviewers are already registered, set `AGENT_AUTO_REGISTER=false`.
+- If using `AGENT_AUTO_REGISTER=true`, make sure the deployment's identity
+  checks accept the configured `AGENT_N_ID` and `AGENT_N_ENS_NAME` values.
+- The on-chain VRF public key for each reviewer must match the configured
+  `AGENT_N_VRF_PRIVATE_KEY`. Agents refuse to serve when the key does not match.
+
+Reviewer funds:
+
+- Each `AGENT_N_PRIVATE_KEY` wallet has Sepolia ETH.
+- Each reviewer has enough USDAIO balance and stake.
+- For `maxActiveRequests=2`, stake at least `2000 USDAIO` per reviewer.
+
+Relayer:
+
+- `CONTENT_RELAYER_PRIVATE_KEY` wallet has Sepolia ETH.
+- Keep this as a hot wallet with only operational gas.
+
+Requester flow:
+
+- Requester holds USDAIO.
+- Requester approves the deployed `PaymentRouter` for the amount needed by the
+  selected tier and priority fee.
+- Requester signs the EIP-712 typed data returned by
+  `POST /request-intents/usdaio`.
+
+Runtime contract config:
+
+- `DAIOCore.maxActiveRequests()` is the authoritative active request limit.
+- Tier quorum, review sortition probability, audit sortition probability, and
+  audit target limit are authoritative on-chain values.
+- Agents read the global active request limit at boot and decode each request's
+  copied config snapshot before local VRF eligibility checks.
+- The env values `DAIO_REVIEW_ELECTION_DIFFICULTY`,
+  `DAIO_AUDIT_ELECTION_DIFFICULTY`, and `DAIO_AUDIT_TARGET_LIMIT` are fallback
+  values only.
+
+There is no separate keeper container in this compose stack. Each reviewer agent
+runs its own auto-start loop and attempts to join eligible queued requests when
+capacity, VRF eligibility, and contract rules allow it.
+
+## 9. Build and Boot
+
+Validate the compose file:
 
 ```sh
-DAIO_DEPLOYMENT_JSON_B64=<base64 encoded deployment json>
+docker compose config --quiet
 ```
 
-On Linux, encode with:
+Build images:
 
 ```sh
-base64 -w0 .deployments/sepolia.json
+docker compose build
 ```
 
-On macOS:
+Start the stack:
 
 ```sh
-base64 < .deployments/sepolia.json | tr -d '\n'
-```
-
-Agent runtime config is chain-first. On startup each agent reads `DAIOCore.maxActiveRequests()` and decodes the tier runtime config from DAIOCore storage for logging. For each request it decodes that request's copied config snapshot from DAIOCore storage before local sortition/audit-target checks. The `.env` values below are fallbacks for incompatible layouts or temporary RPC read failures:
-
-```sh
-DAIO_REVIEW_ELECTION_DIFFICULTY=8000
-DAIO_AUDIT_ELECTION_DIFFICULTY=10000
-DAIO_AUDIT_TARGET_LIMIT=2
-```
-
-## 3. Start
-
-```sh
-docker compose up -d --build
+docker compose up -d
 docker compose ps
 ```
 
-Health checks:
+Follow logs:
 
 ```sh
-curl http://127.0.0.1:18002/health
-curl http://127.0.0.1:18003/health
-```
-
-Logs:
-
-```sh
-docker compose logs -f content-service agent-1
+docker compose logs -f content-service
 docker compose logs -f agent-1 agent-2 agent-3 agent-4 agent-5
 ```
 
-## 4. Document conversion
+Agent logs should show contract-derived config. A healthy boot includes lines
+similar to:
 
-The MarkItDown service converts uploaded files into Markdown. Submit the returned Markdown to the content API request document endpoint.
-
-```sh
-curl -sS -F file=@paper.pdf http://127.0.0.1:18003/convert
+```text
+config from contract storage finality=2 reviewDiff=8000 auditDiff=10000 auditTargetLimit=2
 ```
 
-For raw uploads:
+If an agent exits immediately, check:
+
+- missing `AGENT_N_PRIVATE_KEY`
+- missing `AGENT_N_VRF_PRIVATE_KEY`
+- invalid `AGENT_STATE_KEY`
+- wrong deployment snapshot
+- reviewer registration or VRF public key mismatch
+- no Sepolia ETH for boot-time transactions
+
+## 10. Health Checks
+
+From the EC2 host:
 
 ```sh
-curl -sS \
-  -H 'X-Filename: paper.pdf' \
-  --data-binary @paper.pdf \
-  http://127.0.0.1:18003/convert
+curl -sS http://127.0.0.1:18002/health
+curl -sS http://127.0.0.1:18003/health
 ```
 
-WebP uploads are accepted; the server pre-converts `.webp` files to PNG before handing them to MarkItDown.
+MarkItDown WebP conversion:
 
-## 5. Relayed USDAIO request API
+```sh
+curl -sS -F file=@samples/counterexample.webp http://127.0.0.1:18003/convert
+```
 
-The requester first approves USDAIO to the deployed `PaymentRouter`. Then ask the content API for the typed data to sign:
+LLM smoke test through an agent image:
+
+```sh
+docker compose run --rm --entrypoint node agent-1 -e '
+const base = process.env.LLM_BASE_URL.replace(/\/$/, "");
+const body = {
+  model: process.env.LLM_MODEL,
+  messages: [{ role: "user", content: "Return JSON: {\"ok\":true}" }],
+  max_tokens: 64,
+  temperature: 0,
+  response_format: { type: "json_object" }
+};
+fetch(`${base}/chat/completions`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body)
+})
+  .then(async (res) => {
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${res.status} ${text}`);
+    console.log(text.slice(0, 500));
+  })
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+'
+```
+
+Optional Sepolia fork E2E validation against the deployed contract addresses:
+
+```sh
+RPC_URL=<sepolia-rpc-url> E2E_REQUEST_COUNT=1 E2E_MAX_ACTIVE_REQUESTS=2 npm run e2e:sepolia-fork
+```
+
+That command is a pre-production validation tool. It forks Sepolia locally and
+uses `./.deployments/sepolia.json` addresses without replacing deployed contract
+code. It is not the production serving process.
+
+## 11. API Flow
+
+### Relayed USDAIO request
+
+1. Requester approves USDAIO spending for the deployed `PaymentRouter`.
+2. Frontend calls `POST /request-intents/usdaio`.
+3. Requester signs the returned EIP-712 `typedData`.
+4. Frontend calls `POST /requests/relayed-document` with the document and
+   signature.
+5. Content API sends `PaymentRouter.createRequestWithUSDAIOBySig(...)` from
+   `CONTENT_RELAYER_PRIVATE_KEY`.
+6. Content API verifies the emitted request event and stores the document.
+7. Agents process the request through on-chain assignment, review, audit, and
+   settlement.
+
+Intent example:
 
 ```sh
 curl -sS http://127.0.0.1:18002/request-intents/usdaio \
   -H 'Content-Type: application/json' \
   -d '{
-    "requester": "0x...",
+    "requester": "0xRequester",
     "id": "paper-001",
     "text": "# paper markdown",
     "domainMask": "1",
@@ -147,172 +494,276 @@ curl -sS http://127.0.0.1:18002/request-intents/usdaio \
   }'
 ```
 
-Sign the returned `typedData` with the requester wallet, then submit the document and signature:
+Relayed submission example:
 
 ```sh
 curl -sS http://127.0.0.1:18002/requests/relayed-document \
   -H 'Content-Type: application/json' \
   -d '{
-    "requester": "0x...",
+    "requester": "0xRequester",
     "id": "paper-001",
     "text": "# paper markdown",
     "domainMask": "1",
     "tier": 0,
     "priorityFee": "0",
     "deadline": "1770000000",
-    "signature": "0x..."
+    "signature": "0xSignature"
   }'
 ```
 
-The response contains the relayer TX hash, created `requestId`, and the stored verified document.
+### On-chain request first, document upload second
 
-## 6. Networking and security
+Use this path when the requester sends the on-chain request transaction directly.
 
-By default, the APIs bind to `127.0.0.1` on the host. For Tailscale-only access, set:
+1. Requester creates the on-chain request transaction.
+2. Frontend waits for the transaction hash.
+3. Frontend calls `POST /requests/:requestId/document`.
+4. Content API verifies the on-chain request before accepting the document.
+
+Document upload:
+
+```sh
+curl -sS http://127.0.0.1:18002/requests/<requestId>/document \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "requester": "0xRequester",
+    "txHash": "0xRequestTxHash",
+    "text": "# paper markdown",
+    "mimeType": "text/markdown"
+  }'
+```
+
+### Status and reasons
+
+Per request agent statuses:
+
+```sh
+curl -sS http://127.0.0.1:18002/requests/<requestId>/agent-statuses
+```
+
+Single agent reason history:
+
+```sh
+curl -sS http://127.0.0.1:18002/requests/<requestId>/agents/<agentAddress>/reasons
+```
+
+Stored document:
+
+```sh
+curl -sS http://127.0.0.1:18002/requests/<requestId>/document
+```
+
+Raw hidden model chain-of-thought is not exposed by this stack. The reasons API
+returns persisted review and audit reason artifacts plus raw model output fields
+that the runtime explicitly stores.
+
+## 12. MarkItDown Conversion
+
+Convert multipart uploads:
+
+```sh
+curl -sS -F file=@paper.pdf http://127.0.0.1:18003/convert
+```
+
+Convert raw uploads:
+
+```sh
+curl -sS \
+  -H 'X-Filename: paper.pdf' \
+  --data-binary @paper.pdf \
+  http://127.0.0.1:18003/convert
+```
+
+WebP uploads are accepted. The server pre-converts `.webp` files to PNG before
+passing them to MarkItDown.
+
+For long documents, the content path stores the submitted Markdown and the agent
+prompting path applies `LLM_PROPOSAL_CHAR_BUDGET` before LLM review generation.
+Increase the timeout and char budget only after confirming the LLM endpoint can
+handle the larger payloads.
+
+## 13. Network Exposure
+
+The compose file binds APIs to `127.0.0.1` by default:
+
+```sh
+CONTENT_SERVICE_BIND=127.0.0.1
+MARKITDOWN_BIND=127.0.0.1
+```
+
+For Tailscale-only access:
 
 ```sh
 CONTENT_SERVICE_BIND=<tailscale-ip>
 MARKITDOWN_BIND=<tailscale-ip>
 ```
 
-Avoid binding to `0.0.0.0` unless the EC2 security group, host firewall, and any API authentication layer are already configured. Private keys live in `.env`, so keep that file out of Git and restrict filesystem access. Treat `CONTENT_RELAYER_PRIVATE_KEY` like a hot wallet key and fund it only with operational gas.
+For public traffic, prefer a reverse proxy or API gateway with TLS,
+authentication, rate limits, and upload limits. Keep MarkItDown private unless a
+trusted caller requires direct access.
 
-## 7. Operational notes
+Minimal Nginx shape for the content API:
 
-The content service persists SQLite data under `./.data/content.sqlite`; agent local state is under `./.state/agent-*`. The contracts are compiled inside the app image so ABI artifacts match the checked-out contracts submodule.
+```nginx
+server {
+  listen 443 ssl;
+  server_name api.example.com;
 
-Agents run with `DAIO_AUTO_START_REQUESTS=true` and will actively try to join eligible requests whenever the contract allows it. Tune `DAIO_START_REQUESTS_MAX_PER_TICK`, `DAIO_START_REQUESTS_MIN_INTERVAL_MS`, and the contract-side active request limit together when increasing throughput. Sortition and audit-target parameters should be changed on the contract tier config; the agent reads the request snapshot from chain and uses env values only as fallback.
+  client_max_body_size 60m;
 
-## 8. Production serving checklist
+  location / {
+    proxy_pass http://127.0.0.1:18002;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+}
+```
 
-Use this checklist before opening a new EC2 deployment to real traffic.
+Avoid exposing raw `18002` or `18003` to the public internet unless the EC2
+security group, host firewall, and application-level controls are already in
+place.
 
-### External allowlists
+## 14. Operations
 
-- Attach an Elastic IP to the EC2 instance if any upstream service uses IP allowlists.
-- Allow the EC2 Elastic IP on the LLM endpoint firewall. With the default config, the EC2 instance must reach `LLM_BASE_URL` on its OpenAI-compatible API port.
-- Check any Sepolia RPC provider IP allowlist, API key domain restrictions, and rate limits.
-- Confirm EC2 outbound access to the Sepolia RPC URL, the LLM endpoint, GitHub, npm, Docker registries, and Python package indexes.
-- Confirm system time is synchronized. Bad clock drift can break request deadlines and makes chain/log debugging harder.
-
-### Chain and wallets
-
-- Confirm `./.deployments/sepolia.json` matches the contracts deployed on Sepolia.
-- Confirm the checked-out `contracts` submodule commit matches the deployment ABI/spec.
-- Fund all five agent wallets with Sepolia ETH.
-- Fund the relayer wallet in `CONTENT_RELAYER_PRIVATE_KEY` with Sepolia ETH.
-- Register all five agent wallets as reviewers.
-- If a reviewer is already registered, confirm its on-chain `vrfPublicKey(address)` matches the configured `AGENT_N_VRF_PRIVATE_KEY`; the agent refuses to serve with a mismatched VRF key.
-- Stake enough USDAIO for the active request window. With `maxActiveRequests=2`, each reviewer should have at least `2000 USDAIO` staked.
-- Confirm requesters have USDAIO balance and have approved the deployed `PaymentRouter`.
-- Confirm `DAIOCore.maxActiveRequests()`, the Fast tier quorum, and review/audit sortition settings match the intended production profile.
-
-### Host files and environment
-
-- Keep `.env` out of Git and restrict it with `chmod 600 .env`.
-- Set `RPC_URL`.
-- Set `DAIO_DEPLOYMENT_FILE=sepolia.json`, or provide `DAIO_DEPLOYMENT_JSON_B64`.
-- Set `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TIMEOUT_MS`, `LLM_MAX_TOKENS`, and `LLM_PROPOSAL_CHAR_BUDGET`.
-- Set `CONTENT_RELAYER_PRIVATE_KEY` if the content API should relay signed USDAIO request intents.
-- Set `AGENT_STATE_KEY` to a 32-byte hex value.
-- Set `AGENT_1_PRIVATE_KEY` through `AGENT_5_PRIVATE_KEY`.
-- Set `AGENT_1_VRF_PRIVATE_KEY` through `AGENT_5_VRF_PRIVATE_KEY`; these are required for the deployed `DAIOVRFCoordinator` + `FRAINVRFVerifier` path.
-- Keep fallback values in `.env`: `DAIO_REVIEW_ELECTION_DIFFICULTY=8000`, `DAIO_AUDIT_ELECTION_DIFFICULTY=10000`, and `DAIO_AUDIT_TARGET_LIMIT=2`.
-- Ensure `./.deployments/sepolia.json` exists when using `DAIO_DEPLOYMENT_FILE`.
-- Ensure `./.data` and `./.state` exist and are included in the backup plan.
-
-### Network exposure
-
-- Keep MarkItDown private unless there is a specific reason to expose it.
-- Put public Content API traffic behind TLS, authentication, rate limits, and upload size controls.
-- Avoid exposing `18002` or `18003` directly to the public internet.
-- Security group baseline:
-  - SSH `22/tcp`: operator IPs only.
-  - Content API `18002/tcp`: frontend backend, VPN, Tailscale, or another trusted source only.
-  - MarkItDown `18003/tcp`: private/internal only.
-  - HTTPS `443/tcp`: public only if a reverse proxy or API gateway is configured.
-
-### Pre-boot checks
+Update the running service:
 
 ```sh
-git submodule status --recursive
+git fetch origin
+git pull --ff-only
+git submodule update --init --recursive
 docker compose config --quiet
 docker compose build
-```
-
-Compile contracts with the same optimizer profile used for deployment:
-
-```sh
-OPTIMIZER_RUNS=10 npm run compile-contracts
-```
-
-### Boot and smoke tests
-
-```sh
 docker compose up -d
 docker compose ps
-docker compose logs -f content-service
-docker compose logs -f agent-1 agent-2 agent-3 agent-4 agent-5
 ```
 
-Health checks:
+Restart a single service:
 
 ```sh
-curl http://127.0.0.1:18002/health
-curl http://127.0.0.1:18003/health
+docker compose restart agent-3
 ```
 
-MarkItDown smoke test:
+Stop the stack:
 
 ```sh
-curl -sS -F file=@samples/counterexample.webp http://127.0.0.1:18003/convert
+docker compose down
 ```
 
-LLM smoke test:
+Do not use `docker compose down -v` in production unless you intentionally want
+to remove persistent volumes and local state.
+
+Inspect logs:
 
 ```sh
-npm run smoke-llm
+docker compose logs --tail=200 content-service
+docker compose logs --tail=200 agent-1
 ```
 
-Agent logs should show chain-derived config, for example:
+Back up:
 
-```text
-config from contract storage finality=2 reviewDiff=8000 auditDiff=10000 auditTargetLimit=2
+```sh
+tar czf daio-backup-$(date +%Y%m%d-%H%M%S).tgz .env .deployments/sepolia.json .data .state
 ```
 
-### Request flow smoke test
+Monitor:
 
-- Ask the requester wallet to approve `USDAIO` spending for the deployed `PaymentRouter`.
-- Call `POST /request-intents/usdaio`.
-- Sign the returned typed data with the requester wallet.
-- Call `POST /requests/relayed-document`.
-- Check `GET /requests/:requestId/document`.
-- Check `GET /requests/:requestId/agent-statuses`.
+- service health and Docker restart counts
+- content DB size at `.data/content.sqlite`
+- agent state growth under `.state/agent-*`
+- Sepolia RPC error rate and rate-limit responses
+- LLM latency, failures, and timeout rate
+- relayer Sepolia ETH balance
+- each agent's Sepolia ETH balance
+- each agent's USDAIO stake and locked stake
+- request terminal status mix: `Finalized`, `Failed`, `Unresolved`,
+  `Cancelled`
 
-### Monitoring
+## 15. Launch Checklist
 
-- Relayer Sepolia ETH balance.
-- Agent Sepolia ETH balances.
-- Agent USDAIO stake and locked stake.
-- RPC rate-limit and error rate.
-- LLM latency and error rate.
-- Content DB size at `./.data/content.sqlite`.
-- Agent state growth under `./.state/agent-*`.
-- Docker restart count and service health.
-- Request terminal status mix: `Finalized`, `Failed`, `Unresolved`, `Cancelled`.
+AWS:
 
-### Backups
+- EC2 instance created with enough CPU, memory, and disk.
+- Elastic IP attached if allowlists are used.
+- Security group restricts SSH, content API, and MarkItDown as described above.
+- System clock sync enabled.
+- Docker Engine and Compose plugin installed.
 
-Back up these files/directories:
+External services:
 
-- `.env`
-- `./.deployments/sepolia.json`
-- `./.data/content.sqlite`
-- `./.state/agent-*`
+- Sepolia RPC reachable from EC2.
+- RPC provider API key and IP allowlist configured.
+- LLM endpoint reachable from EC2.
+- EC2 Elastic IP allowed by the LLM endpoint firewall.
+- Outbound access to GitHub, npm, Docker registries, and package indexes works.
 
-Common launch failures to check first:
+Repository:
 
-- The LLM firewall does not allow the EC2 Elastic IP.
-- The relayer or agent wallets do not have enough Sepolia ETH.
-- The requester has not approved USDAIO for `PaymentRouter`.
-- The deployment snapshot points at a different Sepolia deployment than the one the agents are watching.
+- Repo cloned with submodules.
+- `git submodule status --recursive` reviewed.
+- `contracts` submodule matches the deployed ABI/spec.
+- `.deployments/sepolia.json` matches the deployed Sepolia contracts.
+
+Environment:
+
+- `.env` created from `.env.sample`.
+- `.env` permission set to `600`.
+- `RPC_URL` set.
+- `DAIO_DEPLOYMENT_FILE=sepolia.json` set, or `DAIO_DEPLOYMENT_JSON_B64` set.
+- `LLM_BASE_URL`, `LLM_MODEL`, timeout, max tokens, and char budget set.
+- `CONTENT_RELAYER_PRIVATE_KEY` set if relayed request creation is enabled.
+- `AGENT_STATE_KEY` set to a 32-byte hex value.
+- `AGENT_1_PRIVATE_KEY` through `AGENT_5_PRIVATE_KEY` set.
+- `AGENT_1_VRF_PRIVATE_KEY` through `AGENT_5_VRF_PRIVATE_KEY` set.
+- `DAIO_AUTO_START_REQUESTS=true`.
+- `DAIO_START_REQUESTS_MAX_PER_TICK=2` unless the contract-side active request
+  limit and observed latency justify a higher value.
+
+On-chain:
+
+- Five reviewer wallets funded with Sepolia ETH.
+- Relayer wallet funded with Sepolia ETH if used.
+- Five reviewers registered on-chain.
+- Reviewer VRF public keys match local VRF private keys.
+- Reviewers have enough USDAIO staked for the active request window.
+- `DAIOCore.maxActiveRequests()` checked.
+- Tier quorum and sortition settings checked.
+- Requester USDAIO balance and `PaymentRouter` approval flow tested.
+
+Boot:
+
+- `docker compose config --quiet` passes.
+- `docker compose build` succeeds.
+- `docker compose up -d` starts all services.
+- `curl http://127.0.0.1:18002/health` succeeds.
+- `curl http://127.0.0.1:18003/health` succeeds.
+- MarkItDown sample conversion succeeds.
+- LLM smoke call succeeds.
+- Agent logs show contract-derived config and no VRF mismatch.
+
+Serving:
+
+- Frontend uses `POST /request-intents/usdaio` and
+  `POST /requests/relayed-document` for gas-sponsored request creation.
+- Frontend uses `POST /requests/:requestId/document` only after a direct
+  requester on-chain transaction.
+- Frontend can read `GET /requests/:requestId/agent-statuses`.
+- Frontend can read `GET /requests/:requestId/agents/:agent/reasons`.
+- Content API is behind the intended network boundary.
+- MarkItDown is private or exposed only to trusted callers.
+
+Backup and recovery:
+
+- `.env`, `.deployments/sepolia.json`, `.data`, and `.state` are backed up.
+- Log rotation is enabled.
+- Restart and update procedure has been tested.
+
+Common launch failures:
+
+- LLM firewall does not allow the EC2 Elastic IP.
+- RPC provider blocks the EC2 Elastic IP or rate-limits the stack.
+- Agent or relayer wallet lacks Sepolia ETH.
+- Requester did not approve USDAIO for `PaymentRouter`.
+- Reviewer is registered with a different VRF public key.
+- `.deployments/sepolia.json` points at a different deployment than expected.
+- `AGENT_AUTO_REGISTER=true` but identity/ENS prerequisites are not satisfied.

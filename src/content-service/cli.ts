@@ -1,0 +1,31 @@
+import "dotenv/config";
+import { buildServer } from "./server.js";
+
+const port = Number(process.env.CONTENT_SERVICE_PORT ?? 18002);
+const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
+const dbPath = process.env.CONTENT_DB_PATH ?? "./.data/content.sqlite";
+
+const { app, db } = buildServer({ dbPath, logger: process.env.CONTENT_SERVICE_LOG === "1" });
+
+async function main() {
+  await app.listen({ host, port });
+  process.stdout.write(`[content-service] listening http://${host}:${port} db=${dbPath}\n`);
+}
+
+async function shutdown(signal: string) {
+  process.stdout.write(`[content-service] received ${signal}, shutting down\n`);
+  try {
+    await app.close();
+  } finally {
+    db.close();
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+main().catch((err) => {
+  process.stderr.write(`[content-service] fatal: ${err}\n`);
+  process.exit(1);
+});

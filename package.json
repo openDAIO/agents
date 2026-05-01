@@ -1,0 +1,33 @@
+{
+  "name": "@daio/agents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DAIO reviewer agent runtime, content service, and E2E orchestrator",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "content-service": "tsx src/content-service/cli.ts",
+    "agent": "tsx src/reviewer-agent/cli.ts",
+    "e2e": "tsx src/e2e/cli.ts",
+    "prepare-samples": "bash scripts/prepare-samples.sh",
+    "compile-contracts": "cd contracts && npm install --no-audit --no-fund && npx hardhat compile",
+    "smoke-llm": "tsx scripts/smoke-llm.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.4",
+    "fastify": "^5.2.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

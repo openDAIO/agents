@@ -176,7 +176,7 @@ Create persistent directories:
 ```sh
 mkdir -p .deployments .data .state
 chmod 700 .data .state
-cp .env.sample .env
+cp .env.example .env
 chmod 600 .env
 ```
 
@@ -245,7 +245,7 @@ Required chain fields:
 | `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
 | `DAIO_DEPLOYMENT_JSON_B64` | optional | use only when overriding the mounted snapshot |
 
-Public deployment address fields in `.env.sample` are documentation for
+Public deployment address fields in `.env.example` are documentation for
 operators and downstream services. Runtime services read the deployment snapshot.
 
 LLM fields:
@@ -706,7 +706,7 @@ Repository:
 
 Environment:
 
-- `.env` created from `.env.sample`.
+- `.env` created from `.env.example`.
 - `.env` permission set to `600`.
 - `RPC_URL` set.
 - `DAIO_DEPLOYMENT_FILE=sepolia.json` set, or `DAIO_DEPLOYMENT_JSON_B64` set.

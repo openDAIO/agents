@@ -149,7 +149,12 @@ export function installRpcProcessGuards(label: string): void {
   processWithGuard[key] = true;
 
   process.on("unhandledRejection", (reason) => {
-    process.stderr.write(`[${label}] unhandled rejection: ${formatRpcError(reason)}\n`);
+    if (isRetryableRpcError(reason)) {
+      process.stderr.write(`[${label}] suppressed retryable provider rejection: ${formatRpcError(reason)}\n`);
+      return;
+    }
+    process.stderr.write(`[${label}] fatal unhandled rejection: ${formatRpcError(reason)}\n`);
+    process.exit(1);
   });
 
   process.on("uncaughtException", (err) => {
@@ -197,7 +202,7 @@ export async function withRpcReadRetries<T>(
       return await task();
     } catch (err) {
       lastErr = err;
-      if (attempt === attempts - 1) break;
+      if (!isRetryableRpcError(err) || attempt === attempts - 1) break;
       await delay(baseMs * 2 ** attempt);
     }
   }

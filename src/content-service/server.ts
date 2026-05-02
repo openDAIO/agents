@@ -646,18 +646,26 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     const signer = relayer();
     const signerAddress = getAddress(await signer.getAddress());
     const handles = loadContracts(deployment, signer);
-    const send = async () =>
-      handles.paymentRouter.createRequestWithUSDAIOBySig(
-        intent.requester,
-        intent.proposalURI,
-        intent.proposalHash,
-        intent.rubricHash,
-        intent.domainMask,
-        intent.tier,
-        intent.priorityFee,
-        intent.deadline,
-        body.signature,
+    const args = [
+      intent.requester,
+      intent.proposalURI,
+      intent.proposalHash,
+      intent.rubricHash,
+      intent.domainMask,
+      intent.tier,
+      intent.priorityFee,
+      intent.deadline,
+      body.signature,
+    ] as const;
+    try {
+      await withRpcReadRetries(() =>
+        handles.paymentRouter.createRequestWithUSDAIOBySig.staticCall(...args),
       );
+    } catch (err) {
+      throw new Error(`relayed request preflight failed: ${formatError(err)}`);
+    }
+    const send = async () =>
+      handles.paymentRouter.createRequestWithUSDAIOBySig(...args);
     let tx;
     try {
       tx = await send();

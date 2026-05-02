@@ -175,6 +175,13 @@ DAIO_SYNC_REQUEST_GAS_FLOOR=2000000
 submit Sepolia transactions. Without it, the read/write content APIs still boot,
 but relayed request creation cannot complete.
 
+Use at least two unique RPC endpoints in `RPC_URL`/`RPC_URLS` for production
+traffic. `RPC_BATCH_MAX_COUNT=1` disables ethers batching for public RPC
+compatibility, and retryable provider failures such as `408`, `429`, and
+transient network errors are retried/logged instead of crashing the agent
+process. Public free-tier RPCs can still add latency under load; paid or
+dedicated Sepolia RPCs are preferred for sustained testing.
+
 Full API serving means:
 
 - `CONTENT_RELAYER_PRIVATE_KEY` is set and funded, enabling
@@ -272,7 +279,10 @@ The keeper also syncs active requests. It first uses
 contract would advance the request, so a document-missing request can release
 its active slot once the protocol timeout has elapsed. Keeper transaction gas
 floors are intentionally higher than typical estimates to avoid out-of-gas
-reverts when queue/sync state changes between estimate and mining.
+reverts when queue/sync state changes between estimate and mining. Active sync
+is de-duped per request while a sync is already in flight, so reconcile ticks or
+event replay do not send redundant `syncRequest` transactions for the same
+request.
 
 Before serving, each agent wallet must:
 
@@ -281,7 +291,9 @@ Before serving, each agent wallet must:
 - have a registered VRF public key derived from that agent's
   `AGENT_VRF_PRIVATE_KEY`
 - have enough USDAIO staked for the active request window. With
-  `maxActiveRequests=2`, use at least `2000 USDAIO` staked per reviewer.
+  `maxActiveRequests=2`, use at least `2000 USDAIO` staked per reviewer; the
+  current shared Sepolia profile uses about `6000 USDAIO` per reviewer for a
+  wider buffer.
 
 If `AGENT_AUTO_REGISTER=true`, the agent tries to register itself at boot.
 For already-registered production wallets, keep it `false`; the agent will
@@ -338,17 +350,18 @@ need the configured relayer/reviewer wallet to be funded and authorized on-chain
 Default host port: `127.0.0.1:18002`.
 
 For a browser frontend, expose this service through the same HTTPS origin or
-through an API gateway/reverse proxy. The service itself does not add CORS
-headers by default, so cross-origin browser traffic needs CORS policy at the
-gateway layer. Keep requester-facing write endpoints authenticated/rate-limited
-and keep agent-only write endpoints signed with
+through an API gateway/reverse proxy. Docker Compose passes `CORS_ALLOW_*`
+values into the service, so the built-in server can answer browser preflight
+requests for local or public testing. For production, keep requester-facing
+write endpoints authenticated/rate-limited and keep agent-only write endpoints
+signed with
 `CONTENT_REQUIRE_AGENT_SIGNATURES=true`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | service health |
 | `POST` | `/request-intents/usdaio` | build an EIP-712 USDAIO request intent for a requester to sign |
-| `POST` | `/requests/relayed-document` | relay a signed request transaction, verify it on Sepolia, and store the document |
+| `POST` | `/requests/relayed-document` | preflight and relay a signed request transaction, verify it on Sepolia, and store the document |
 | `POST` | `/requests/document-from-tx` | recover document storage from a successful payment tx hash |
 | `POST` | `/requests/:requestId/document` | verify a requester-created on-chain transaction and store the document |
 | `GET` | `/requests/:requestId/document` | read the stored request document and verified on-chain metadata |

@@ -360,6 +360,11 @@ RPC providers that reject large batches. `RPC_READ_RETRIES` and
 `RPC_READ_RETRY_BASE_MS` add short exponential-backoff retries around event
 polling and chain reads. `RPC_TX_WAIT_RETRIES` and
 `RPC_TX_WAIT_RETRY_BASE_MS` add retries while waiting for transaction receipts.
+Retryable provider-side failures such as public-RPC `408`, `429`, and transient
+network errors are logged and retried instead of crashing the agent process;
+non-retryable unhandled failures still terminate the process so Docker can
+restart it cleanly. For production load, keep at least two unique RPC endpoints
+configured and prefer paid/dedicated Sepolia RPCs over free public tiers.
 `CORS_ALLOW_ORIGIN=*` makes both content-service and MarkItDown respond to
 browser preflight requests on every endpoint. For a locked-down frontend, replace
 it with a comma-separated allowlist such as `http://localhost:3000,https://app.example`.
@@ -399,7 +404,9 @@ must be the transaction sender. The keeper also probes active requests with
 `syncRequest.staticCall(...)` and sends a real `syncRequest` transaction only
 when the contract would advance the request, for example after a protocol
 timeout. Keeper gas floors add headroom above fragile RPC gas estimates; unused
-gas is not spent.
+gas is not spent. Keeper active sync is de-duped per request while a sync is
+already in flight, which avoids redundant `syncRequest` transactions during
+reconcile ticks or event replay.
 
 For `maxActiveRequests=2`, each reviewer wallet should have at least
 `2 * ReviewerRegistry.minStake()` staked. Otherwise one active request can lock
@@ -452,6 +459,15 @@ npm run ops:e2e:sepolia -- --mode direct --pdf samples/2505.04223v1.pdf --manual
 Use `GET /requests/:requestId/chain-status` on content-service to read the
 current on-chain lifecycle even if local agent status rows are still catching
 up after restart.
+
+Live Sepolia validation on 2026-05-02 with `samples/2505.04223v1.pdf` finalized
+five tracked requests in 11.86 minutes while other users were also testing the
+shared queue. The run observed `maxActiveRequests=2` in practice: requests 19
+and 20 were active concurrently and finalized together; a follow-up relayed
+smoke request, request 22, also finalized with `retryCount=0` and
+`lowConfidence=false`. Shared-queue timings include external request pressure,
+so use per-request first-active-to-finalized timings when benchmarking agent
+throughput.
 
 The `contracts` submodule also includes deployment and validation helpers for
 operators. `contracts/scripts/deploy-via-deployer.js` deploys a new DAIO system
@@ -525,7 +541,7 @@ Agent-written observability data is signed by the agent wallet when `CONTENT_REQ
 For requester UX, the content-service also exposes a relayed USDAIO flow:
 
 - `POST /request-intents/usdaio` returns the exact EIP-712 `RequestIntent` payload for `PaymentRouter.createRequestWithUSDAIOBySig(...)`.
-- `POST /requests/relayed-document` accepts the requester signature and document, sends the relayed transaction with `CONTENT_RELAYER_PRIVATE_KEY`, verifies the emitted `RequestPaid` event and lifecycle requester, then stores the document.
+- `POST /requests/relayed-document` accepts the requester signature and document, preflights `createRequestWithUSDAIOBySig(...)` with `staticCall`, sends the relayed transaction with `CONTENT_RELAYER_PRIVATE_KEY`, verifies the emitted `RequestPaid` event and lifecycle requester, then stores the document. If preflight fails because the requester nonce, allowance, deadline, or signature is stale, the relayer does not send a transaction; the client should request a fresh intent and signature.
 - `POST /requests/document-from-tx` recovers document storage from a successful payment transaction hash if the original relayed response was missed.
 
 The requester still pays the protocol fee from their own USDAIO balance through `PaymentRouter` allowance; the relayer only pays gas.

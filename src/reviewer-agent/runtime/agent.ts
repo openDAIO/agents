@@ -118,6 +118,7 @@ export class ReviewerAgent {
   private keeperReconcileTimer: NodeJS.Timeout | null = null;
   private readonly activeRequests = new Map<string, RequestStatus>();
   private readonly phaseRetryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly keeperSyncInFlight = new Set<string>();
 
   constructor(
     private readonly provider: Provider,
@@ -452,48 +453,78 @@ export class ReviewerAgent {
 
   private async syncActiveRequest(requestId: bigint, knownStatus: RequestStatus, reason: string): Promise<void> {
     if (!this.syncActiveRequestsEnabled()) return;
-    const liveStatus = await this.currentRequestStatus(requestId);
-    this.trackRequestStatus(requestId, liveStatus);
-    if (!this.activeStatus(liveStatus)) {
-      await this.recordLiveStatusForStaleEvent(requestId, liveStatus, RequestStatus[knownStatus] ?? `Status${knownStatus}`);
-      return;
-    }
-
-    const core = this.handles.core.connect(this.keeperTxSigner);
-    let predictedStatus: RequestStatus;
+    const key = requestId.toString();
+    if (this.keeperSyncInFlight.has(key)) return;
+    this.keeperSyncInFlight.add(key);
     try {
-      predictedStatus = Number(await core.syncRequest.staticCall(requestId)) as RequestStatus;
-    } catch (err) {
-      this.log(`keeper syncRequest preflight failed request=${requestId}: ${formatError(err)}`);
-      return;
-    }
-    if (predictedStatus === liveStatus) return;
+      const liveStatus = await this.currentRequestStatus(requestId);
+      this.trackRequestStatus(requestId, liveStatus);
+      if (!this.activeStatus(liveStatus)) {
+        await this.recordLiveStatusForStaleEvent(requestId, liveStatus, RequestStatus[knownStatus] ?? `Status${knownStatus}`);
+        return;
+      }
 
-    const receipt = await this.queuedKeeperTx(async () => {
-      const gasLimit = await gasLimitWithHeadroom(
-        core.syncRequest,
-        [requestId],
-        "DAIO_SYNC_REQUEST_GAS_FLOOR",
-        2_000_000n,
+      const core = this.handles.core.connect(this.keeperTxSigner);
+      let predictedStatus: RequestStatus;
+      try {
+        predictedStatus = Number(await core.syncRequest.staticCall(requestId)) as RequestStatus;
+      } catch (err) {
+        this.log(`keeper syncRequest preflight failed request=${requestId}: ${formatError(err)}`);
+        return;
+      }
+      if (predictedStatus === liveStatus) return;
+
+      const result = await this.queuedKeeperTx(async () => {
+        const queuedLiveStatus = await this.currentRequestStatus(requestId);
+        this.trackRequestStatus(requestId, queuedLiveStatus);
+        if (!this.activeStatus(queuedLiveStatus)) {
+          await this.recordLiveStatusForStaleEvent(
+            requestId,
+            queuedLiveStatus,
+            RequestStatus[knownStatus] ?? `Status${knownStatus}`,
+          );
+          return undefined;
+        }
+
+        let queuedPredictedStatus: RequestStatus;
+        try {
+          queuedPredictedStatus = Number(await core.syncRequest.staticCall(requestId)) as RequestStatus;
+        } catch (err) {
+          this.log(`keeper syncRequest queued preflight failed request=${requestId}: ${formatError(err)}`);
+          return undefined;
+        }
+        if (queuedPredictedStatus === queuedLiveStatus) return undefined;
+
+        const gasLimit = await gasLimitWithHeadroom(
+          core.syncRequest,
+          [requestId],
+          "DAIO_SYNC_REQUEST_GAS_FLOOR",
+          2_000_000n,
+        );
+        const tx = await core.syncRequest(requestId, { gasLimit });
+        const receipt = await waitForTransactionWithRetries(tx);
+        return { receipt, liveStatus: queuedLiveStatus, predictedStatus: queuedPredictedStatus };
+      });
+      if (result === undefined) return;
+      const { receipt, liveStatus: sentLiveStatus, predictedStatus: sentPredictedStatus } = result;
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(`syncRequest transaction reverted for request ${requestId}`);
+      }
+      this.log(
+        `keeper synced active request=${requestId} reason=${reason} ${RequestStatus[sentLiveStatus]}->${RequestStatus[sentPredictedStatus] ?? `Status${sentPredictedStatus}`} tx=${receipt.hash} block=${receipt.blockNumber}`,
       );
-      const tx = await core.syncRequest(requestId, { gasLimit });
-      return waitForTransactionWithRetries(tx);
-    });
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(`syncRequest transaction reverted for request ${requestId}`);
-    }
-    this.log(
-      `keeper synced active request=${requestId} reason=${reason} ${RequestStatus[liveStatus]}->${RequestStatus[predictedStatus] ?? `Status${predictedStatus}`} tx=${receipt.hash} block=${receipt.blockNumber}`,
-    );
-    this.trackRequestStatus(requestId, predictedStatus);
-    if (
-      predictedStatus === RequestStatus.Queued ||
-      predictedStatus === RequestStatus.Finalized ||
-      predictedStatus === RequestStatus.Cancelled ||
-      predictedStatus === RequestStatus.Failed ||
-      predictedStatus === RequestStatus.Unresolved
-    ) {
-      this.scheduleActiveRefill(`sync-${RequestStatus[predictedStatus] ?? predictedStatus}`);
+      this.trackRequestStatus(requestId, sentPredictedStatus);
+      if (
+        sentPredictedStatus === RequestStatus.Queued ||
+        sentPredictedStatus === RequestStatus.Finalized ||
+        sentPredictedStatus === RequestStatus.Cancelled ||
+        sentPredictedStatus === RequestStatus.Failed ||
+        sentPredictedStatus === RequestStatus.Unresolved
+      ) {
+        this.scheduleActiveRefill(`sync-${RequestStatus[sentPredictedStatus] ?? sentPredictedStatus}`);
+      }
+    } finally {
+      this.keeperSyncInFlight.delete(key);
     }
   }
 

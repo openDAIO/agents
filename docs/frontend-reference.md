@@ -10,9 +10,10 @@ Default local service URLs:
 Production deployments should put both APIs behind TLS, authentication, rate limits, and upload size controls.
 
 Browser frontends should normally call these services through the same HTTPS
-origin or through an API gateway/reverse proxy. The bundled services do not add
-browser CORS headers by default. If the frontend is served from a different
-origin, add CORS policy at the gateway layer and keep write endpoints
+origin or through an API gateway/reverse proxy. The bundled Docker Compose
+runtime now enables CORS headers from `CORS_ALLOW_*` env values on both
+content-service and MarkItDown, so local browser testing can call them directly.
+For production, still prefer a gateway-level allowlist and keep write endpoints
 authenticated.
 
 Trust boundaries:
@@ -254,7 +255,7 @@ const signature = await signer.signTypedData(
 
 ### `POST /requests/relayed-document`
 
-Submits the signed request intent through the content relayer, verifies the on-chain request transaction, and stores the document.
+Submits the signed request intent through the content relayer, verifies the on-chain request transaction, and stores the document. The service preflights the signed call with `staticCall` before sending a real relayer transaction; if the requester nonce, allowance, deadline, or signature is stale, request a fresh intent and signature.
 
 Request body:
 

@@ -19,6 +19,7 @@ For full API serving, including requester-sponsored relayed requests, provide:
   agent
 - five registered/staked reviewer wallets with matching VRF keys
 - one funded relayer wallet for the content-service relayed-request API
+- one funded keeper gas wallet when `DAIO_KEEPER_PRIVATE_KEY` is set
 
 ## 0. One-Page Deployment Path
 
@@ -286,7 +287,7 @@ request.
 
 Before serving, each agent wallet must:
 
-- hold Sepolia ETH
+- hold Sepolia ETH for review/audit commit-reveal gas
 - be registered in `ReviewerRegistry`
 - have a registered VRF public key derived from that agent's
   `AGENT_VRF_PRIVATE_KEY`
@@ -294,6 +295,22 @@ Before serving, each agent wallet must:
   `maxActiveRequests=2`, use at least `2000 USDAIO` staked per reviewer; the
   current shared Sepolia profile uses about `6000 USDAIO` per reviewer for a
   wider buffer.
+
+Recommended live Sepolia funding baselines:
+
+| Account | Purpose | Minimum | Comfortable test buffer |
+| --- | --- | ---: | ---: |
+| Reviewer agent wallet | review/audit commit-reveal gas | `0.03 ETH` each | `0.05 ETH` each |
+| Reviewer stake | sortition eligibility for `maxActiveRequests=2` | `2000 USDAIO` each | `6000 USDAIO` each |
+| Content relayer wallet | `/requests/relayed-document` gas | `0.02 ETH` | `0.05 ETH` |
+| Keeper wallet | `startNextRequest` and `syncRequest` gas | `0.02 ETH` | `0.05 ETH` |
+| Requester wallet | direct-request gas, if bypassing relayer | `0.01 ETH` | `0.03 ETH` |
+| Requester USDAIO | request fees | `baseRequestFee + priorityFee` per request | enough for planned batch size |
+
+The content relayer does not need USDAIO for relayed USDAIO requests; the
+request fee is pulled from the requester through `PaymentRouter` allowance. The
+requester must approve at least `baseRequestFee + priorityFee` for each request,
+or use a larger allowance for repeated tests.
 
 If `AGENT_AUTO_REGISTER=true`, the agent tries to register itself at boot.
 For already-registered production wallets, keep it `false`; the agent will
@@ -429,5 +446,6 @@ Before declaring the EC2 host production-ready:
 - confirm `CONTENT_REQUIRE_AGENT_SIGNATURES=true`
 - confirm requester USDAIO approval targets the deployed `PaymentRouter`
 - confirm the relayer wallet has Sepolia ETH
+- confirm the keeper wallet has Sepolia ETH
 - confirm all five reviewer wallets have Sepolia ETH and sufficient USDAIO stake
 - confirm agent logs show contract-derived config and no VRF mismatch

@@ -419,6 +419,12 @@ Sepolia buffer. If the configured ENS name does not resolve to the reviewer or
 ERC-8004 agent wallet, set `DAIO_REGISTER_ENS=false`; ERC-8004 `agentId` can
 still be registered without clearing identity fields.
 
+For live Sepolia testing, keep reviewer wallets funded with about `0.05 ETH`
+each for commit-reveal gas and keep the dedicated keeper and content relayer
+wallets around `0.05 ETH` each. The requester needs USDAIO balance and
+`PaymentRouter` allowance for `baseRequestFee + priorityFee` per request; the
+relayer only pays gas for relayed requests and does not pay the protocol fee.
+
 Run the full E2E:
 
 ```bash

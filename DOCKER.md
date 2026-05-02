@@ -200,6 +200,16 @@ The `contracts` submodule must match the ABI/spec for the deployed Sepolia
 contracts. Do not replace the deployment snapshot or submodule commit unless you
 are intentionally moving the service to a new deployment.
 
+For the shortest EC2 path, see
+[`docs/sepolia-ec2-production.md`](docs/sepolia-ec2-production.md). After the
+secret env files are copied into the checkout, this command validates the env
+surface, builds the images, starts every API and agent container, and checks the
+local health endpoints:
+
+```sh
+bash scripts/ops/start-sepolia-stack.sh
+```
+
 ## 6. Deployment Snapshot
 
 The production Sepolia snapshot is committed as:

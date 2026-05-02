@@ -377,6 +377,15 @@ and round-ledger finalization. The Docker serving path still uses
 `.deployments/sepolia.json`; after any new contract deployment, update that
 snapshot before starting agents.
 
+For an EC2 production-style Sepolia boot with Docker Compose, use
+[docs/sepolia-ec2-production.md](docs/sepolia-ec2-production.md). After cloning
+the repo and copying `.env` plus `.env.agent_1` through `.env.agent_5`, the
+single command is:
+
+```bash
+bash scripts/ops/start-sepolia-stack.sh
+```
+
 Optional fork controls:
 
 ```bash

@@ -58,6 +58,8 @@ await usdaio.approve(paymentRouterAddress, baseRequestFee + priorityFee);
 5. Ask the requester wallet to sign the returned typed data.
 6. Call `POST /requests/relayed-document` with the signature and document text.
 7. Track the returned `requestId` through the Content API and contract views.
+8. Third-party agents can fetch the canonical converted Markdown with
+   `GET /requests/:requestId/markdown`.
 
 The relayer pays gas for `PaymentRouter.createRequestWithUSDAIOBySig(...)`, but the request fee is still pulled from the requester through `PaymentRouter` allowance. The on-chain requester remains the requester address, not the relayer.
 
@@ -316,6 +318,45 @@ Response shape is the same `document` object returned by `POST /requests/relayed
 
 Returns the stored verified document and on-chain payment metadata.
 
+### `GET /requests/:requestId/markdown`
+
+Returns the stored Markdown document for a verified request. This is the
+canonical off-chain document body third-party agents should review. The
+`hash` field is the `keccak256` hash of this Markdown text and matches the
+on-chain `proposalHash`.
+
+JSON response:
+
+```json
+{
+  "requestId": "1",
+  "updatedAt": 1770000000000,
+  "verified": {
+    "requestId": "1",
+    "proposalURI": "content://proposals/paper-001",
+    "proposalHash": "0x..."
+  },
+  "proposal": {
+    "uri": "content://proposals/paper-001",
+    "id": "paper-001",
+    "hash": "0x...",
+    "mimeType": "text/markdown",
+    "bytes": 12345,
+    "markdown": "# Converted markdown"
+  }
+}
+```
+
+Raw Markdown response:
+
+```http
+GET /requests/1/markdown?format=raw
+Accept: text/markdown
+```
+
+The raw response uses `Content-Type: text/markdown` and includes
+`X-DAIO-Proposal-URI` and `X-DAIO-Proposal-Hash` headers.
+
 ### `GET /requests/:requestId/agent-statuses`
 
 Returns all known off-chain agent status rows for a request.
@@ -401,6 +442,7 @@ These are mostly agent/internal, but they can be useful for debugging or explore
 | --- | --- | --- |
 | `POST` | `/proposals` | Store a proposal by `{ id, text, mimeType }`; returns `content://proposals/<id>` and hash. |
 | `GET` | `/proposals/:id` | Read a stored proposal. |
+| `GET` | `/proposals/:id/markdown` | Read the stored proposal Markdown as JSON, or raw Markdown with `?format=raw`. |
 | `POST` | `/reports` | Agent-only. Store canonical review artifact; with signature enforcement, body is `{ artifact, signature }`. |
 | `GET` | `/reports/:hash` | Read a stored review artifact. |
 | `POST` | `/audits` | Agent-only. Store canonical audit artifact; with signature enforcement, body is `{ artifact, signature }`. |
@@ -594,6 +636,7 @@ Read:
 
 - `DAIOCore.getRequestLifecycle(requestId)`
 - `GET /requests/:requestId/document`
+- `GET /requests/:requestId/markdown`
 - `PaymentRouter.latestRequestState(requester)` if starting from a requester address
 - `DAIORoundLedger.getRoundAggregate(requestId, attempt, 0..2)`
 - `DAIOCommitRevealManager.getReviewParticipants(requestId, attempt)`

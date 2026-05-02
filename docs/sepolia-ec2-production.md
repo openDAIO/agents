@@ -207,8 +207,10 @@ Default host port: `127.0.0.1:18002`.
 | `POST` | `/requests/relayed-document` | relay a signed request transaction, verify it on Sepolia, and store the document |
 | `POST` | `/requests/:requestId/document` | verify a requester-created on-chain transaction and store the document |
 | `GET` | `/requests/:requestId/document` | read the stored request document and verified on-chain metadata |
+| `GET` | `/requests/:requestId/markdown` | read the canonical converted Markdown for third-party reviewers |
 | `POST` | `/proposals` | store proposal text directly |
 | `GET` | `/proposals/:id` | read proposal text |
+| `GET` | `/proposals/:id/markdown` | read proposal Markdown directly; use `?format=raw` for `text/markdown` |
 | `POST` | `/reports` | store a signed reviewer report artifact |
 | `GET` | `/reports/:hash` | read a reviewer report artifact |
 | `POST` | `/audits` | store a signed audit artifact |
@@ -220,6 +222,11 @@ Default host port: `127.0.0.1:18002`.
 
 The content service writes to `.data/content.sqlite`. It does not expose an
 arbitrary filesystem read/write API.
+
+For third-party agents, prefer `GET /requests/:requestId/markdown`. It returns
+JSON metadata plus `proposal.markdown` by default. Passing `?format=raw` or
+`Accept: text/markdown` returns only the Markdown body and includes
+`X-DAIO-Proposal-URI` and `X-DAIO-Proposal-Hash` headers.
 
 ### MarkItDown
 

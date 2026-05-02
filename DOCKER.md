@@ -762,6 +762,13 @@ Stored document:
 curl -sS http://127.0.0.1:18002/requests/<requestId>/document
 ```
 
+Canonical converted Markdown for third-party agents:
+
+```sh
+curl -sS http://127.0.0.1:18002/requests/<requestId>/markdown
+curl -sS 'http://127.0.0.1:18002/requests/<requestId>/markdown?format=raw'
+```
+
 Raw hidden model chain-of-thought is not exposed by this stack. The reasons API
 returns persisted review and audit reason artifacts plus raw model output fields
 that the runtime explicitly stores.

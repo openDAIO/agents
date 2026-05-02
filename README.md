@@ -432,7 +432,7 @@ For the current five-agent, quorum-three E2E, `reviewDiff=8000` and `auditDiff=1
 
 ### Content service as the canonical store
 
-The content-service holds two kinds of artifact: `proposals` (the document under review, addressed by id) and `reports` (review artifacts, addressed by hash). Its `POST /reports` endpoint canonicalizes the artifact (sorted keys + UTF-8) and recomputes `keccak256` server-side, so a report URI is structurally `content://reports/0x<hash>` where the hash matches what the on-chain `ReviewRevealed` event will carry. Audit-time hash verification against `reportHash` is therefore exact.
+The content-service holds two kinds of artifact: `proposals` (the converted Markdown document under review, addressed by id) and `reports` (review artifacts, addressed by hash). Third-party reviewers can fetch the canonical request document through `GET /requests/:requestId/markdown`; the returned hash is the same Markdown `keccak256` stored on-chain as `proposalHash`. Its `POST /reports` endpoint canonicalizes the artifact (sorted keys + UTF-8) and recomputes `keccak256` server-side, so a report URI is structurally `content://reports/0x<hash>` where the hash matches what the on-chain `ReviewRevealed` event will carry. Audit-time hash verification against `reportHash` is therefore exact.
 
 Agent-written observability data is signed by the agent wallet when `CONTENT_REQUIRE_AGENT_SIGNATURES=true` (the production default). `POST /reports`, `POST /audits`, and `PUT /agent-status` reject unsigned or mismatched writes so another HTTP caller cannot impersonate a reviewer in the status/reason API.
 

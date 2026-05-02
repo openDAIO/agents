@@ -213,6 +213,35 @@ function serializeRequestDocument(db: ContentDB, requestId: string) {
   };
 }
 
+function markdownResponse(input: { uri: string; id: string; hash: string; mimeType: string; text: string }) {
+  return {
+    uri: input.uri,
+    id: input.id,
+    hash: input.hash,
+    mimeType: input.mimeType,
+    bytes: Buffer.byteLength(input.text, "utf8"),
+    markdown: input.text,
+  };
+}
+
+function wantsRawMarkdown(req: { headers: { accept?: string }; query?: { format?: string } }): boolean {
+  const format = req.query?.format?.trim().toLowerCase();
+  if (format && ["raw", "text", "markdown"].includes(format)) return true;
+  const accept = req.headers.accept?.toLowerCase() ?? "";
+  return accept.includes("text/markdown") && !accept.includes("application/json");
+}
+
+function sendRawMarkdown(
+  reply: { type: (value: string) => unknown; header: (name: string, value: string) => unknown },
+  input: { uri: string; hash: string; text: string },
+) {
+  reply.type("text/markdown; charset=utf-8");
+  reply.header("ETag", `"${input.hash}"`);
+  reply.header("X-DAIO-Proposal-URI", input.uri);
+  reply.header("X-DAIO-Proposal-Hash", input.hash);
+  return input.text;
+}
+
 function findReviewArtifact(db: ContentDB, requestId: string, agent: string) {
   const key = addressKey(agent);
   const indexed = db.findReviewArtifact(requestId, key);
@@ -665,6 +694,23 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     };
   });
 
+  app.get<{ Params: { id: string }; Querystring: { format?: string } }>("/proposals/:id/markdown", async (req, reply) => {
+    const row = db.getProposal(req.params.id);
+    if (!row) {
+      reply.code(404);
+      return { error: "not_found" };
+    }
+    const proposal = {
+      uri: `content://proposals/${row.id}`,
+      id: row.id,
+      hash: row.hash,
+      mimeType: row.mimeType,
+      text: row.text,
+    };
+    if (wantsRawMarkdown(req)) return sendRawMarkdown(reply, proposal);
+    return markdownResponse(proposal);
+  });
+
   app.post("/reports", async (req, reply) => {
     const parsed = ReviewArtifactBody.safeParse(req.body);
     if (!parsed.success) {
@@ -821,6 +867,35 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     }
     return doc;
   });
+
+  app.get<{ Params: { requestId: string }; Querystring: { format?: string } }>(
+    "/requests/:requestId/markdown",
+    async (req, reply) => {
+      if (!/^\d+$/.test(req.params.requestId)) {
+        reply.code(400);
+        return { error: "invalid_request_id" };
+      }
+      const doc = serializeRequestDocument(db, req.params.requestId);
+      if (!doc) {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      const proposal = {
+        uri: doc.proposal.uri,
+        id: doc.proposal.id,
+        hash: doc.proposal.hash,
+        mimeType: doc.proposal.mimeType,
+        text: doc.proposal.text,
+      };
+      if (wantsRawMarkdown(req)) return sendRawMarkdown(reply, proposal);
+      return {
+        requestId: doc.verified.requestId,
+        updatedAt: doc.updatedAt,
+        verified: doc.verified,
+        proposal: markdownResponse(proposal),
+      };
+    },
+  );
 
   app.put("/agent-status", async (req, reply) => {
     const parsed = AgentStatusBody.safeParse(req.body);

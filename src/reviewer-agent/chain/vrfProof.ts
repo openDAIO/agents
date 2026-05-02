@@ -102,7 +102,7 @@ function randomScalar(): bigint {
   }
 }
 
-async function daioVrfMessage(provider: JsonRpcProvider, input: VrfProofInput): Promise<Uint8Array> {
+export async function daioVrfMessage(provider: JsonRpcProvider, input: VrfProofInput): Promise<Uint8Array> {
   const network = await provider.getNetwork();
   const stableBlock = input.phaseStartBlock > input.finalityFactor ? input.phaseStartBlock - input.finalityFactor : 0n;
   let stableBlockHash = ZeroHash;

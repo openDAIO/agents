@@ -7,28 +7,6 @@ x-daio-app: &daio-app
   volumes:
     - ./.deployments:/app/deployments:ro
 
-x-agent-env: &agent-env
-  RPC_URL: ${RPC_URL:?set RPC_URL in .env}
-  CONTENT_SERVICE_URL: http://content-service:18002
-  AGENT_STATE_KEY: ${AGENT_STATE_KEY:?set AGENT_STATE_KEY in .env}
-  AGENT_AUTO_REGISTER: ${AGENT_AUTO_REGISTER:-false}
-  DAIO_DEPLOYMENT_FILE: ${DAIO_DEPLOYMENT_FILE:-sepolia.json}
-  DAIO_DEPLOYMENT_JSON: ${DAIO_DEPLOYMENT_JSON:-}
-  DAIO_DEPLOYMENT_JSON_B64: ${DAIO_DEPLOYMENT_JSON_B64:-}
-  DAIO_REVIEW_ELECTION_DIFFICULTY: ${DAIO_REVIEW_ELECTION_DIFFICULTY:-8000}
-  DAIO_AUDIT_ELECTION_DIFFICULTY: ${DAIO_AUDIT_ELECTION_DIFFICULTY:-10000}
-  DAIO_AUDIT_TARGET_LIMIT: ${DAIO_AUDIT_TARGET_LIMIT:-2}
-  DAIO_AUTO_START_REQUESTS: ${DAIO_AUTO_START_REQUESTS:-true}
-  DAIO_START_REQUESTS_MAX_PER_TICK: ${DAIO_START_REQUESTS_MAX_PER_TICK:-2}
-  DAIO_START_REQUESTS_MIN_INTERVAL_MS: ${DAIO_START_REQUESTS_MIN_INTERVAL_MS:-1000}
-  DAIO_START_REQUESTS_JITTER_MS: ${DAIO_START_REQUESTS_JITTER_MS:-250}
-  LLM_BASE_URL: ${LLM_BASE_URL:-http://59.12.201.156:18001/v1}
-  LLM_MODEL: ${LLM_MODEL:-gpt-oss-120b}
-  LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-120000}
-  LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
-  LLM_PROPOSAL_CHAR_BUDGET: ${LLM_PROPOSAL_CHAR_BUDGET:-350000}
-  LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
-
 x-agent-common: &agent-common
   <<: *daio-app
   restart: unless-stopped
@@ -39,8 +17,6 @@ x-agent-common: &agent-common
   volumes:
     - ./.deployments:/app/deployments:ro
     - ./.state:/app/state
-  environment:
-    <<: *agent-env
 
 services:
   content-service:
@@ -56,6 +32,7 @@ services:
       CONTENT_CHAIN_RPC_URL: ${RPC_URL:?set RPC_URL in .env}
       CONTENT_RELAYER_PRIVATE_KEY: ${CONTENT_RELAYER_PRIVATE_KEY:-}
       CONTENT_RELAYER_CONFIRMATIONS: ${CONTENT_RELAYER_CONFIRMATIONS:-1}
+      CONTENT_REQUIRE_AGENT_SIGNATURES: ${CONTENT_REQUIRE_AGENT_SIGNATURES:-true}
       DAIO_DEPLOYMENT_FILE: ${DAIO_DEPLOYMENT_FILE:-sepolia.json}
       DAIO_DEPLOYMENT_JSON: ${DAIO_DEPLOYMENT_JSON:-}
       DAIO_DEPLOYMENT_JSON_B64: ${DAIO_DEPLOYMENT_JSON_B64:-}
@@ -94,55 +71,50 @@ services:
 
   agent-1:
     <<: *agent-common
+    env_file:
+      - path: ./.env.agent_1
+        required: false
     environment:
-      <<: *agent-env
-      AGENT_PRIVATE_KEY: ${AGENT_1_PRIVATE_KEY:?set AGENT_1_PRIVATE_KEY in .env}
-      AGENT_VRF_PRIVATE_KEY: ${AGENT_1_VRF_PRIVATE_KEY:?set AGENT_1_VRF_PRIVATE_KEY in .env}
+      CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R1
       AGENT_STATE_DIR: /app/state/agent-1
-      AGENT_ID: ${AGENT_1_ID:-1001}
-      AGENT_ENS_NAME: ${AGENT_1_ENS_NAME:-reviewer-1.daio.eth}
 
   agent-2:
     <<: *agent-common
+    env_file:
+      - path: ./.env.agent_2
+        required: false
     environment:
-      <<: *agent-env
-      AGENT_PRIVATE_KEY: ${AGENT_2_PRIVATE_KEY:?set AGENT_2_PRIVATE_KEY in .env}
-      AGENT_VRF_PRIVATE_KEY: ${AGENT_2_VRF_PRIVATE_KEY:?set AGENT_2_VRF_PRIVATE_KEY in .env}
+      CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R2
       AGENT_STATE_DIR: /app/state/agent-2
-      AGENT_ID: ${AGENT_2_ID:-1002}
-      AGENT_ENS_NAME: ${AGENT_2_ENS_NAME:-reviewer-2.daio.eth}
 
   agent-3:
     <<: *agent-common
+    env_file:
+      - path: ./.env.agent_3
+        required: false
     environment:
-      <<: *agent-env
-      AGENT_PRIVATE_KEY: ${AGENT_3_PRIVATE_KEY:?set AGENT_3_PRIVATE_KEY in .env}
-      AGENT_VRF_PRIVATE_KEY: ${AGENT_3_VRF_PRIVATE_KEY:?set AGENT_3_VRF_PRIVATE_KEY in .env}
+      CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R3
       AGENT_STATE_DIR: /app/state/agent-3
-      AGENT_ID: ${AGENT_3_ID:-1003}
-      AGENT_ENS_NAME: ${AGENT_3_ENS_NAME:-reviewer-3.daio.eth}
 
   agent-4:
     <<: *agent-common
+    env_file:
+      - path: ./.env.agent_4
+        required: false
     environment:
-      <<: *agent-env
-      AGENT_PRIVATE_KEY: ${AGENT_4_PRIVATE_KEY:?set AGENT_4_PRIVATE_KEY in .env}
-      AGENT_VRF_PRIVATE_KEY: ${AGENT_4_VRF_PRIVATE_KEY:?set AGENT_4_VRF_PRIVATE_KEY in .env}
+      CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R4
       AGENT_STATE_DIR: /app/state/agent-4
-      AGENT_ID: ${AGENT_4_ID:-1004}
-      AGENT_ENS_NAME: ${AGENT_4_ENS_NAME:-reviewer-4.daio.eth}
 
   agent-5:
     <<: *agent-common
+    env_file:
+      - path: ./.env.agent_5
+        required: false
     environment:
-      <<: *agent-env
-      AGENT_PRIVATE_KEY: ${AGENT_5_PRIVATE_KEY:?set AGENT_5_PRIVATE_KEY in .env}
-      AGENT_VRF_PRIVATE_KEY: ${AGENT_5_VRF_PRIVATE_KEY:?set AGENT_5_VRF_PRIVATE_KEY in .env}
+      CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R5
       AGENT_STATE_DIR: /app/state/agent-5
-      AGENT_ID: ${AGENT_5_ID:-1005}
-      AGENT_ENS_NAME: ${AGENT_5_ENS_NAME:-reviewer-5.daio.eth}

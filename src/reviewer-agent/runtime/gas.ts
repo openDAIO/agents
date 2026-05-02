@@ -18,7 +18,9 @@ export async function gasLimitWithHeadroom(
   envName: string,
   fallbackFloor: bigint,
 ): Promise<bigint> {
+  const configuredFloor = process.env[envName];
   const floor = parseGasFloor(envName, fallbackFloor);
+  if (configuredFloor && configuredFloor.trim() !== "") return floor;
   try {
     const estimated = BigInt(await method.estimateGas(...args));
     const padded = estimated * DEFAULT_MULTIPLIER;

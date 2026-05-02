@@ -10,6 +10,7 @@ import { chat, extractJson } from "../llm/client.js";
 import { parseReview } from "../llm/validate.js";
 import type { ReviewArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
+import { agentArtifactMessage } from "../../shared/agent-signing.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
 import type { VrfProofProvider } from "../chain/vrfProof.js";
@@ -144,8 +145,9 @@ export async function runReview(
     },
     metadata: { model: parsed.metadata?.model, createdAt: new Date().toISOString() },
   };
-  const stored = await content.putReport(artifact);
   const reportHash = canonicalHash(artifact);
+  const artifactSignature = await wallet.signMessage(agentArtifactMessage("review", reportHash));
+  const stored = await content.putReport(artifact, artifactSignature);
   if (stored.hash !== reportHash) {
     throw new Error(`report hash mismatch between client (${reportHash}) and server (${stored.hash})`);
   }

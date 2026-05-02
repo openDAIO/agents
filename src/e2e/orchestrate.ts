@@ -20,11 +20,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(here, "../..");
 
 const FAST = 0;
-const E2E_AGENT_COUNT = 5;
-const E2E_QUORUM = 3;
-const E2E_REVIEW_VRF_DIFFICULTY = 8000n;
-const E2E_AUDIT_VRF_DIFFICULTY = 10000n;
-const E2E_AUDIT_TARGET_LIMIT = 2n;
+const E2E_AGENT_COUNT = Number(process.env.E2E_AGENT_COUNT ?? "5");
+const E2E_QUORUM = Number(process.env.E2E_QUORUM ?? "3");
+const E2E_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_REVIEW_VRF_DIFFICULTY ?? "8000");
+const E2E_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AUDIT_VRF_DIFFICULTY ?? "10000");
+const E2E_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AUDIT_TARGET_LIMIT ?? "2");
 const E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY ?? "1");
 const E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY ?? "1");
 const E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT ?? "1");
@@ -398,6 +398,7 @@ async function main(): Promise<RunResult> {
   const node = await startHardhatNode({
     port: 8545,
     host: "127.0.0.1",
+    silent: booleanEnv(process.env.E2E_HARDHAT_SILENT, true),
     fork: forkRpcUrl ? { url: forkRpcUrl, blockNumber: E2E_SEPOLIA_FORK_BLOCK } : undefined,
   });
   process.stdout.write(`[orchestrate] hardhat ready at ${node.rpcUrl}\n`);
@@ -602,7 +603,6 @@ async function main(): Promise<RunResult> {
   );
 
   // 8. Spawn selected agents
-  const stateKey = `0x${crypto.randomBytes(32).toString("hex")}`;
   const runStateRoot = path.join(ROOT, ".state", `e2e-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
   mkdirSync(runStateRoot, { recursive: true });
   process.stdout.write(`[orchestrate] agent state root: ${runStateRoot}\n`);
@@ -617,7 +617,7 @@ async function main(): Promise<RunResult> {
       contentSvc: content.baseUrl,
       deploymentPath,
       stateDir: path.join(runStateRoot, `agent-${i + 1}`),
-      stateKey,
+      stateKey: `0x${crypto.randomBytes(32).toString("hex")}`,
       agentId: BigInt(1001 + idx),
       ensName: `reviewer-${idx + 1}.daio.eth`,
       label: `R${i + 1}`,
@@ -719,26 +719,41 @@ async function main(): Promise<RunResult> {
   }
 
   // 12. Verify convenience APIs backed by the content service.
-  const apiProbeAgent = prescreen.reviewPassAddresses[0]!;
-  const statusRecord = await contentClient.getAgentStatus(primaryRequest.requestId, apiProbeAgent);
-  const reasons = await contentClient.getAgentReasons(primaryRequest.requestId, apiProbeAgent);
+  let apiProbe: {
+    requestId: bigint;
+    agent: string;
+    statusRecord: Awaited<ReturnType<ContentServiceClient["getAgentStatus"]>>;
+    reasons: Awaited<ReturnType<ContentServiceClient["getAgentReasons"]>>;
+  } | undefined;
+  for (const req of requests) {
+    for (const agent of prescreen.addresses) {
+      const statusRecord = await contentClient.getAgentStatus(req.requestId, agent);
+      const reasons = await contentClient.getAgentReasons(req.requestId, agent);
+      if (reasons.review && reasons.audit) {
+        apiProbe = { requestId: req.requestId, agent, statusRecord, reasons };
+        break;
+      }
+    }
+    if (apiProbe) break;
+  }
+  if (!apiProbe) throw new Error("agent reasons API did not return a review+audit pair for any finalized request");
+  const { statusRecord, reasons } = apiProbe;
   process.stdout.write(`[orchestrate] agent status API: ${JSON.stringify({
+    requestId: apiProbe.requestId.toString(),
     agent: statusRecord.agent,
     phase: statusRecord.phase,
     status: statusRecord.status,
   })}\n`);
   process.stdout.write(`[orchestrate] agent reasons API: ${JSON.stringify({
+    requestId: apiProbe.requestId.toString(),
     agent: reasons.agent,
     hasReview: Boolean(reasons.review),
     hasAudit: Boolean(reasons.audit),
     rawThinkingAvailable: reasons.rawThinking.available,
   })}\n`);
-  if (!reasons.review || !reasons.audit) {
-    throw new Error(`agent reasons API missing review or audit reasons for ${apiProbeAgent}`);
-  }
   if (statusRecord.phase !== "Finalized" || statusRecord.status !== "finalized") {
     throw new Error(
-      `agent status API did not report finalized state for ${apiProbeAgent}: ${statusRecord.phase}/${statusRecord.status}`,
+      `agent status API did not report finalized state for ${apiProbe.agent}: ${statusRecord.phase}/${statusRecord.status}`,
     );
   }
 

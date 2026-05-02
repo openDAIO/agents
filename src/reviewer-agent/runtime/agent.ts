@@ -3,6 +3,7 @@ import type { ContractHandles } from "../chain/contracts.js";
 import { CoreEventStream, type PhaseChange } from "../chain/events.js";
 import { RequestStatus } from "../../shared/types.js";
 import { ContentServiceClient } from "../../shared/content-client.js";
+import { agentStatusMessage } from "../../shared/agent-signing.js";
 import { runReview, runReviewReveal, type ReviewFlowDeps } from "./reviewFlow.js";
 import { runAudit, runAuditReveal, type AuditFlowDeps } from "./auditFlow.js";
 import type { StateStore } from "./state.js";
@@ -136,7 +137,7 @@ export class ReviewerAgent {
   ): Promise<void> {
     try {
       const safeDetail = detail && detail.length > 1000 ? `${detail.slice(0, 997)}...` : detail;
-      await this.content.putAgentStatus({
+      const statusBody = {
         requestId,
         agent: this.wallet.address,
         phase,
@@ -147,7 +148,14 @@ export class ReviewerAgent {
           chainStatus: phase,
           ...payload,
         },
-      });
+      };
+      const signature = await this.wallet.signMessage(
+        agentStatusMessage({
+          ...statusBody,
+          requestId: requestId.toString(),
+        }),
+      );
+      await this.content.putAgentStatus(statusBody, signature);
     } catch (err) {
       this.log(`status update failed: ${(err as Error).message}`);
     }

@@ -221,11 +221,11 @@ export class ContentServiceClient {
     return (await res.json()) as RequestDocumentRecord;
   }
 
-  async putReport(artifact: ReviewArtifact): Promise<ReportRecord> {
+  async putReport(artifact: ReviewArtifact, signature?: string): Promise<ReportRecord> {
     const res = await fetch(this.url("/reports"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(artifact),
+      body: JSON.stringify(signature ? { artifact, signature } : artifact),
     });
     if (!res.ok) throw new Error(`putReport: ${res.status} ${await res.text()}`);
     return (await res.json()) as ReportRecord;
@@ -243,11 +243,11 @@ export class ContentServiceClient {
     return this.getReport(m[1]!);
   }
 
-  async putAudit(artifact: AuditArtifact): Promise<AuditRecord> {
+  async putAudit(artifact: AuditArtifact, signature?: string): Promise<AuditRecord> {
     const res = await fetch(this.url("/audits"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(artifact),
+      body: JSON.stringify(signature ? { artifact, signature } : artifact),
     });
     if (!res.ok) throw new Error(`putAudit: ${res.status} ${await res.text()}`);
     return (await res.json()) as AuditRecord;
@@ -260,11 +260,11 @@ export class ContentServiceClient {
     status: string;
     detail?: string;
     payload?: Record<string, unknown>;
-  }): Promise<AgentStatusRecord> {
+  }, signature?: string): Promise<AgentStatusRecord> {
     const res = await fetch(this.url("/agent-status"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...input, requestId: input.requestId.toString() }),
+      body: JSON.stringify({ ...input, requestId: input.requestId.toString(), ...(signature ? { signature } : {}) }),
     });
     if (!res.ok) throw new Error(`putAgentStatus: ${res.status} ${await res.text()}`);
     return (await res.json()) as AgentStatusRecord;

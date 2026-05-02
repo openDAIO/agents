@@ -92,9 +92,10 @@ async function main() {
   const content = new ContentServiceClient(contentUrl as string);
   const state = StateStore.fromKey(stateDir as string, stateKey as string);
   const vrfPrivateKey = (values["vrf-privkey"] as string | undefined) ?? process.env.AGENT_VRF_PRIVATE_KEY;
+  const allowFixtureVrf = booleanSetting(undefined, "DAIO_ALLOW_FIXTURE_VRF", false);
   const vrf = vrfPrivateKey
     ? makeSecp256k1VrfProvider(vrfPrivateKey, ctx.provider)
-    : deployment.vrfPublicKey && deployment.vrfProof
+    : allowFixtureVrf && deployment.vrfPublicKey && deployment.vrfProof
       ? makeFixtureVrfProvider(
           [BigInt(deployment.vrfPublicKey[0]), BigInt(deployment.vrfPublicKey[1])],
           [
@@ -106,7 +107,9 @@ async function main() {
         )
       : undefined;
   if (!vrf) {
-    throw new Error("AGENT_VRF_PRIVATE_KEY is required unless the deployment snapshot provides mock vrfPublicKey and vrfProof");
+    throw new Error(
+      "AGENT_VRF_PRIVATE_KEY is required; set DAIO_ALLOW_FIXTURE_VRF=true only for local mock deployments that intentionally provide vrfPublicKey and vrfProof",
+    );
   }
 
   if (values["auto-register"]) {

@@ -8,6 +8,9 @@ const deploymentPath = process.env.CONTENT_DEPLOYMENT_PATH ?? process.env.DAIO_D
 const rpcUrl = process.env.CONTENT_CHAIN_RPC_URL ?? process.env.RPC_URL;
 const relayerPrivateKey = process.env.CONTENT_RELAYER_PRIVATE_KEY ?? process.env.RELAYER_PRIVATE_KEY;
 const relayerConfirmations = Number(process.env.CONTENT_RELAYER_CONFIRMATIONS ?? "1");
+const requireAgentSignatures = !["0", "false", "no", "off"].includes(
+  (process.env.CONTENT_REQUIRE_AGENT_SIGNATURES ?? "true").trim().toLowerCase(),
+);
 
 const { app, db } = buildServer({
   dbPath,
@@ -17,6 +20,7 @@ const { app, db } = buildServer({
     privateKey: relayerPrivateKey,
     confirmations: Number.isFinite(relayerConfirmations) && relayerConfirmations >= 0 ? relayerConfirmations : 1,
   },
+  requireAgentSignatures,
 });
 
 async function main() {

@@ -30,7 +30,8 @@ Persistent files:
 
 | Path | Purpose | Backup |
 | --- | --- | --- |
-| `.env` | RPC, wallet keys, VRF keys, LLM config, service config | yes, encrypted |
+| `.env` | shared content-service, MarkItDown, deployment, and relayer config | yes, encrypted |
+| `.env.agent_*` | one independent reviewer agent config and secrets per file | yes, encrypted |
 | `.deployments/sepolia.json` | contract deployment snapshot used by services | yes |
 | `.data/content.sqlite` | content API documents, statuses, reasons, request metadata | yes |
 | `.state/agent-*` | local reviewer runtime state | yes |
@@ -88,15 +89,23 @@ Wallets:
 - Five reviewer transaction wallets, one per agent.
 - Five reviewer VRF private keys, one per agent. These are separate from the
   transaction private keys.
+- Five reviewer state keys, one per agent. Each lives in that agent's
+  `.env.agent_*` file and encrypts local commit-reveal seeds under
+  `.state/agent-*`.
 - One optional relayer transaction wallet for `CONTENT_RELAYER_PRIVATE_KEY`.
 - External requester wallets, operated by users or your frontend flow.
+
+`AGENT_PRIVATE_KEY`, `AGENT_VRF_PRIVATE_KEY`, and `AGENT_STATE_KEY` are all
+32-byte secret-like values and may parse if reused in a throwaway test. Do not
+reuse them in production: one leak would compromise transaction authority, VRF
+sortition proofs, and commit-reveal seed encryption at once.
 
 Funds and permissions:
 
 - Each reviewer transaction wallet needs Sepolia ETH for transactions.
 - The relayer wallet needs Sepolia ETH if relayed request creation is enabled.
 - Each reviewer must be registered on-chain with the VRF public key derived from
-  its configured `AGENT_N_VRF_PRIVATE_KEY`.
+  its own `.env.agent_N` `AGENT_VRF_PRIVATE_KEY`.
 - Each reviewer must have enough USDAIO staked for the active request window.
   With `maxActiveRequests=2`, use at least `2000 USDAIO` staked per reviewer.
 - Requesters need USDAIO balance and must approve the deployed `PaymentRouter`
@@ -177,7 +186,8 @@ Create persistent directories:
 mkdir -p .deployments .data .state
 chmod 700 .data .state
 cp .env.example .env
-chmod 600 .env
+for i in 1 2 3 4 5; do cp .env.agent.example ".env.agent_$i"; done
+chmod 600 .env .env.agent_*
 ```
 
 Confirm the submodule commits:
@@ -229,35 +239,24 @@ macOS encoding:
 base64 < .deployments/sepolia.json | tr -d '\n'
 ```
 
-## 7. Configure `.env`
+## 7. Configure `.env` and `.env.agent_*`
 
-Edit `.env` on the EC2 host:
+Edit the shared `.env` on the EC2 host:
 
 ```sh
 nano .env
 ```
 
-Required chain fields:
+Shared chain/content fields:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `RPC_URL` | yes | Sepolia RPC used by all services |
-| `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
+| `RPC_URL` | yes | Sepolia RPC used by content-service and deployment checks |
+| `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json`; compose also mounts this snapshot for agents |
 | `DAIO_DEPLOYMENT_JSON_B64` | optional | use only when overriding the mounted snapshot |
 
 Public deployment address fields in `.env.example` are documentation for
 operators and downstream services. Runtime services read the deployment snapshot.
-
-LLM fields:
-
-| Field | Required | Notes |
-| --- | --- | --- |
-| `LLM_BASE_URL` | yes | OpenAI-compatible base URL, for example `http://host:port/v1` |
-| `LLM_MODEL` | yes | model served by the LLM endpoint |
-| `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
-| `LLM_MAX_TOKENS` | yes | response token budget |
-| `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
-| `LLM_REASONING_EFFORT` | optional | forwarded when the endpoint supports it |
 
 Content API fields:
 
@@ -268,6 +267,7 @@ Content API fields:
 | `CONTENT_DB_PATH` | informational | compose stores DB at `/app/data/content.sqlite` mapped from `.data` |
 | `CONTENT_RELAYER_PRIVATE_KEY` | optional | enables relayed request creation |
 | `CONTENT_RELAYER_CONFIRMATIONS` | optional | confirmation wait count after relayer tx |
+| `CONTENT_REQUIRE_AGENT_SIGNATURES` | yes | keep `true`; requires reviewer wallet signatures on agent-written artifacts/status |
 
 MarkItDown fields:
 
@@ -278,43 +278,77 @@ MarkItDown fields:
 | `MARKITDOWN_MAX_UPLOAD_BYTES` | yes | upload limit, default 50 MiB |
 | `MARKITDOWN_ENABLE_PLUGINS` | optional | keep `false` unless explicitly needed |
 
-Agent runtime fields:
+Then edit each agent file independently:
+
+```sh
+nano .env.agent_1
+nano .env.agent_2
+nano .env.agent_3
+nano .env.agent_4
+nano .env.agent_5
+```
+
+Each `.env.agent_N` uses the same variable names because it is injected only
+into that one container. Do not place five agents' secrets in the shared `.env`.
+Keep each agent file's deployment fields aligned with the shared `.env` and
+mounted `.deployments/sepolia.json`; otherwise the agent and content service may
+watch different contracts.
+
+Per-agent chain/LLM fields:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `AGENT_STATE_KEY` | yes | 32-byte local state encryption/signing key |
+| `RPC_URL` | yes | Sepolia RPC used by this agent |
+| `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
+| `CONTENT_SERVICE_URL` | yes | overridden to `http://content-service:18002` by bundled compose |
+| `LLM_BASE_URL` | yes | OpenAI-compatible base URL chosen by this operator |
+| `LLM_MODEL` | yes | model served by the LLM endpoint |
+| `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
+| `LLM_MAX_TOKENS` | yes | response token budget |
+| `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
+| `LLM_REASONING_EFFORT` | optional | forwarded when the endpoint supports it |
+
+Per-agent secret and identity fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `AGENT_STATE_KEY` | yes | 32-byte local state encryption key for this agent only |
+| `AGENT_PRIVATE_KEY` | yes | transaction signer, must hold Sepolia ETH |
+| `AGENT_VRF_PRIVATE_KEY` | yes | secp256k1 VRF secret used to derive proofs |
+| `AGENT_ID` | if auto-registering | identity id passed to reviewer registration |
+| `AGENT_ENS_NAME` | if auto-registering | ENS name passed to reviewer registration |
 | `AGENT_AUTO_REGISTER` | optional | if `true`, agents attempt reviewer registration at boot |
 | `DAIO_AUTO_START_REQUESTS` | yes | keep `true` for active production serving |
 | `DAIO_START_REQUESTS_MAX_PER_TICK` | yes | max start attempts per polling tick, default `2` |
 | `DAIO_START_REQUESTS_MIN_INTERVAL_MS` | yes | polling interval floor |
 | `DAIO_START_REQUESTS_JITTER_MS` | yes | spreads agent tx timing |
+| `DAIO_ALLOW_FIXTURE_VRF` | yes | keep `false` outside local mock deployments |
 | `DAIO_REVIEW_ELECTION_DIFFICULTY` | fallback | agents prefer on-chain request config |
 | `DAIO_AUDIT_ELECTION_DIFFICULTY` | fallback | agents prefer on-chain request config |
 | `DAIO_AUDIT_TARGET_LIMIT` | fallback | agents prefer on-chain request config |
+| `DAIO_REVIEW_COMMIT_GAS_FLOOR` | optional | when set, skip review-commit gas estimation and use this gas limit |
+| `DAIO_REVIEW_REVEAL_GAS_FLOOR` | optional | when set, skip review-reveal gas estimation and use this gas limit |
+| `DAIO_AUDIT_COMMIT_GAS_FLOOR` | optional | when set, skip audit-commit gas estimation and use this gas limit |
+| `DAIO_AUDIT_REVEAL_GAS_FLOOR` | optional | when set, skip audit-reveal gas estimation and use this gas limit |
 
-Per-agent fields:
-
-| Field | Required | Notes |
-| --- | --- | --- |
-| `AGENT_N_PRIVATE_KEY` | yes | transaction signer, must hold Sepolia ETH |
-| `AGENT_N_VRF_PRIVATE_KEY` | yes | secp256k1 VRF secret used to derive proofs |
-| `AGENT_N_ID` | if auto-registering | identity id passed to reviewer registration |
-| `AGENT_N_ENS_NAME` | if auto-registering | ENS name passed to reviewer registration |
-
-Generate a state key:
+Generate per-agent state keys:
 
 ```sh
-printf '0x%s\n' "$(openssl rand -hex 32)"
+for i in 1 2 3 4 5; do printf '.env.agent_%s AGENT_STATE_KEY=0x%s\n' "$i" "$(openssl rand -hex 32)"; done
 ```
 
 Generate candidate VRF keys:
 
 ```sh
-for i in 1 2 3 4 5; do printf 'AGENT_%s_VRF_PRIVATE_KEY=0x%s\n' "$i" "$(openssl rand -hex 32)"; done
+for i in 1 2 3 4 5; do printf '.env.agent_%s AGENT_VRF_PRIVATE_KEY=0x%s\n' "$i" "$(openssl rand -hex 32)"; done
 ```
 
 If an agent rejects a VRF key as invalid, generate a new one. Do not reuse the
-same private key for transaction signing and VRF.
+same private key for transaction signing, VRF, or local state encryption.
+
+The same `AGENT_STATE_KEY` variable name is used in every `.env.agent_N`, but
+each file belongs to one agent only. Do not reuse the same value across
+independent reviewers in production.
 
 Do not put E2E-only fields such as `E2E_CHAIN_MODE`, `E2E_FORK_RPC_URL`, or
 `E2E_FORK_DISABLE_IDENTITY_MODULES` into the production operational path. They
@@ -328,13 +362,14 @@ Reviewer registration:
 
 - If reviewers are already registered, set `AGENT_AUTO_REGISTER=false`.
 - If using `AGENT_AUTO_REGISTER=true`, make sure the deployment's identity
-  checks accept the configured `AGENT_N_ID` and `AGENT_N_ENS_NAME` values.
+  checks accept each agent file's `AGENT_ID` and `AGENT_ENS_NAME` values.
 - The on-chain VRF public key for each reviewer must match the configured
-  `AGENT_N_VRF_PRIVATE_KEY`. Agents refuse to serve when the key does not match.
+  `AGENT_VRF_PRIVATE_KEY` in that reviewer's `.env.agent_N`. Agents refuse to
+  serve when the key does not match.
 
 Reviewer funds:
 
-- Each `AGENT_N_PRIVATE_KEY` wallet has Sepolia ETH.
+- Each `AGENT_PRIVATE_KEY` wallet in `.env.agent_N` has Sepolia ETH.
 - Each reviewer has enough USDAIO balance and stake.
 - For `maxActiveRequests=2`, stake at least `2000 USDAIO` per reviewer.
 
@@ -366,7 +401,43 @@ There is no separate keeper container in this compose stack. Each reviewer agent
 runs its own auto-start loop and attempts to join eligible queued requests when
 capacity, VRF eligibility, and contract rules allow it.
 
-## 9. Build and Boot
+## 9. Independence Boundaries
+
+The protocol-critical path is chain-anchored:
+
+- reviewer membership, stake, VRF public keys, active request limits, quorum, and
+  sortition config come from contracts
+- each agent signs its own transactions with `AGENT_PRIVATE_KEY` from its own
+  `.env.agent_N`
+- each agent derives its own VRF proofs from `AGENT_VRF_PRIVATE_KEY`
+- each agent encrypts local commit-reveal seeds with its own `AGENT_STATE_KEY`
+- content artifacts are addressed by canonical hashes, and agents verify
+  proposal/report hashes before using fetched content
+
+The HTTP content service is still a shared availability layer. A malicious or
+unavailable content service can censor documents or artifacts, but it should not
+be able to silently change proposal text or review reports without hash
+verification failing.
+
+Keep `CONTENT_REQUIRE_AGENT_SIGNATURES=true`. With that setting, `POST /reports`,
+`POST /audits`, and `PUT /agent-status` must be signed by the reviewer/auditor
+wallet named in the payload. This protects the status/reason API from trivial
+spoofing by another HTTP caller.
+
+The five-agent Docker Compose file is an operational convenience for one box. It
+is not a trust boundary between mutually distrustful operators: a host or Docker
+administrator can read every container environment and mounted state directory.
+For real independent operators, run one agent per operator-controlled host or
+account, each with its own `.env`, `.state`, tx key, VRF key, and state key. They
+should also choose their own LLM endpoint policy instead of assuming the shared
+`LLM_BASE_URL` in this convenience compose file is neutral. They may share a
+public content API, or each operator may use its own content service as long as
+the published `content://...` artifacts are reachable by auditors.
+The current `content://` resolver is bound to the agent's configured
+`CONTENT_SERVICE_URL`; true multi-service federation needs a shared gateway,
+mirroring layer, or globally resolvable artifact URI scheme such as IPFS/HTTPS.
+
+## 10. Build and Boot
 
 Validate the compose file:
 
@@ -403,14 +474,14 @@ config from contract storage finality=2 reviewDiff=8000 auditDiff=10000 auditTar
 
 If an agent exits immediately, check:
 
-- missing `AGENT_N_PRIVATE_KEY`
-- missing `AGENT_N_VRF_PRIVATE_KEY`
-- invalid `AGENT_STATE_KEY`
+- missing `AGENT_PRIVATE_KEY` in that service's `.env.agent_N`
+- missing `AGENT_VRF_PRIVATE_KEY` in that service's `.env.agent_N`
+- invalid `AGENT_STATE_KEY` in that service's `.env.agent_N`
 - wrong deployment snapshot
 - reviewer registration or VRF public key mismatch
 - no Sepolia ETH for boot-time transactions
 
-## 10. Health Checks
+## 11. Health Checks
 
 From the EC2 host:
 
@@ -457,14 +528,31 @@ fetch(`${base}/chat/completions`, {
 Optional Sepolia fork E2E validation against the deployed contract addresses:
 
 ```sh
-RPC_URL=<sepolia-rpc-url> E2E_REQUEST_COUNT=1 E2E_MAX_ACTIVE_REQUESTS=2 npm run e2e:sepolia-fork
+RPC_URL=<sepolia-rpc-url> \
+E2E_AGENT_COUNT=5 \
+E2E_QUORUM=3 \
+E2E_REQUEST_COUNT=2 \
+E2E_MAX_ACTIVE_REQUESTS=2 \
+E2E_REVIEW_VRF_DIFFICULTY=8000 \
+E2E_AUDIT_VRF_DIFFICULTY=10000 \
+DAIO_REVIEW_COMMIT_GAS_FLOOR=7000000 \
+DAIO_REVIEW_REVEAL_GAS_FLOOR=2000000 \
+DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
+DAIO_AUDIT_REVEAL_GAS_FLOOR=12000000 \
+npm run e2e:sepolia-fork
 ```
 
 That command is a pre-production validation tool. It forks Sepolia locally and
 uses `./.deployments/sepolia.json` addresses without replacing deployed contract
 code. It is not the production serving process.
 
-## 11. API Flow
+The reliable E2E finalization default is review VRF `8000/10000` and audit VRF
+`10000/10000`. Setting both review and audit difficulty to `6000` exercises a
+stricter 60% sortition path, but real audit VRF may legitimately miss quorum
+for a five-agent, quorum-three run. Treat that as a stress/availability
+scenario rather than a guaranteed success case.
+
+## 12. API Flow
 
 ### Relayed USDAIO request
 
@@ -557,7 +645,7 @@ Raw hidden model chain-of-thought is not exposed by this stack. The reasons API
 returns persisted review and audit reason artifacts plus raw model output fields
 that the runtime explicitly stores.
 
-## 12. MarkItDown Conversion
+## 13. MarkItDown Conversion
 
 Convert multipart uploads:
 
@@ -582,7 +670,7 @@ prompting path applies `LLM_PROPOSAL_CHAR_BUDGET` before LLM review generation.
 Increase the timeout and char budget only after confirming the LLM endpoint can
 handle the larger payloads.
 
-## 13. Network Exposure
+## 14. Network Exposure
 
 The compose file binds APIs to `127.0.0.1` by default:
 
@@ -624,7 +712,7 @@ Avoid exposing raw `18002` or `18003` to the public internet unless the EC2
 security group, host firewall, and application-level controls are already in
 place.
 
-## 14. Operations
+## 15. Operations
 
 Update the running service:
 
@@ -663,7 +751,7 @@ docker compose logs --tail=200 agent-1
 Back up:
 
 ```sh
-tar czf daio-backup-$(date +%Y%m%d-%H%M%S).tgz .env .deployments/sepolia.json .data .state
+tar czf daio-backup-$(date +%Y%m%d-%H%M%S).tgz .env .env.agent_* .deployments/sepolia.json .data .state
 ```
 
 Monitor:
@@ -679,7 +767,7 @@ Monitor:
 - request terminal status mix: `Finalized`, `Failed`, `Unresolved`,
   `Cancelled`
 
-## 15. Launch Checklist
+## 16. Launch Checklist
 
 AWS:
 
@@ -707,16 +795,20 @@ Repository:
 Environment:
 
 - `.env` created from `.env.example`.
+- `.env.agent_1` through `.env.agent_5` created from `.env.agent.example`.
 - `.env` permission set to `600`.
+- `.env.agent_*` permission set to `600`.
 - `RPC_URL` set.
 - `DAIO_DEPLOYMENT_FILE=sepolia.json` set, or `DAIO_DEPLOYMENT_JSON_B64` set.
-- `LLM_BASE_URL`, `LLM_MODEL`, timeout, max tokens, and char budget set.
 - `CONTENT_RELAYER_PRIVATE_KEY` set if relayed request creation is enabled.
-- `AGENT_STATE_KEY` set to a 32-byte hex value.
-- `AGENT_1_PRIVATE_KEY` through `AGENT_5_PRIVATE_KEY` set.
-- `AGENT_1_VRF_PRIVATE_KEY` through `AGENT_5_VRF_PRIVATE_KEY` set.
-- `DAIO_AUTO_START_REQUESTS=true`.
-- `DAIO_START_REQUESTS_MAX_PER_TICK=2` unless the contract-side active request
+- `CONTENT_REQUIRE_AGENT_SIGNATURES=true`.
+- Each `.env.agent_N` has `RPC_URL`, `LLM_BASE_URL`, `LLM_MODEL`, timeout, max tokens, and char budget set.
+- Each `.env.agent_N` has a distinct `AGENT_STATE_KEY`.
+- Each `.env.agent_N` has its own `AGENT_PRIVATE_KEY`.
+- Each `.env.agent_N` has its own `AGENT_VRF_PRIVATE_KEY`.
+- Each `.env.agent_N` has `DAIO_AUTO_START_REQUESTS=true`.
+- Each `.env.agent_N` has `DAIO_ALLOW_FIXTURE_VRF=false`.
+- Each `.env.agent_N` has `DAIO_START_REQUESTS_MAX_PER_TICK=2` unless the contract-side active request
   limit and observed latency justify a higher value.
 
 On-chain:
@@ -754,7 +846,7 @@ Serving:
 
 Backup and recovery:
 
-- `.env`, `.deployments/sepolia.json`, `.data`, and `.state` are backed up.
+- `.env`, `.env.agent_*`, `.deployments/sepolia.json`, `.data`, and `.state` are backed up.
 - Log rotation is enabled.
 - Restart and update procedure has been tested.
 

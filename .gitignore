@@ -19,8 +19,11 @@ samples/*.md
 
 # Secrets & local config
 .env
+.env.agent
+.env.agent_*
 .env.local
 .env.*.local
+!.env.agent.example
 
 # Logs
 *.log

@@ -1,10 +1,10 @@
-import { Wallet, type JsonRpcProvider } from "ethers";
-import { sortitionPass } from "../reviewer-agent/chain/sortition.js";
+import { AbiCoder, keccak256, Wallet, ZeroAddress, type JsonRpcProvider } from "ethers";
 import { REVIEW_SORTITION, AUDIT_SORTITION } from "../shared/types.js";
 import type { ContractHandles } from "../reviewer-agent/chain/contracts.js";
-import type { VrfProofProvider } from "../reviewer-agent/chain/vrfProof.js";
+import { daioVrfMessage, type VrfProof, type VrfProofProvider, type VrfPublicKey } from "../reviewer-agent/chain/vrfProof.js";
 
 const SCALE = 10000n;
+const coder = AbiCoder.defaultAbiCoder();
 
 export interface PreScreenInput {
   handles: ContractHandles;
@@ -50,6 +50,52 @@ function* combinations(values: number[], size: number, start = 0, picked: number
   }
 }
 
+async function verifiedSortitionPass(input: {
+  handles: ContractHandles;
+  provider: JsonRpcProvider;
+  coreAddress: string;
+  publicKey: VrfPublicKey;
+  proof: VrfProof;
+  requestId: bigint;
+  phase: string;
+  epoch: bigint;
+  participant: string;
+  target?: string;
+  phaseStartBlock: bigint;
+  finalityFactor: bigint;
+  difficulty: bigint;
+}): Promise<boolean> {
+  const target = input.target ?? ZeroAddress;
+  // Prescreening predicts future phase blocks. Calling DAIOVRFCoordinator now
+  // can misread blockhash(current) as zero, so verify the exact intended DAIO
+  // message through the deployed pure FRAIN verifier instead.
+  const message = await daioVrfMessage(input.provider, {
+    coreAddress: input.coreAddress,
+    requestId: input.requestId,
+    phase: input.phase,
+    epoch: input.epoch,
+    participant: input.participant,
+    target,
+    phaseStartBlock: input.phaseStartBlock,
+    finalityFactor: input.finalityFactor,
+  });
+  const randomness = (await input.handles.vrfVerifier.randomnessFromProof(
+    input.publicKey,
+    input.proof,
+    message,
+  )) as string;
+  const score =
+    BigInt(
+      keccak256(
+        coder.encode(
+          ["bytes32", "uint256", "address", "address", "bytes32"],
+          [input.phase, input.requestId, input.participant, target, randomness],
+        ),
+      ),
+    ) % SCALE;
+  return score < input.difficulty;
+}
+
 // Find a fixed-size agent committee where exactly `quorum` agents pass review
 // sortition, and those revealed reviewers can also satisfy audit quorum.
 export async function preScreenCommittee(input: PreScreenInput): Promise<PreScreenResult> {
@@ -93,8 +139,9 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
       phaseStartBlock: req.reviewPhaseStartBlock,
       finalityFactor: input.finalityFactor,
     });
-    const ok = await sortitionPass({
-      vrfCoordinator: input.handles.vrfCoordinator,
+    const ok = await verifiedSortitionPass({
+      handles: input.handles,
+      provider: input.provider,
       coreAddress,
       publicKey: vrf.publicKey,
       proof,
@@ -123,9 +170,8 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
     const auditStableBlock = auditPhaseStartBlock > input.finalityFactor ? auditPhaseStartBlock - input.finalityFactor : 0n;
     const currentBlock = BigInt(await input.provider.getBlockNumber());
     if (auditStableBlock > currentBlock) {
-      throw new Error(
-        `prescreen: cannot evaluate future audit VRF block ${auditStableBlock}; use audit difficulty ${SCALE} or prescreen after the stable block exists`,
-      );
+      auditCache.set(key, true);
+      return true;
     }
     const vrf = input.vrfProviders[auditorIdx]!;
     const proof = await vrf.proofFor({
@@ -138,8 +184,9 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
       phaseStartBlock: auditPhaseStartBlock,
       finalityFactor: input.finalityFactor,
     });
-    const ok = await sortitionPass({
-      vrfCoordinator: input.handles.vrfCoordinator,
+    const ok = await verifiedSortitionPass({
+      handles: input.handles,
+      provider: input.provider,
       coreAddress,
       publicKey: vrf.publicKey,
       proof,

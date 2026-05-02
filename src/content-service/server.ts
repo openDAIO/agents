@@ -5,6 +5,7 @@ import { z } from "zod";
 import { ContentDB } from "./db.js";
 import { ReviewArtifact, AuditArtifact } from "../shared/schemas.js";
 import { canonicalHash, canonicalJson } from "../shared/canonical.js";
+import { agentArtifactMessage, agentStatusMessage, verifyAgentSignature } from "../shared/agent-signing.js";
 import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { RequestStatus, Tier } from "../shared/types.js";
@@ -21,6 +22,7 @@ export interface ServerOptions {
     privateKey?: string;
     confirmations?: number;
   };
+  requireAgentSignatures?: boolean;
 }
 
 const HexAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/);
@@ -47,7 +49,24 @@ const AgentStatusBody = z.object({
   status: z.string().min(1).max(80),
   detail: z.string().max(1000).optional(),
   payload: z.record(z.unknown()).optional().default({}),
+  signature: HexSignature.optional(),
 });
+
+const ReviewArtifactBody = z.union([
+  ReviewArtifact,
+  z.object({
+    artifact: ReviewArtifact,
+    signature: HexSignature,
+  }),
+]);
+
+const AuditArtifactBody = z.union([
+  AuditArtifact,
+  z.object({
+    artifact: AuditArtifact,
+    signature: HexSignature,
+  }),
+]);
 
 const RequestIntentBody = z.object({
   requester: HexAddress,
@@ -225,6 +244,24 @@ function formatError(err: unknown): string {
   return String(err);
 }
 
+function requireValidAgentSignature(input: {
+  enabled: boolean;
+  signer: string;
+  message: string;
+  signature?: string;
+}): { ok: true } | { ok: false; code: number; error: string } {
+  if (!input.enabled) return { ok: true };
+  if (!input.signature) return { ok: false, code: 401, error: "agent_signature_required" };
+  try {
+    if (!verifyAgentSignature(input.signer, input.message, input.signature)) {
+      return { ok: false, code: 403, error: "agent_signature_mismatch" };
+    }
+  } catch (err) {
+    return { ok: false, code: 400, error: "invalid_agent_signature" };
+  }
+  return { ok: true };
+}
+
 function isNonceError(err: unknown): boolean {
   const text = formatError(err).toLowerCase();
   return text.includes("nonce") || text.includes("replacement transaction underpriced") || text.includes("already known");
@@ -365,6 +402,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   const app = Fastify({ logger: opts.logger ?? false, bodyLimit: 25 * 1024 * 1024 });
   const deploymentPath = opts.chain?.deploymentPath ?? "./.deployments/local.json";
   const rpcUrl = opts.chain?.rpcUrl;
+  const requireAgentSignatures = opts.requireAgentSignatures ?? true;
   let relayerProvider: JsonRpcProvider | undefined;
   let relayerSigner: NonceManager | undefined;
 
@@ -626,14 +664,25 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   });
 
   app.post("/reports", async (req, reply) => {
-    const parsed = ReviewArtifact.safeParse(req.body);
+    const parsed = ReviewArtifactBody.safeParse(req.body);
     if (!parsed.success) {
       reply.code(400);
       return { error: "invalid_artifact", issues: parsed.error.issues };
     }
-    const artifact = parsed.data;
+    const artifact = "artifact" in parsed.data ? parsed.data.artifact : parsed.data;
+    const signature = "signature" in parsed.data ? parsed.data.signature : undefined;
     const json = canonicalJson(artifact);
     const hash = canonicalHash(artifact);
+    const sig = requireValidAgentSignature({
+      enabled: requireAgentSignatures,
+      signer: artifact.reviewer,
+      message: agentArtifactMessage("review", hash),
+      signature,
+    });
+    if (!sig.ok) {
+      reply.code(sig.code);
+      return { error: sig.error };
+    }
     db.upsertBlob("reports", { hash, json });
     db.indexReviewArtifact({
       requestId: artifact.requestId,
@@ -654,14 +703,25 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   });
 
   app.post("/audits", async (req, reply) => {
-    const parsed = AuditArtifact.safeParse(req.body);
+    const parsed = AuditArtifactBody.safeParse(req.body);
     if (!parsed.success) {
       reply.code(400);
       return { error: "invalid_artifact", issues: parsed.error.issues };
     }
-    const artifact = parsed.data;
+    const artifact = "artifact" in parsed.data ? parsed.data.artifact : parsed.data;
+    const signature = "signature" in parsed.data ? parsed.data.signature : undefined;
     const json = canonicalJson(artifact);
     const hash = canonicalHash(artifact);
+    const sig = requireValidAgentSignature({
+      enabled: requireAgentSignatures,
+      signer: artifact.auditor,
+      message: agentArtifactMessage("audit", hash),
+      signature,
+    });
+    if (!sig.ok) {
+      reply.code(sig.code);
+      return { error: sig.error };
+    }
     db.upsertBlob("audits", { hash, json });
     db.indexAuditArtifact({
       requestId: artifact.requestId,
@@ -767,6 +827,23 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     }
     const body = parsed.data;
     const agent = getAddress(body.agent);
+    const sig = requireValidAgentSignature({
+      enabled: requireAgentSignatures,
+      signer: agent,
+      message: agentStatusMessage({
+        requestId: body.requestId,
+        agent,
+        phase: body.phase,
+        status: body.status,
+        detail: body.detail,
+        payload: body.payload,
+      }),
+      signature: body.signature,
+    });
+    if (!sig.ok) {
+      reply.code(sig.code);
+      return { error: sig.error };
+    }
     db.upsertAgentStatus({
       requestId: body.requestId,
       agentKey: addressKey(agent),

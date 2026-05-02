@@ -314,10 +314,13 @@ npm install
 bash scripts/prepare-samples.sh    # converts contracts/BRAIN.pdf → samples/paper-001.md
 ```
 
-`.env` (a working default is committed):
+Local E2E/content-service `.env` values:
 
 ```bash
-LLM_BASE_URL=http://59.12.201.156:18001/v1
+RPC_URL=https://sepolia.drpc.org
+DAIO_DEPLOYMENT_FILE=sepolia.json
+
+LLM_BASE_URL=http://100.94.8.47:8000/v1
 LLM_MODEL=gpt-oss-120b
 LLM_TIMEOUT_MS=120000
 LLM_MAX_TOKENS=8192
@@ -327,9 +330,7 @@ LLM_PROPOSAL_CHAR_BUDGET=350000
 CONTENT_SERVICE_PORT=18002
 CONTENT_SERVICE_HOST=127.0.0.1
 CONTENT_DB_PATH=./.data/content.sqlite
-
-HARDHAT_PORT=8545
-HARDHAT_HOST=127.0.0.1
+CONTENT_REQUIRE_AGENT_SIGNATURES=true
 ```
 
 Run the full E2E:
@@ -341,7 +342,18 @@ npm run e2e
 Run the deployed-contract Sepolia fork E2E:
 
 ```bash
-RPC_URL=https://sepolia.infura.io/v3/... npm run e2e:sepolia-fork
+RPC_URL=https://sepolia.drpc.org \
+E2E_AGENT_COUNT=5 \
+E2E_QUORUM=3 \
+E2E_REQUEST_COUNT=2 \
+E2E_MAX_ACTIVE_REQUESTS=2 \
+E2E_REVIEW_VRF_DIFFICULTY=8000 \
+E2E_AUDIT_VRF_DIFFICULTY=10000 \
+DAIO_REVIEW_COMMIT_GAS_FLOOR=7000000 \
+DAIO_REVIEW_REVEAL_GAS_FLOOR=2000000 \
+DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
+DAIO_AUDIT_REVEAL_GAS_FLOOR=12000000 \
+npm run e2e:sepolia-fork
 ```
 
 Optional fork controls:
@@ -351,6 +363,7 @@ E2E_SEPOLIA_FORK_BLOCK=10769290
 E2E_SEPOLIA_DEPLOYMENT_PATH=.deployments/sepolia.json
 E2E_FORK_DISABLE_IDENTITY_MODULES=true
 E2E_FORK_CONFIGURE_FAST_TIER=true
+E2E_HARDHAT_SILENT=true
 ```
 
 Standalone binaries (for debugging):
@@ -361,7 +374,7 @@ npm run agent -- --rpc … --privkey … …    # reviewer-agent alone
 npm run typecheck                         # tsc --noEmit
 ```
 
-Production-style Docker Compose setup is documented in [DOCKER.md](DOCKER.md). It runs the content API, five reviewer agents, and a MarkItDown conversion API from one `.env`.
+Production-style Docker Compose setup is documented in [DOCKER.md](DOCKER.md). The included compose file can run the content API, five reviewer agents, and a MarkItDown conversion API on one host for operational convenience. Agent secrets are split into `.env.agent_1` through `.env.agent_5`; independent operators should run their own host/account/env rather than sharing one host-level trust boundary.
 
 Manual probes during a run:
 
@@ -381,11 +394,17 @@ curl http://127.0.0.1:18002/reports/0x643abeef31189c116d28ed73e4d9162355b4ecddd7
 
 Both local and Sepolia fork E2E runs use `DAIOVRFCoordinator` + `FRAINVRFVerifier`, not `MockVRFCoordinator`. Each spawned E2E agent receives its own secp256k1 VRF private key; the runtime derives the public key for registration and generates request/phase/epoch/target-specific VRF proofs before review and audit commits.
 
-The orchestrator's prescreen routine reproduces the same `randomness % 10000 < electionDifficulty` check off-chain (in [src/reviewer-agent/chain/sortition.ts](src/reviewer-agent/chain/sortition.ts)) so it can pick three candidates that, at the predicted `phaseStartBlock`, all pass review sortition and form valid mutual audit pairs.
+The legacy fixture VRF path is disabled unless `DAIO_ALLOW_FIXTURE_VRF=true` is set explicitly. Production and Sepolia fork runs should keep it disabled and provide `AGENT_VRF_PRIVATE_KEY`.
+
+The orchestrator's prescreen routine uses the same DAIO VRF message builder as the agents and verifies generated proofs through the deployed `FRAINVRFVerifier.randomnessFromProof(...)`. This avoids relying on coordinator state while choosing a five-agent committee for a predicted review `phaseStartBlock`. Audit sortition that depends on a future stable block is intentionally not forced during prescreen; the agents re-check audit eligibility at runtime through the deployed coordinator before sending audit commits.
+
+For the current five-agent, quorum-three E2E, `reviewDiff=8000` and `auditDiff=10000` are the reliable validation defaults. A `6000/6000` stress run exercises the 60% VRF path, but it can legitimately miss audit quorum under real sortition and should be treated as an availability test, not a guaranteed finalization test.
 
 ### Content service as the canonical store
 
 The content-service holds two kinds of artifact: `proposals` (the document under review, addressed by id) and `reports` (review artifacts, addressed by hash). Its `POST /reports` endpoint canonicalizes the artifact (sorted keys + UTF-8) and recomputes `keccak256` server-side, so a report URI is structurally `content://reports/0x<hash>` where the hash matches what the on-chain `ReviewRevealed` event will carry. Audit-time hash verification against `reportHash` is therefore exact.
+
+Agent-written observability data is signed by the agent wallet when `CONTENT_REQUIRE_AGENT_SIGNATURES=true` (the production default). `POST /reports`, `POST /audits`, and `PUT /agent-status` reject unsigned or mismatched writes so another HTTP caller cannot impersonate a reviewer in the status/reason API.
 
 For requester UX, the content-service also exposes a relayed USDAIO flow:
 
@@ -410,14 +429,16 @@ The agent code is split along the boundaries described in `REVIEWER_AGENT_INTERF
 - `chain/` — owns provider, signer, contract handles, VRF inputs, sortition pre-checks, and event indexing.
 - `runtime/` — owns canonical artifact construction, seed generation, encrypted state persistence, and the dispatch from chain events into review/audit flows.
 
-State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a per-agent directory. Seeds are encrypted at rest with ChaCha20-Poly1305 keyed on `AGENT_STATE_KEY`. The orchestrator generates one such key per E2E run and passes it into each agent.
+State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a per-agent directory. Seeds are encrypted at rest with ChaCha20-Poly1305 keyed on the container-local `AGENT_STATE_KEY`. Production Docker Compose loads that key from the corresponding `.env.agent_N` file; the E2E orchestrator generates ephemeral state keys for its child processes.
+
+`AGENT_PRIVATE_KEY`, `AGENT_VRF_PRIVATE_KEY`, and `AGENT_STATE_KEY` are all 32-byte secret values, but they protect different domains: transaction authority, sortition proofs, and local commit-reveal seed encryption. A single value may satisfy the parser in a disposable test, but production deployments should use distinct values per agent and per purpose. The content-service relayer, when enabled, adds one more hot-wallet secret: `CONTENT_RELAYER_PRIVATE_KEY`.
 
 ## Known Limitations
 
 - The Sepolia fork E2E mutates fork-local state to register local test reviewers and set a deterministic Fast-tier E2E config. It does not send transactions to Sepolia and does not replace deployed contract code.
-- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review/audit sortition.
+- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review sortition, while audit sortition is ultimately enforced at runtime.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
-- `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested.
+- `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested. In rare low-token responses the model can emit `reasoning_content` without final JSON `content`; use the documented token budget and `reasoning_effort=low`.
 
 ## References
 

@@ -9,6 +9,7 @@ import { chat, extractJson } from "../llm/client.js";
 import { parseAudit } from "../llm/validate.js";
 import type { AuditArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
+import { agentArtifactMessage } from "../../shared/agent-signing.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
 import type { VrfProofProvider } from "../chain/vrfProof.js";
@@ -177,8 +178,9 @@ export async function runAudit(
     },
     metadata: { model: parsed.metadata?.model, createdAt: new Date().toISOString() },
   };
-  const stored = await content.putAudit(artifact);
   const auditHash = canonicalHash(artifact);
+  const artifactSignature = await wallet.signMessage(agentArtifactMessage("audit", auditHash));
+  const stored = await content.putAudit(artifact, artifactSignature);
   if (stored.hash !== auditHash) {
     throw new Error(`audit hash mismatch between client (${auditHash}) and server (${stored.hash})`);
   }

@@ -385,6 +385,14 @@ Response:
 
 Important: hidden model chain-of-thought is intentionally not exposed. Use the structured rationales and final artifacts.
 
+When `CONTENT_REQUIRE_AGENT_SIGNATURES=true`, status and reason data is written
+only by requests signed with the reviewer/auditor wallet. The content API still
+serves these as off-chain observability records. Frontends that need settlement
+truth should cross-check contract views/events for finalized scores and rewards.
+The current `content://...` URI scheme is resolved through the configured content
+API, so deployments that use multiple content services need a mirroring/gateway
+strategy or a globally resolvable URI scheme.
+
 ### Artifact Storage Endpoints
 
 These are mostly agent/internal, but they can be useful for debugging or explorer pages.
@@ -393,11 +401,11 @@ These are mostly agent/internal, but they can be useful for debugging or explore
 | --- | --- | --- |
 | `POST` | `/proposals` | Store a proposal by `{ id, text, mimeType }`; returns `content://proposals/<id>` and hash. |
 | `GET` | `/proposals/:id` | Read a stored proposal. |
-| `POST` | `/reports` | Store canonical review artifact; returns `content://reports/0x<hash>`. |
+| `POST` | `/reports` | Agent-only. Store canonical review artifact; with signature enforcement, body is `{ artifact, signature }`. |
 | `GET` | `/reports/:hash` | Read a stored review artifact. |
-| `POST` | `/audits` | Store canonical audit artifact; returns `content://audits/0x<hash>`. |
+| `POST` | `/audits` | Agent-only. Store canonical audit artifact; with signature enforcement, body is `{ artifact, signature }`. |
 | `GET` | `/audits/:hash` | Read a stored audit artifact. |
-| `PUT` | `/agent-status` | Agent-only status writer. Frontends should normally read status endpoints instead. |
+| `PUT` | `/agent-status` | Agent-only status writer; with signature enforcement, body includes `signature`. Frontends should normally read status endpoints instead. |
 
 ## Contract Views
 

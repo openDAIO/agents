@@ -130,6 +130,11 @@ Required for full API serving, including the relayer:
 RPC_URL=<primary-sepolia-rpc-url>
 RPC_URLS=<primary-sepolia-rpc-url>,<backup-sepolia-rpc-url>
 RPC_FAILOVER_QUORUM=1
+RPC_BATCH_MAX_COUNT=1
+RPC_READ_RETRIES=3
+RPC_READ_RETRY_BASE_MS=500
+RPC_TX_WAIT_RETRIES=5
+RPC_TX_WAIT_RETRY_BASE_MS=1000
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
 CONTENT_SERVICE_BIND=127.0.0.1
@@ -142,6 +147,28 @@ MARKITDOWN_BIND=127.0.0.1
 MARKITDOWN_PORT=18003
 MARKITDOWN_MAX_UPLOAD_BYTES=52428800
 MARKITDOWN_ENABLE_PLUGINS=false
+
+CORS_ALLOW_ORIGIN=*
+CORS_ALLOW_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS
+CORS_ALLOW_HEADERS=Content-Type,Authorization,X-Requested-With,X-Filename
+CORS_EXPOSE_HEADERS=Content-Length,Content-Type
+CORS_MAX_AGE=86400
+CORS_ALLOW_CREDENTIALS=false
+
+DAIO_DOCUMENT_WAIT_MS=300000
+DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
+DAIO_DOCUMENT_RETRY_MAX_MS=10000
+DAIO_DOCUMENT_RECHECK_MS=10000
+DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
+DAIO_EVENT_LOOKBACK_BLOCKS=7200
+DAIO_EVENT_REORG_DEPTH_BLOCKS=12
+DAIO_KEEPER_RECONCILE_INTERVAL_MS=10000
+DAIO_KEEPER_SYNC_ACTIVE_REQUESTS=true
+DAIO_KEEPER_SYNC_MAX_PER_TICK=8
+DAIO_KEEPER_PRIVATE_KEY=<dedicated-keeper-gas-private-key>
+DAIO_START_NEXT_REQUEST_GAS_FLOOR=300000
+DAIO_SYNC_REQUEST_GAS_FLOOR=2000000
 ```
 
 `CONTENT_RELAYER_PRIVATE_KEY` is required if `/requests/relayed-document` should
@@ -175,6 +202,11 @@ Required fields per agent:
 ```sh
 RPC_URL=<primary-sepolia-rpc-url>
 RPC_URLS=<primary-sepolia-rpc-url>,<backup-sepolia-rpc-url>
+RPC_BATCH_MAX_COUNT=1
+RPC_READ_RETRIES=3
+RPC_READ_RETRY_BASE_MS=500
+RPC_TX_WAIT_RETRIES=5
+RPC_TX_WAIT_RETRY_BASE_MS=1000
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
 LLM_BASE_URL=<openai-compatible-llm-base-url>
@@ -190,11 +222,28 @@ AGENT_STATE_KEY=<32-byte-hex-local-state-key>
 AGENT_ID=<registered-agent-id>
 AGENT_ENS_NAME=<registered-agent-ens-name>
 AGENT_AUTO_REGISTER=false
+DAIO_REGISTER_ENS=false
+DAIO_AGENT_TARGET_STAKE_USDAIO=6000
 
 DAIO_AUTO_START_REQUESTS=true
+DAIO_KEEPER_ENABLED=false
+DAIO_KEEPER_PRIVATE_KEY=
+DAIO_KEEPER_RECONCILE_INTERVAL_MS=10000
+DAIO_KEEPER_SYNC_ACTIVE_REQUESTS=true
+DAIO_KEEPER_SYNC_MAX_PER_TICK=8
+DAIO_START_NEXT_REQUEST_GAS_FLOOR=300000
+DAIO_SYNC_REQUEST_GAS_FLOOR=2000000
 DAIO_START_REQUESTS_MAX_PER_TICK=2
 DAIO_START_REQUESTS_MIN_INTERVAL_MS=1000
 DAIO_START_REQUESTS_JITTER_MS=250
+DAIO_DOCUMENT_WAIT_MS=300000
+DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
+DAIO_DOCUMENT_RETRY_MAX_MS=10000
+DAIO_DOCUMENT_RECHECK_MS=10000
+DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
+DAIO_EVENT_LOOKBACK_BLOCKS=7200
+DAIO_EVENT_REORG_DEPTH_BLOCKS=12
 DAIO_ALLOW_FIXTURE_VRF=false
 
 DAIO_REVIEW_COMMIT_GAS_FLOOR=7000000
@@ -209,6 +258,22 @@ Generate a state key with:
 openssl rand -hex 32
 ```
 
+When using the bundled Docker Compose file, only `agent-1` is keeper-enabled by
+default. The other agents still process review/audit phases but do not send
+`startNextRequest` transactions. Override `DAIO_KEEPER_ENABLED_AGENT_N` in
+`.env` if ownership should move. Set `DAIO_KEEPER_PRIVATE_KEY` in `.env` for a
+single shared dedicated keeper gas wallet, or in only the keeper-enabled
+`.env.agent_N` for a per-agent keeper key. Review and audit commit-reveal
+transactions still use `AGENT_PRIVATE_KEY`, because reviewer identity is tied to
+`msg.sender`.
+
+The keeper also syncs active requests. It first uses
+`syncRequest.staticCall(requestId)` and sends a real transaction only when the
+contract would advance the request, so a document-missing request can release
+its active slot once the protocol timeout has elapsed. Keeper transaction gas
+floors are intentionally higher than typical estimates to avoid out-of-gas
+reverts when queue/sync state changes between estimate and mining.
+
 Before serving, each agent wallet must:
 
 - hold Sepolia ETH
@@ -221,6 +286,9 @@ Before serving, each agent wallet must:
 If `AGENT_AUTO_REGISTER=true`, the agent tries to register itself at boot.
 For already-registered production wallets, keep it `false`; the agent will
 verify the registered VRF key and refuse to start if it does not match.
+The agent registration helper does not use an identityless stake top-up
+fallback, so failed ENS/ERC-8004 verification will leave existing on-chain
+identity fields untouched instead of clearing them.
 
 ## 6. Start The Stack
 
@@ -281,8 +349,10 @@ and keep agent-only write endpoints signed with
 | `GET` | `/health` | service health |
 | `POST` | `/request-intents/usdaio` | build an EIP-712 USDAIO request intent for a requester to sign |
 | `POST` | `/requests/relayed-document` | relay a signed request transaction, verify it on Sepolia, and store the document |
+| `POST` | `/requests/document-from-tx` | recover document storage from a successful payment tx hash |
 | `POST` | `/requests/:requestId/document` | verify a requester-created on-chain transaction and store the document |
 | `GET` | `/requests/:requestId/document` | read the stored request document and verified on-chain metadata |
+| `GET` | `/requests/:requestId/chain-status` | read current on-chain lifecycle directly from Sepolia |
 | `GET` | `/requests/:requestId/markdown` | read the canonical converted Markdown for third-party reviewers |
 | `POST` | `/proposals` | store proposal text directly |
 | `GET` | `/proposals/:id` | read proposal text |

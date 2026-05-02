@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { buildServer } from "./server.js";
+import { installRpcProcessGuards } from "../shared/rpc.js";
 
 const port = Number(process.env.CONTENT_SERVICE_PORT ?? 18002);
 const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
@@ -12,6 +13,8 @@ const relayerConfirmations = Number(process.env.CONTENT_RELAYER_CONFIRMATIONS ??
 const requireAgentSignatures = !["0", "false", "no", "off"].includes(
   (process.env.CONTENT_REQUIRE_AGENT_SIGNATURES ?? "true").trim().toLowerCase(),
 );
+
+installRpcProcessGuards("content-service");
 
 const { app, db } = buildServer({
   dbPath,

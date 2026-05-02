@@ -46,6 +46,20 @@ export interface RequestDocumentRecord extends VerifiedDocumentRecord {
   updatedAt: number;
 }
 
+export interface ChainStatusRecord {
+  requestId: string;
+  requester: string;
+  status: number;
+  statusName: string;
+  feePaid: string;
+  priorityFee: string;
+  retryCount: string;
+  committeeEpoch: string;
+  auditEpoch: string;
+  activePriority: string;
+  lowConfidence: boolean;
+}
+
 export interface AgentStatusRecord {
   requestId: string;
   agent: string;
@@ -116,6 +130,25 @@ export interface RelayedDocumentRecord {
     blockNumber: number;
   };
   document: RequestDocumentRecord;
+}
+
+export class ContentServiceError extends Error {
+  constructor(
+    public readonly operation: string,
+    public readonly status: number,
+    public readonly responseBody: string,
+  ) {
+    super(`${operation}: ${status} ${responseBody}`);
+    this.name = "ContentServiceError";
+  }
+}
+
+export function isContentServiceNotFound(err: unknown, operation?: string): boolean {
+  return (
+    err instanceof ContentServiceError &&
+    err.status === 404 &&
+    (operation === undefined || err.operation === operation)
+  );
 }
 
 export class ContentServiceClient {
@@ -203,6 +236,22 @@ export class ContentServiceClient {
     return (await res.json()) as VerifiedDocumentRecord;
   }
 
+  async recoverRequestDocumentFromTx(input: {
+    txHash: string;
+    id?: string;
+    requester?: string;
+    text: string;
+    mimeType?: string;
+  }): Promise<VerifiedDocumentRecord> {
+    const res = await fetch(this.url("/requests/document-from-tx"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(`recoverRequestDocumentFromTx: ${res.status} ${await res.text()}`);
+    return (await res.json()) as VerifiedDocumentRecord;
+  }
+
   async getProposal(id: string): Promise<ProposalRecord> {
     const res = await fetch(this.url(`/proposals/${encodeURIComponent(id)}`));
     if (!res.ok) throw new Error(`getProposal(${id}): ${res.status}`);
@@ -217,8 +266,14 @@ export class ContentServiceClient {
 
   async getRequestDocument(requestId: string | bigint | number): Promise<RequestDocumentRecord> {
     const res = await fetch(this.url(`/requests/${requestId.toString()}/document`));
-    if (!res.ok) throw new Error(`getRequestDocument: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new ContentServiceError("getRequestDocument", res.status, await res.text());
     return (await res.json()) as RequestDocumentRecord;
+  }
+
+  async getChainStatus(requestId: string | bigint | number): Promise<ChainStatusRecord> {
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/chain-status`));
+    if (!res.ok) throw new ContentServiceError("getChainStatus", res.status, await res.text());
+    return (await res.json()) as ChainStatusRecord;
   }
 
   async putReport(artifact: ReviewArtifact, signature?: string): Promise<ReportRecord> {

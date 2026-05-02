@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { Contract, EventLog, Provider } from "ethers";
 import { RequestStatus } from "../../shared/types.js";
+import { rpcFailoverOptionsFromEnv, withRpcReadRetries, type RpcFailoverOptions } from "../../shared/rpc.js";
 
 export interface PhaseChange {
   requestId: bigint;
@@ -27,23 +28,55 @@ export interface FinalizedEvent {
   lowConfidence: boolean;
 }
 
+export interface EventCursorStore {
+  load: () => { lastBlock: number } | undefined;
+  save: (cursor: { lastBlock: number; updatedAt: number }) => void;
+}
+
+export interface CoreEventStreamOptions {
+  cursorStore?: EventCursorStore;
+  lookbackBlocks?: number;
+  reorgDepthBlocks?: number;
+  maxSeenLogs?: number;
+  retryOptions?: RpcFailoverOptions;
+}
+
+function positiveInteger(value: number | undefined, fallback: number, min = 0): number {
+  if (value === undefined || !Number.isFinite(value) || value < min) return fallback;
+  return Math.floor(value);
+}
+
 export class CoreEventStream extends EventEmitter {
   private readonly provider: Provider;
   private readonly core: Contract;
+  private readonly options: CoreEventStreamOptions;
   private polling = false;
   private lastBlock = 0;
   private pollHandle: NodeJS.Timeout | null = null;
   private readonly phases: Map<string, PhaseChange[]> = new Map();
   private readonly reveals: Map<string, ReviewReveal[]> = new Map();
+  private readonly seenLogIds = new Set<string>();
+  private readonly seenLogOrder: string[] = [];
 
-  constructor(provider: Provider, core: Contract) {
+  constructor(provider: Provider, core: Contract, options: CoreEventStreamOptions = {}) {
     super();
     this.provider = provider;
     this.core = core;
+    this.options = options;
   }
 
   async start(fromBlock?: number, intervalMs = 500): Promise<void> {
-    this.lastBlock = fromBlock ?? (await this.provider.getBlockNumber());
+    const head = await this.rpcRead(() => this.provider.getBlockNumber());
+    if (fromBlock !== undefined) {
+      this.lastBlock = Math.max(0, Math.floor(fromBlock));
+    } else {
+      const lookback = positiveInteger(this.options.lookbackBlocks, 0);
+      const reorgDepth = positiveInteger(this.options.reorgDepthBlocks, 0);
+      const cursorBlock = this.options.cursorStore?.load()?.lastBlock;
+      const lookbackBlock = Math.max(0, head - lookback);
+      const baseline = cursorBlock === undefined ? lookbackBlock : Math.min(cursorBlock, lookbackBlock);
+      this.lastBlock = Math.max(0, Math.min(head, baseline) - reorgDepth);
+    }
     this.polling = true;
     const tick = async () => {
       if (!this.polling) return;
@@ -66,17 +99,19 @@ export class CoreEventStream extends EventEmitter {
   }
 
   private async poll(): Promise<void> {
-    const head = await this.provider.getBlockNumber();
+    const head = await this.rpcRead(() => this.provider.getBlockNumber());
     if (head <= this.lastBlock) return;
     const from = this.lastBlock + 1;
     const to = head;
     // ethers v6 filters are dynamic ABI accessors; cast through unknown for typing.
     const f = (this.core as unknown as { filters: Record<string, () => unknown> }).filters;
-    const [statusLogs, revealLogs, finalLogs] = await Promise.all([
-      this.core.queryFilter(f.StatusChanged!() as never, from, to),
-      this.core.queryFilter(f.ReviewRevealed!() as never, from, to),
-      this.core.queryFilter(f.RequestFinalized!() as never, from, to),
-    ]);
+    const [statusLogs, revealLogs, finalLogs] = await this.rpcRead(() =>
+      Promise.all([
+        this.core.queryFilter(f.StatusChanged!() as never, from, to),
+        this.core.queryFilter(f.ReviewRevealed!() as never, from, to),
+        this.core.queryFilter(f.RequestFinalized!() as never, from, to),
+      ]),
+    );
 
     // Merge and process in chronological order so that, e.g., a ReviewRevealed
     // landing in the same block as a StatusChanged(AuditCommit) is recorded
@@ -93,6 +128,7 @@ export class CoreEventStream extends EventEmitter {
     all.sort((a, b) => a.log.blockNumber - b.log.blockNumber || a.log.index - b.log.index);
 
     for (const entry of all) {
+      if (!this.rememberLog(entry.log)) continue;
       if (entry.kind === "status") {
         const evt = entry.log;
         const requestId = evt.args[0] as bigint;
@@ -139,6 +175,24 @@ export class CoreEventStream extends EventEmitter {
       }
     }
     this.lastBlock = to;
+    this.options.cursorStore?.save({ lastBlock: to, updatedAt: Math.floor(Date.now() / 1000) });
+  }
+
+  private rpcRead<T>(task: () => Promise<T>): Promise<T> {
+    return withRpcReadRetries(task, this.options.retryOptions ?? rpcFailoverOptionsFromEnv());
+  }
+
+  private rememberLog(log: EventLog): boolean {
+    const id = `${log.transactionHash}:${log.index}`;
+    if (this.seenLogIds.has(id)) return false;
+    this.seenLogIds.add(id);
+    this.seenLogOrder.push(id);
+    const maxSeen = positiveInteger(this.options.maxSeenLogs, 10_000, 1);
+    while (this.seenLogOrder.length > maxSeen) {
+      const removed = this.seenLogOrder.shift();
+      if (removed) this.seenLogIds.delete(removed);
+    }
+    return true;
   }
 
   phaseStartBlock(requestId: bigint, status: RequestStatus): number | undefined {

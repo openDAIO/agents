@@ -48,6 +48,14 @@ optional_env() {
   env_value "$file" "$key"
 }
 
+unique_rpc_count() {
+  local file="$1"
+  {
+    optional_env "$file" "RPC_URL"
+    optional_env "$file" "RPC_URLS" | tr ',' '\n' | tr '[:space:]' '\n'
+  } | sed '/^[[:space:]]*$/d' | sort -u | wc -l | tr -d ' '
+}
+
 is_hex32() {
   [[ "$1" =~ ^(0x)?[0-9a-fA-F]{64}$ ]]
 }
@@ -99,6 +107,12 @@ require_bool_env "$ENV_FILE" "CONTENT_REQUIRE_AGENT_SIGNATURES" "true"
 if [ -z "$(optional_env "$ENV_FILE" "RPC_URLS")" ]; then
   warn "$ENV_FILE RPC_URLS is empty; use at least two Sepolia RPC endpoints for production"
 fi
+if [ "$(unique_rpc_count "$ENV_FILE")" -lt 2 ]; then
+  warn "$ENV_FILE should include at least two unique RPC endpoints across RPC_URL/RPC_URLS"
+fi
+if [ "$(optional_env "$ENV_FILE" "RPC_BATCH_MAX_COUNT")" != "1" ]; then
+  warn "$ENV_FILE RPC_BATCH_MAX_COUNT=1 is recommended for public/free RPC providers"
+fi
 
 if [ "${REQUIRE_CONTENT_RELAYER:-true}" = "true" ]; then
   require_hex32 "$ENV_FILE" "CONTENT_RELAYER_PRIVATE_KEY"
@@ -106,6 +120,11 @@ else
   if [ -z "$(optional_env "$ENV_FILE" "CONTENT_RELAYER_PRIVATE_KEY")" ]; then
     warn "CONTENT_RELAYER_PRIVATE_KEY is empty; relayed request API will not send transactions"
   fi
+fi
+
+global_keeper_key="$(optional_env "$ENV_FILE" "DAIO_KEEPER_PRIVATE_KEY")"
+if [ -n "$global_keeper_key" ] && ! is_hex32 "$global_keeper_key"; then
+  die "$ENV_FILE DAIO_KEEPER_PRIVATE_KEY must be a 32-byte hex value"
 fi
 
 case "$(optional_env "$ENV_FILE" "CONTENT_SERVICE_BIND")" in
@@ -118,6 +137,7 @@ case "$(optional_env "$ENV_FILE" "MARKITDOWN_BIND")" in
   "") warn "$ENV_FILE MARKITDOWN_BIND is empty; docker compose will bind MarkItDown to 127.0.0.1" ;;
 esac
 
+keeper_count=0
 for i in 1 2 3 4 5; do
   file="${AGENT_ENV_PREFIX}${i}"
   require_file "$file"
@@ -129,22 +149,80 @@ for i in 1 2 3 4 5; do
   require_hex32 "$file" "AGENT_STATE_KEY"
   require_bool_env "$file" "DAIO_AUTO_START_REQUESTS" "true"
   require_bool_env "$file" "DAIO_ALLOW_FIXTURE_VRF" "false"
+  tx_key="$(optional_env "$file" "AGENT_PRIVATE_KEY")"
+  vrf_key="$(optional_env "$file" "AGENT_VRF_PRIVATE_KEY")"
+  state_key="$(optional_env "$file" "AGENT_STATE_KEY")"
+  keeper_key="$(optional_env "$file" "DAIO_KEEPER_PRIVATE_KEY")"
+  if [ -n "$keeper_key" ] && ! is_hex32 "$keeper_key"; then
+    die "$file DAIO_KEEPER_PRIVATE_KEY must be a 32-byte hex value"
+  fi
+  if [ "$(unique_rpc_count "$file")" -lt 2 ]; then
+    warn "$file should include at least two unique RPC endpoints across RPC_URL/RPC_URLS"
+  fi
+  if [ "$(optional_env "$file" "RPC_BATCH_MAX_COUNT")" != "1" ]; then
+    warn "$file RPC_BATCH_MAX_COUNT=1 is recommended for public/free RPC providers"
+  fi
+  document_recheck_ms="$(optional_env "$file" "DAIO_DOCUMENT_RECHECK_MS")"
+  if [ -n "$document_recheck_ms" ] && ! [[ "$document_recheck_ms" =~ ^[0-9]+$ ]]; then
+    die "$file DAIO_DOCUMENT_RECHECK_MS must be an integer millisecond value"
+  fi
+  document_deadline_buffer_ms="$(optional_env "$file" "DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS")"
+  if [ -n "$document_deadline_buffer_ms" ] && ! [[ "$document_deadline_buffer_ms" =~ ^[0-9]+$ ]]; then
+    die "$file DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS must be an integer millisecond value"
+  fi
+  fallback_phase_timeout_ms="$(optional_env "$file" "DAIO_FALLBACK_PHASE_TIMEOUT_MS")"
+  if [ -n "$fallback_phase_timeout_ms" ] && ! [[ "$fallback_phase_timeout_ms" =~ ^[0-9]+$ ]]; then
+    die "$file DAIO_FALLBACK_PHASE_TIMEOUT_MS must be an integer millisecond value"
+  fi
 
+  keeper_enabled="$(optional_env "$file" "DAIO_KEEPER_ENABLED")"
+  if [ -n "$keeper_enabled" ]; then
+    is_bool "$keeper_enabled" || die "$file DAIO_KEEPER_ENABLED must be boolean-like"
+    if [[ "$keeper_enabled" =~ ^(true|1|yes|on)$ ]]; then
+      keeper_count=$((keeper_count + 1))
+      effective_keeper_key="$keeper_key"
+      if [ -z "$effective_keeper_key" ]; then
+        effective_keeper_key="$global_keeper_key"
+      fi
+      if [ -z "$effective_keeper_key" ]; then
+        warn "$file enables keeper without DAIO_KEEPER_PRIVATE_KEY; keeper txs will use AGENT_PRIVATE_KEY"
+      elif [ "$effective_keeper_key" = "$tx_key" ]; then
+        warn "$file keeper key equals AGENT_PRIVATE_KEY; use a dedicated funded keeper key for production"
+      fi
+    fi
+  fi
+  keeper_sync="$(optional_env "$file" "DAIO_KEEPER_SYNC_ACTIVE_REQUESTS")"
+  if [ -n "$keeper_sync" ]; then
+    is_bool "$keeper_sync" || die "$file DAIO_KEEPER_SYNC_ACTIVE_REQUESTS must be boolean-like"
+  fi
   auto_register="$(optional_env "$file" "AGENT_AUTO_REGISTER")"
   if [ -n "$auto_register" ]; then
     is_bool "$auto_register" || die "$file AGENT_AUTO_REGISTER must be boolean-like"
   fi
+  register_ens="$(optional_env "$file" "DAIO_REGISTER_ENS")"
+  if [ -n "$register_ens" ]; then
+    is_bool "$register_ens" || die "$file DAIO_REGISTER_ENS must be boolean-like"
+  fi
+  target_stake="$(optional_env "$file" "DAIO_AGENT_TARGET_STAKE_USDAIO")"
+  if [ -n "$target_stake" ] && ! [[ "$target_stake" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    die "$file DAIO_AGENT_TARGET_STAKE_USDAIO must be a decimal token amount"
+  fi
   if [[ "$auto_register" =~ ^(true|1|yes|on)$ ]]; then
     require_env "$file" "AGENT_ID"
-    require_env "$file" "AGENT_ENS_NAME"
+    if [[ "$register_ens" =~ ^(true|1|yes|on)$ ]]; then
+      require_env "$file" "AGENT_ENS_NAME"
+    fi
   fi
 
-  tx_key="$(optional_env "$file" "AGENT_PRIVATE_KEY")"
-  vrf_key="$(optional_env "$file" "AGENT_VRF_PRIVATE_KEY")"
-  state_key="$(optional_env "$file" "AGENT_STATE_KEY")"
   if [ "$tx_key" = "$vrf_key" ] || [ "$tx_key" = "$state_key" ] || [ "$vrf_key" = "$state_key" ]; then
     warn "$file reuses a transaction, VRF, or state key; use distinct secrets for production"
   fi
 done
+
+if [ "$keeper_count" -eq 0 ]; then
+  warn "no .env.agent_N has DAIO_KEEPER_ENABLED=true; docker-compose defaults agent-1 to keeper, but non-compose runs need one keeper"
+elif [ "$keeper_count" -gt 1 ]; then
+  warn "$keeper_count agent env files enable keeper; prefer one keeper to reduce redundant startNextRequest attempts"
+fi
 
 info "Sepolia serving env files look complete"

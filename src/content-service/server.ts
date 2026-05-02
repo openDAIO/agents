@@ -10,7 +10,13 @@ import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { RequestStatus, Tier } from "../shared/types.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
-import { makeRpcProvider, parseRpcUrls, rpcFailoverOptionsFromEnv } from "../shared/rpc.js";
+import {
+  makeRpcProvider,
+  parseRpcUrls,
+  rpcFailoverOptionsFromEnv,
+  waitForTransactionWithRetries,
+  withRpcReadRetries,
+} from "../shared/rpc.js";
 
 export interface ServerOptions {
   dbPath: string;
@@ -25,6 +31,83 @@ export interface ServerOptions {
     confirmations?: number;
   };
   requireAgentSignatures?: boolean;
+}
+
+interface CorsConfig {
+  allowOrigin: string;
+  allowMethods: string;
+  allowHeaders: string;
+  exposeHeaders: string;
+  maxAge: string;
+  allowCredentials: boolean;
+}
+
+function envSetting(names: readonly string[], fallback: string): string {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value.trim() !== "") return value.trim();
+  }
+  return fallback;
+}
+
+function boolEnv(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined || value.trim() === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function corsConfigFromEnv(): CorsConfig {
+  return {
+    allowOrigin: envSetting(["CONTENT_CORS_ALLOW_ORIGIN", "CORS_ALLOW_ORIGIN"], "*"),
+    allowMethods: envSetting(
+      ["CONTENT_CORS_ALLOW_METHODS", "CORS_ALLOW_METHODS"],
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    ),
+    allowHeaders: envSetting(
+      ["CONTENT_CORS_ALLOW_HEADERS", "CORS_ALLOW_HEADERS"],
+      "Content-Type,Authorization,X-Requested-With,X-Filename",
+    ),
+    exposeHeaders: envSetting(["CONTENT_CORS_EXPOSE_HEADERS", "CORS_EXPOSE_HEADERS"], "Content-Length,Content-Type"),
+    maxAge: envSetting(["CONTENT_CORS_MAX_AGE", "CORS_MAX_AGE"], "86400"),
+    allowCredentials: boolEnv("CONTENT_CORS_ALLOW_CREDENTIALS", boolEnv("CORS_ALLOW_CREDENTIALS", false)),
+  };
+}
+
+function resolveAllowedOrigin(config: CorsConfig, requestOrigin: string | undefined): string | undefined {
+  const entries = config.allowOrigin
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  if (entries.includes("*")) {
+    return config.allowCredentials ? requestOrigin : "*";
+  }
+  if (requestOrigin && entries.includes(requestOrigin)) return requestOrigin;
+  return undefined;
+}
+
+function installCors(app: FastifyInstance, config: CorsConfig): void {
+  app.addHook("onRequest", async (req, reply) => {
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    const allowedOrigin = resolveAllowedOrigin(config, origin);
+    if (allowedOrigin) {
+      reply.header("Access-Control-Allow-Origin", allowedOrigin);
+      if (allowedOrigin !== "*") reply.header("Vary", "Origin");
+    }
+    reply.header("Access-Control-Allow-Methods", config.allowMethods);
+    reply.header(
+      "Access-Control-Allow-Headers",
+      typeof req.headers["access-control-request-headers"] === "string"
+        ? req.headers["access-control-request-headers"]
+        : config.allowHeaders,
+    );
+    reply.header("Access-Control-Expose-Headers", config.exposeHeaders);
+    reply.header("Access-Control-Max-Age", config.maxAge);
+    if (config.allowCredentials) reply.header("Access-Control-Allow-Credentials", "true");
+
+    if (req.method === "OPTIONS") {
+      reply.code(204).send();
+    }
+  });
 }
 
 const HexAddress = z.string().regex(/^0x[a-fA-F0-9]{40}$/);
@@ -312,11 +395,11 @@ async function verifyRequestTransaction(input: {
   const provider = makeRpcProvider(rpcUrls, rpcFailoverOptionsFromEnv());
   const paymentRouterAddress = getAddress(deployment.contracts.paymentRouter);
   const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
-  const receipt = await provider.getTransactionReceipt(input.txHash);
+  const receipt = await withRpcReadRetries(() => provider.getTransactionReceipt(input.txHash));
   if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_or_pending" };
   if (receipt.status !== 1) return { ok: false as const, code: 400, error: "tx_failed" };
 
-  const tx = await provider.getTransaction(input.txHash);
+  const tx = await withRpcReadRetries(() => provider.getTransaction(input.txHash));
   if (!tx) return { ok: false as const, code: 404, error: "tx_not_found" };
   if (!tx.to || getAddress(tx.to) !== paymentRouterAddress) {
     return { ok: false as const, code: 400, error: "tx_not_sent_to_payment_router" };
@@ -399,7 +482,9 @@ async function verifyRequestTransaction(input: {
   }
 
   const handles = loadContracts(deployment, provider);
-  const lifecycle = await handles.core.getRequestLifecycle(BigInt(input.requestId));
+  const lifecycle = await withRpcReadRetries(
+    () => handles.core.getRequestLifecycle(BigInt(input.requestId)) as Promise<readonly unknown[]>,
+  );
   const lifecycleRequester = getAddress(String(lifecycle[0]));
   if (lifecycleRequester !== expectedRequester) {
     return { ok: false as const, code: 400, error: "request_lifecycle_requester_mismatch" };
@@ -415,7 +500,7 @@ async function verifyRequestTransaction(input: {
     rubricHash,
     domainMask: domainMask.toString(),
     tier,
-      tierName: Tier[tier] ?? `Tier${tier}`,
+    tierName: Tier[tier] ?? `Tier${tier}`,
     priorityFee: priorityFee.toString(),
     txHash: input.txHash,
     paymentFunction: parsedTx.name,
@@ -427,9 +512,58 @@ async function verifyRequestTransaction(input: {
   };
 }
 
+async function findRequestIdsFromPaymentTx(input: {
+  txHash: string;
+  requester?: string;
+  deploymentPath: string;
+  rpcUrl?: string;
+  rpcUrls?: string;
+}) {
+  const deployment = loadDeploymentSnapshot(input.deploymentPath);
+  const rpcUrls = parseRpcUrls(input.rpcUrl ?? deployment.rpcUrl, input.rpcUrls);
+  const provider = makeRpcProvider(rpcUrls, rpcFailoverOptionsFromEnv());
+  const paymentRouterAddress = getAddress(deployment.contracts.paymentRouter);
+  const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
+  const receipt = await withRpcReadRetries(() => provider.getTransactionReceipt(input.txHash));
+  if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_or_pending" };
+  if (receipt.status !== 1) return { ok: false as const, code: 400, error: "tx_failed" };
+
+  const requester = input.requester ? getAddress(input.requester) : undefined;
+  const requestIds = receipt.logs.flatMap((log) => {
+    if (getAddress(log.address) !== paymentRouterAddress) return [];
+    try {
+      const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+      if (parsed?.name !== "RequestPaid") return [];
+      if (requester && getAddress(String(parsed.args.requester)) !== requester) return [];
+      return [String(parsed.args.requestId)];
+    } catch (_err) {
+      return [];
+    }
+  });
+  return { ok: true as const, requestIds: [...new Set(requestIds)] };
+}
+
+function serializeRequestLifecycle(requestId: string, lifecycle: readonly unknown[]) {
+  const status = Number(lifecycle[1] as bigint | number);
+  return {
+    requestId,
+    requester: getAddress(String(lifecycle[0])),
+    status,
+    statusName: RequestStatus[status] ?? `Status${status}`,
+    feePaid: String(lifecycle[2]),
+    priorityFee: String(lifecycle[3]),
+    retryCount: String(lifecycle[4]),
+    committeeEpoch: String(lifecycle[5]),
+    auditEpoch: String(lifecycle[6]),
+    activePriority: String(lifecycle[7]),
+    lowConfidence: Boolean(lifecycle[8]),
+  };
+}
+
 export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: ContentDB } {
   const db = new ContentDB(opts.dbPath);
   const app = Fastify({ logger: opts.logger ?? false, bodyLimit: 25 * 1024 * 1024 });
+  installCors(app, corsConfigFromEnv());
   const deploymentPath = opts.chain?.deploymentPath ?? "./.deployments/local.json";
   const rpcUrl = opts.chain?.rpcUrl;
   const rpcUrls = opts.chain?.rpcUrls;
@@ -532,7 +666,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       signer.reset();
       tx = await send();
     }
-    const receipt = await tx.wait(opts.relayer?.confirmations ?? 1);
+    const receipt = await waitForTransactionWithRetries(tx, opts.relayer?.confirmations ?? 1);
     if (!receipt || receipt.status !== 1) throw new Error(`relayed request transaction failed: ${tx.hash}`);
 
     const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
@@ -560,6 +694,24 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   }
 
   app.get("/health", async () => ({ ok: true }));
+
+  app.get<{ Params: { requestId: string } }>("/requests/:requestId/chain-status", async (req, reply) => {
+    if (!/^\d+$/.test(req.params.requestId)) {
+      reply.code(400);
+      return { error: "invalid_request_id" };
+    }
+    try {
+      const deployment = loadDeploymentSnapshot(deploymentPath);
+      const handles = loadContracts(deployment, chainProvider());
+      const lifecycle = await withRpcReadRetries(() =>
+        handles.core.getRequestLifecycle(BigInt(req.params.requestId)),
+      );
+      return serializeRequestLifecycle(req.params.requestId, lifecycle as readonly unknown[]);
+    } catch (err) {
+      reply.code(503);
+      return { error: "chain_status_unavailable", detail: formatError(err) };
+    }
+  });
 
   app.post("/request-intents/usdaio", async (req, reply) => {
     const parsed = RequestIntentBody.safeParse(req.body);
@@ -787,6 +939,90 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       return { error: "not_found" };
     }
     return { uri: `content://audits/${row.hash}`, hash: row.hash, artifact: JSON.parse(row.json) };
+  });
+
+  app.post("/requests/document-from-tx", async (req, reply) => {
+    const parsed = SubmitDocumentBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400);
+      return { error: "invalid_document_submission", issues: parsed.error.issues };
+    }
+
+    const body = parsed.data;
+    const hash = keccak256(toUtf8Bytes(body.text));
+    let ids: Awaited<ReturnType<typeof findRequestIdsFromPaymentTx>>;
+    try {
+      ids = await findRequestIdsFromPaymentTx({
+        txHash: body.txHash,
+        requester: body.requester,
+        deploymentPath,
+        rpcUrl,
+        rpcUrls,
+      });
+    } catch (err) {
+      reply.code(503);
+      return { error: "payment_tx_lookup_unavailable", detail: (err as Error).message };
+    }
+    if (!ids.ok) {
+      reply.code(ids.code);
+      return ids;
+    }
+    if (ids.requestIds.length !== 1) {
+      reply.code(400);
+      return { error: "ambiguous_request_id", requestIds: ids.requestIds };
+    }
+
+    let verified: Awaited<ReturnType<typeof verifyRequestTransaction>>;
+    try {
+      verified = await verifyRequestTransaction({
+        requestId: ids.requestIds[0]!,
+        txHash: body.txHash,
+        requester: body.requester,
+        textHash: hash,
+        deploymentPath,
+        rpcUrl,
+        rpcUrls,
+      });
+    } catch (err) {
+      reply.code(503);
+      return { error: "chain_verification_unavailable", detail: (err as Error).message };
+    }
+    if (!verified.ok) {
+      reply.code(verified.code);
+      return verified;
+    }
+
+    const idFromUri = proposalIdFromUri(verified.proposalURI);
+    if (!idFromUri) {
+      reply.code(400);
+      return { error: "unsupported_proposal_uri", proposalURI: verified.proposalURI };
+    }
+    if (body.id && body.id !== idFromUri) {
+      reply.code(400);
+      return { error: "proposal_id_mismatch", expected: idFromUri, got: body.id };
+    }
+
+    const mimeType = body.mimeType ?? "text/markdown";
+    db.upsertProposal({ id: idFromUri, hash, mimeType, text: body.text });
+    db.upsertRequestDocument({
+      requestId: verified.requestId,
+      requester: verified.requester,
+      proposalUri: verified.proposalURI,
+      proposalHash: verified.proposalHash,
+      rubricHash: verified.rubricHash,
+      domainMask: verified.domainMask,
+      tier: verified.tier,
+      priorityFee: verified.priorityFee,
+      paymentTxHash: verified.txHash,
+      paymentFunction: verified.paymentFunction,
+      paymentToken: verified.paymentToken,
+      amountPaid: verified.amountPaid,
+      blockNumber: verified.blockNumber,
+      status: verified.status,
+      statusName: verified.statusName,
+      proposalId: idFromUri,
+    });
+    return serializeRequestDocument(db, verified.requestId)!;
   });
 
   app.post<{ Params: { requestId: string } }>("/requests/:requestId/document", async (req, reply) => {

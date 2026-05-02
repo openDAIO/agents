@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } from "ethers";
-import { ContentServiceClient } from "../../shared/content-client.js";
+import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
 import { AUDIT_SORTITION, RequestStatus, SCALE } from "../../shared/types.js";
@@ -13,6 +13,12 @@ import { agentArtifactMessage } from "../../shared/agent-signing.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
 import type { VrfProofProvider } from "../chain/vrfProof.js";
+import {
+  RequestDocumentUnavailableError,
+  RequestDocumentWaitAbortedError,
+  waitForRequestDocument,
+} from "./document.js";
+import { waitForTransactionWithRetries } from "../../shared/rpc.js";
 
 export interface AuditFlowDeps {
   handles: ContractHandles;
@@ -24,6 +30,13 @@ export interface AuditFlowDeps {
   vrf: VrfProofProvider;
   log: (msg: string) => void;
   txQueue: <T>(task: () => Promise<T>) => Promise<T>;
+  recordStatus?: (
+    requestId: bigint,
+    phase: string,
+    status: string,
+    detail?: string,
+    payload?: Record<string, unknown>,
+  ) => Promise<void>;
 }
 
 export async function runAudit(
@@ -32,11 +45,26 @@ export async function runAudit(
   finalityFactor: bigint,
   auditElectionDifficulty: bigint,
   auditTargetLimit: bigint,
+  documentWaitMs?: number,
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; auditHash?: string; auditURI?: string }> {
   const { handles, events, content, state, wallet, vrf, log } = deps;
 
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.AuditCommit);
   if (startBlock === undefined) return { committed: false, reason: "no audit phase start block" };
+
+  const existing = state.load(requestId.toString());
+  if (existing?.audit?.commitTx && existing.audit.accepted !== false) {
+    return {
+      committed: true,
+      reason: "already_committed",
+      commitTx: existing.audit.commitTx,
+      auditHash: existing.audit.auditHash,
+      auditURI: existing.audit.auditURI,
+    };
+  }
+  if (existing?.audit?.accepted === false) {
+    return { committed: false, reason: existing.audit.notAcceptedReason ?? "not accepted" };
+  }
 
   const revealedReviewers = events.revealedReviewersOrdered(requestId);
   const selfRevealed = revealedReviewers.find((r) => getAddress(r.reviewer) === getAddress(wallet.address));
@@ -47,7 +75,12 @@ export async function runAudit(
   if (candidateTargets.length === 0) return { committed: false, reason: "no candidate targets" };
 
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
+  const attempt = BigInt(lifecycle[4] as bigint | number);
   const auditEpoch = BigInt(lifecycle[6] as bigint | number);
+  const existingParticipants = (await handles.commitReveal.getAuditParticipants(requestId, attempt)) as readonly string[];
+  if (existingParticipants.some((addr) => getAddress(addr) === getAddress(wallet.address))) {
+    return { committed: false, reason: "already_committed_onchain" };
+  }
   const startBlockBigInt = BigInt(startBlock);
   const coreAddress = await handles.core.getAddress();
   const targetProofs = await Promise.all(
@@ -122,7 +155,36 @@ export async function runAudit(
     }),
   );
 
-  const document = await content.getRequestDocument(requestId);
+  let document: RequestDocumentRecord;
+  try {
+    document = await waitForRequestDocument(content, requestId, {
+      waitMs: documentWaitMs,
+      log,
+      onWaiting: (info) =>
+        deps.recordStatus?.(requestId, "AuditCommit", "waiting_document", "request document not registered yet", {
+          elapsedMs: info.elapsedMs,
+          nextRetryMs: info.nextRetryMs,
+          waitMs: documentWaitMs,
+        }) ?? Promise.resolve(),
+      shouldContinue: async () => {
+        try {
+          const lifecycle = await handles.core.getRequestLifecycle(requestId);
+          return Number(lifecycle[1] as bigint | number) === RequestStatus.AuditCommit;
+        } catch (err) {
+          log(`audit: document wait status check failed for request ${requestId}: ${(err as Error).message}`);
+          return true;
+        }
+      },
+    });
+  } catch (err) {
+    if (err instanceof RequestDocumentUnavailableError) {
+      return { committed: false, reason: "document_unavailable" };
+    }
+    if (err instanceof RequestDocumentWaitAbortedError) {
+      return { committed: false, reason: "document_wait_aborted" };
+    }
+    throw err;
+  }
   const proposal = document.proposal;
   const computedHash = keccak256(toUtf8Bytes(proposal.text));
   if (computedHash.toLowerCase() !== proposal.hash.toLowerCase()) {
@@ -237,13 +299,12 @@ export async function runAudit(
   );
   const receipt = await deps.txQueue(async () => {
     const tx = await cr.commitAudit(...commitArgs, { gasLimit });
-    return tx.wait();
+    return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
     throw new Error(`audit commit transaction failed: ${receipt?.hash ?? "unknown tx"}`);
   }
 
-  const attempt = BigInt((await handles.core.getRequestLifecycle(requestId))[4] as bigint | number);
   const participants = (await handles.commitReveal.getAuditParticipants(requestId, attempt)) as readonly string[];
   const accepted = participants.some((addr) => getAddress(addr) === getAddress(wallet.address));
 
@@ -277,7 +338,7 @@ export async function runAuditReveal(
   const gasLimit = await gasLimitWithHeadroom(cr.revealAudit, args, "DAIO_AUDIT_REVEAL_GAS_FLOOR", 8_000_000n);
   const receipt = await deps.txQueue(async () => {
     const tx = await cr.revealAudit(...args, { gasLimit });
-    return tx.wait();
+    return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
     throw new Error(`audit reveal transaction failed: ${receipt?.hash ?? "unknown tx"}`);

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } from "ethers";
-import { ContentServiceClient } from "../../shared/content-client.js";
+import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
 import { REVIEW_SORTITION, RequestStatus } from "../../shared/types.js";
@@ -14,6 +14,12 @@ import { agentArtifactMessage } from "../../shared/agent-signing.js";
 import type { StateStore } from "./state.js";
 import { gasLimitWithHeadroom } from "./gas.js";
 import type { VrfProofProvider } from "../chain/vrfProof.js";
+import {
+  RequestDocumentUnavailableError,
+  RequestDocumentWaitAbortedError,
+  waitForRequestDocument,
+} from "./document.js";
+import { waitForTransactionWithRetries } from "../../shared/rpc.js";
 
 export interface ReviewFlowDeps {
   handles: ContractHandles;
@@ -25,6 +31,13 @@ export interface ReviewFlowDeps {
   vrf: VrfProofProvider;
   log: (msg: string) => void;
   txQueue: <T>(task: () => Promise<T>) => Promise<T>;
+  recordStatus?: (
+    requestId: bigint,
+    phase: string,
+    status: string,
+    detail?: string,
+    payload?: Record<string, unknown>,
+  ) => Promise<void>;
 }
 
 export async function runReview(
@@ -32,6 +45,7 @@ export async function runReview(
   requestId: bigint,
   finalityFactor: bigint,
   reviewElectionDifficulty: bigint,
+  documentWaitMs?: number,
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; reportHash?: string; reportURI?: string }> {
   const { handles, events, content, state, wallet, vrf, log } = deps;
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.ReviewCommit);
@@ -39,7 +53,50 @@ export async function runReview(
     return { committed: false, reason: "no review phase start block" };
   }
 
-  const document = await content.getRequestDocument(requestId);
+  const existing = state.load(requestId.toString());
+  if (existing?.review?.commitTx && existing.review.accepted !== false) {
+    return {
+      committed: true,
+      reason: "already_committed",
+      commitTx: existing.review.commitTx,
+      reportHash: existing.review.reportHash,
+      reportURI: existing.review.reportURI,
+    };
+  }
+  if (existing?.review?.accepted === false) {
+    return { committed: false, reason: existing.review.notAcceptedReason ?? "not accepted" };
+  }
+
+  let document: RequestDocumentRecord;
+  try {
+    document = await waitForRequestDocument(content, requestId, {
+      waitMs: documentWaitMs,
+      log,
+      onWaiting: (info) =>
+        deps.recordStatus?.(requestId, "ReviewCommit", "waiting_document", "request document not registered yet", {
+          elapsedMs: info.elapsedMs,
+          nextRetryMs: info.nextRetryMs,
+          waitMs: documentWaitMs,
+        }) ?? Promise.resolve(),
+      shouldContinue: async () => {
+        try {
+          const lifecycle = await handles.core.getRequestLifecycle(requestId);
+          return Number(lifecycle[1] as bigint | number) === RequestStatus.ReviewCommit;
+        } catch (err) {
+          log(`review: document wait status check failed for request ${requestId}: ${(err as Error).message}`);
+          return true;
+        }
+      },
+    });
+  } catch (err) {
+    if (err instanceof RequestDocumentUnavailableError) {
+      return { committed: false, reason: "document_unavailable" };
+    }
+    if (err instanceof RequestDocumentWaitAbortedError) {
+      return { committed: false, reason: "document_wait_aborted" };
+    }
+    throw err;
+  }
   const domainMask = BigInt(document.verified.domainMask);
   const tierName = document.verified.tierName;
 
@@ -48,6 +105,11 @@ export async function runReview(
 
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
   const committeeEpoch = BigInt(lifecycle[5] as bigint | number);
+  const attempt = BigInt(lifecycle[4] as bigint | number);
+  const existingParticipants = (await handles.commitReveal.getReviewParticipants(requestId, attempt)) as readonly string[];
+  if (existingParticipants.some((addr) => getAddress(addr) === getAddress(wallet.address))) {
+    return { committed: false, reason: "already_committed_onchain" };
+  }
   const coreAddress = await handles.core.getAddress();
   const proof = await vrf.proofFor({
     coreAddress,
@@ -190,13 +252,12 @@ export async function runReview(
   );
   const receipt = await deps.txQueue(async () => {
     const tx = await cr.commitReview(...commitArgs, { gasLimit });
-    return tx.wait();
+    return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
     throw new Error(`review commit transaction failed: ${receipt?.hash ?? "unknown tx"}`);
   }
 
-  const attempt = BigInt((await handles.core.getRequestLifecycle(requestId))[4] as bigint | number);
   const participants = (await handles.commitReveal.getReviewParticipants(requestId, attempt)) as readonly string[];
   const accepted = participants.some((addr) => getAddress(addr) === getAddress(wallet.address));
 
@@ -246,7 +307,7 @@ export async function runReviewReveal(
       ...args,
       { gasLimit },
     );
-    return tx.wait();
+    return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
     throw new Error(`review reveal transaction failed: ${receipt?.hash ?? "unknown tx"}`);

@@ -18,6 +18,27 @@ x-agent-common: &agent-common
     - ./.deployments:/app/deployments:ro
     - ./.state:/app/state
 
+x-agent-runtime-env: &agent-runtime-env
+  RPC_BATCH_MAX_COUNT: ${RPC_BATCH_MAX_COUNT:-1}
+  RPC_READ_RETRIES: ${RPC_READ_RETRIES:-3}
+  RPC_READ_RETRY_BASE_MS: ${RPC_READ_RETRY_BASE_MS:-500}
+  RPC_TX_WAIT_RETRIES: ${RPC_TX_WAIT_RETRIES:-5}
+  RPC_TX_WAIT_RETRY_BASE_MS: ${RPC_TX_WAIT_RETRY_BASE_MS:-1000}
+  DAIO_DOCUMENT_WAIT_MS: ${DAIO_DOCUMENT_WAIT_MS:-300000}
+  DAIO_DOCUMENT_RETRY_INITIAL_MS: ${DAIO_DOCUMENT_RETRY_INITIAL_MS:-1000}
+  DAIO_DOCUMENT_RETRY_MAX_MS: ${DAIO_DOCUMENT_RETRY_MAX_MS:-10000}
+  DAIO_DOCUMENT_RECHECK_MS: ${DAIO_DOCUMENT_RECHECK_MS:-10000}
+  DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS: ${DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS:-180000}
+  DAIO_FALLBACK_PHASE_TIMEOUT_MS: ${DAIO_FALLBACK_PHASE_TIMEOUT_MS:-600000}
+  DAIO_EVENT_LOOKBACK_BLOCKS: ${DAIO_EVENT_LOOKBACK_BLOCKS:-7200}
+  DAIO_EVENT_REORG_DEPTH_BLOCKS: ${DAIO_EVENT_REORG_DEPTH_BLOCKS:-12}
+  DAIO_KEEPER_RECONCILE_INTERVAL_MS: ${DAIO_KEEPER_RECONCILE_INTERVAL_MS:-10000}
+  DAIO_KEEPER_SYNC_ACTIVE_REQUESTS: ${DAIO_KEEPER_SYNC_ACTIVE_REQUESTS:-true}
+  DAIO_KEEPER_SYNC_MAX_PER_TICK: ${DAIO_KEEPER_SYNC_MAX_PER_TICK:-8}
+  DAIO_GLOBAL_KEEPER_PRIVATE_KEY: ${DAIO_KEEPER_PRIVATE_KEY:-}
+  DAIO_START_NEXT_REQUEST_GAS_FLOOR: ${DAIO_START_NEXT_REQUEST_GAS_FLOOR:-300000}
+  DAIO_SYNC_REQUEST_GAS_FLOOR: ${DAIO_SYNC_REQUEST_GAS_FLOOR:-2000000}
+
 services:
   content-service:
     <<: *daio-app
@@ -37,6 +58,17 @@ services:
       RPC_FAILOVER_EVENT_QUORUM: ${RPC_FAILOVER_EVENT_QUORUM:-1}
       RPC_FAILOVER_EVENT_WORKERS: ${RPC_FAILOVER_EVENT_WORKERS:-2}
       RPC_FAILOVER_CACHE_TIMEOUT_MS: ${RPC_FAILOVER_CACHE_TIMEOUT_MS:-250}
+      RPC_BATCH_MAX_COUNT: ${RPC_BATCH_MAX_COUNT:-1}
+      RPC_READ_RETRIES: ${RPC_READ_RETRIES:-3}
+      RPC_READ_RETRY_BASE_MS: ${RPC_READ_RETRY_BASE_MS:-500}
+      RPC_TX_WAIT_RETRIES: ${RPC_TX_WAIT_RETRIES:-5}
+      RPC_TX_WAIT_RETRY_BASE_MS: ${RPC_TX_WAIT_RETRY_BASE_MS:-1000}
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:-*}
+      CORS_ALLOW_METHODS: ${CORS_ALLOW_METHODS:-GET,POST,PUT,PATCH,DELETE,OPTIONS}
+      CORS_ALLOW_HEADERS: ${CORS_ALLOW_HEADERS:-Content-Type,Authorization,X-Requested-With,X-Filename}
+      CORS_EXPOSE_HEADERS: ${CORS_EXPOSE_HEADERS:-Content-Length,Content-Type}
+      CORS_MAX_AGE: ${CORS_MAX_AGE:-86400}
+      CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
       CONTENT_RELAYER_PRIVATE_KEY: ${CONTENT_RELAYER_PRIVATE_KEY:-}
       CONTENT_RELAYER_CONFIRMATIONS: ${CONTENT_RELAYER_CONFIRMATIONS:-1}
       CONTENT_REQUIRE_AGENT_SIGNATURES: ${CONTENT_REQUIRE_AGENT_SIGNATURES:-true}
@@ -67,6 +99,12 @@ services:
       MARKITDOWN_PORT: "18003"
       MARKITDOWN_MAX_UPLOAD_BYTES: ${MARKITDOWN_MAX_UPLOAD_BYTES:-52428800}
       MARKITDOWN_ENABLE_PLUGINS: ${MARKITDOWN_ENABLE_PLUGINS:-false}
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:-*}
+      CORS_ALLOW_METHODS: ${CORS_ALLOW_METHODS:-GET,POST,OPTIONS}
+      CORS_ALLOW_HEADERS: ${CORS_ALLOW_HEADERS:-Content-Type,Authorization,X-Requested-With,X-Filename}
+      CORS_EXPOSE_HEADERS: ${CORS_EXPOSE_HEADERS:-Content-Length,Content-Type}
+      CORS_MAX_AGE: ${CORS_MAX_AGE:-86400}
+      CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
     ports:
       - "${MARKITDOWN_BIND:-127.0.0.1}:${MARKITDOWN_PORT:-18003}:18003"
     healthcheck:
@@ -82,9 +120,11 @@ services:
       - path: ./.env.agent_1
         required: false
     environment:
+      <<: *agent-runtime-env
       CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R1
       AGENT_STATE_DIR: /app/state/agent-1
+      DAIO_KEEPER_ENABLED: ${DAIO_KEEPER_ENABLED_AGENT_1:-true}
 
   agent-2:
     <<: *agent-common
@@ -92,9 +132,11 @@ services:
       - path: ./.env.agent_2
         required: false
     environment:
+      <<: *agent-runtime-env
       CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R2
       AGENT_STATE_DIR: /app/state/agent-2
+      DAIO_KEEPER_ENABLED: ${DAIO_KEEPER_ENABLED_AGENT_2:-false}
 
   agent-3:
     <<: *agent-common
@@ -102,9 +144,11 @@ services:
       - path: ./.env.agent_3
         required: false
     environment:
+      <<: *agent-runtime-env
       CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R3
       AGENT_STATE_DIR: /app/state/agent-3
+      DAIO_KEEPER_ENABLED: ${DAIO_KEEPER_ENABLED_AGENT_3:-false}
 
   agent-4:
     <<: *agent-common
@@ -112,9 +156,11 @@ services:
       - path: ./.env.agent_4
         required: false
     environment:
+      <<: *agent-runtime-env
       CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R4
       AGENT_STATE_DIR: /app/state/agent-4
+      DAIO_KEEPER_ENABLED: ${DAIO_KEEPER_ENABLED_AGENT_4:-false}
 
   agent-5:
     <<: *agent-common
@@ -122,6 +168,8 @@ services:
       - path: ./.env.agent_5
         required: false
     environment:
+      <<: *agent-runtime-env
       CONTENT_SERVICE_URL: http://content-service:18002
       AGENT_LABEL: R5
       AGENT_STATE_DIR: /app/state/agent-5
+      DAIO_KEEPER_ENABLED: ${DAIO_KEEPER_ENABLED_AGENT_5:-false}

@@ -135,8 +135,10 @@ Endpoint summary:
 | `GET` | `/health` | Health check. |
 | `POST` | `/request-intents/usdaio` | Build the EIP-712 `RequestIntent` for requester signing. |
 | `POST` | `/requests/relayed-document` | Relay a signed USDAIO request and store the verified document. |
+| `POST` | `/requests/document-from-tx` | Recover document storage from a successful payment transaction hash. |
 | `POST` | `/requests/:requestId/document` | Store a document after the requester already created the on-chain request directly. |
 | `GET` | `/requests/:requestId/document` | Read stored document metadata and verified payment/request metadata. |
+| `GET` | `/requests/:requestId/chain-status` | Read current on-chain lifecycle directly from the configured chain RPC. |
 | `GET` | `/requests/:requestId/markdown` | Read the canonical converted Markdown for a request. |
 | `GET` | `/requests/:requestId/agent-statuses` | List all known off-chain agent statuses for a request. |
 | `GET` | `/requests/:requestId/agents/:agent/status` | Read one agent's off-chain status. |
@@ -390,6 +392,29 @@ Response:
     "mimeType": "text/markdown",
     "text": "# Document markdown"
   }
+}
+```
+
+### `GET /requests/:requestId/chain-status`
+
+Returns the current on-chain lifecycle for a request. Use this as the source of
+truth when local agent status rows are still replaying after restart.
+
+Response:
+
+```json
+{
+  "requestId": "1",
+  "requester": "0xRequester",
+  "status": 6,
+  "statusName": "Finalized",
+  "feePaid": "100000000000000000000",
+  "priorityFee": "0",
+  "retryCount": "0",
+  "committeeEpoch": "123",
+  "auditEpoch": "123",
+  "activePriority": "0",
+  "lowConfidence": false
 }
 ```
 

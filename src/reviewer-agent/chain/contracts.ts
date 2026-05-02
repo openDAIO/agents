@@ -21,6 +21,8 @@ export interface ContractHandles {
   vrfCoordinator: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   vrfVerifier: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  priorityQueue: any;
   // The Core contract is a ethers Contract; typed loosely for dynamic methods.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   core: any;
@@ -62,6 +64,11 @@ export function loadContracts(d: DeploymentSnapshot, runner: ContractRunner): Co
     vrfVerifier: new Contract(
       d.contracts.vrfVerifier,
       Artifacts.FRAINVRFVerifier().abi as never[],
+      runner,
+    ),
+    priorityQueue: new Contract(
+      d.contracts.priorityQueue,
+      Artifacts.DAIOPriorityQueue().abi as never[],
       runner,
     ),
     core,

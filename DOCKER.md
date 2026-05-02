@@ -399,11 +399,14 @@ Per-agent secret and identity fields:
 | `AGENT_STATE_KEY` | yes | 32-byte local state encryption key for this agent only |
 | `AGENT_PRIVATE_KEY` | yes | transaction signer, must hold Sepolia ETH |
 | `AGENT_VRF_PRIVATE_KEY` | yes | secp256k1 VRF secret used to derive proofs |
+| `DAIO_KEEPER_PRIVATE_KEY` | optional | dedicated gas signer for keeper-only `startNextRequest`/`syncRequest`; falls back to `AGENT_PRIVATE_KEY` |
 | `AGENT_ID` | if auto-registering | identity id passed to reviewer registration |
 | `AGENT_ENS_NAME` | if auto-registering | ENS name passed to reviewer registration |
 | `AGENT_AUTO_REGISTER` | optional | if `true`, agents attempt reviewer registration at boot |
 | `DAIO_AUTO_START_REQUESTS` | yes | keep `true` for active production serving |
 | `DAIO_START_REQUESTS_MAX_PER_TICK` | yes | max start attempts per polling tick, default `2` |
+| `DAIO_START_NEXT_REQUEST_GAS_FLOOR` | optional | keeper `startNextRequest` gas floor, default `300000` |
+| `DAIO_SYNC_REQUEST_GAS_FLOOR` | optional | keeper `syncRequest` gas floor, default `2000000` |
 | `DAIO_START_REQUESTS_MIN_INTERVAL_MS` | yes | polling interval floor |
 | `DAIO_START_REQUESTS_JITTER_MS` | yes | spreads agent tx timing |
 | `DAIO_ALLOW_FIXTURE_VRF` | yes | keep `false` outside local mock deployments |
@@ -483,7 +486,9 @@ Runtime contract config:
 
 There is no separate keeper container in this compose stack. Each reviewer agent
 runs its own auto-start loop and attempts to join eligible queued requests when
-capacity, VRF eligibility, and contract rules allow it.
+capacity, VRF eligibility, and contract rules allow it. Set
+`DAIO_KEEPER_PRIVATE_KEY` for keeper-enabled agents when keeper gas should be
+isolated from reviewer commit/reveal wallets.
 
 ## 9. Independence Boundaries
 

@@ -42,6 +42,11 @@ export interface RequestState {
   };
 }
 
+export interface EventCursorState {
+  lastBlock: number;
+  updatedAt: number;
+}
+
 export class StateStore {
   constructor(private readonly dir: string, private readonly key: Buffer) {
     mkdirSync(dir, { recursive: true });
@@ -60,6 +65,10 @@ export class StateStore {
 
   private filePath(requestId: string): string {
     return path.join(this.dir, `req-${requestId}.json`);
+  }
+
+  private metadataPath(name: string): string {
+    return path.join(this.dir, `${name}.json`);
   }
 
   encryptSeed(plain: string): string {
@@ -89,5 +98,17 @@ export class StateStore {
 
   save(state: RequestState): void {
     writeFileSync(this.filePath(state.requestId), JSON.stringify(state, null, 2));
+  }
+
+  loadEventCursor(name = "core-events"): EventCursorState | undefined {
+    const fp = this.metadataPath(name);
+    if (!existsSync(fp)) return undefined;
+    const parsed = JSON.parse(readFileSync(fp, "utf8")) as EventCursorState;
+    if (!Number.isFinite(parsed.lastBlock) || parsed.lastBlock < 0) return undefined;
+    return parsed;
+  }
+
+  saveEventCursor(cursor: EventCursorState, name = "core-events"): void {
+    writeFileSync(this.metadataPath(name), JSON.stringify(cursor, null, 2));
   }
 }

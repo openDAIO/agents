@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { formatEther, parseEther, Wallet } from "ethers";
 import { makeChainContext } from "./chain/provider.js";
 import { loadContracts } from "./chain/contracts.js";
 import { registerReviewerIfNeeded } from "./chain/registration.js";
@@ -10,6 +11,7 @@ import { StateStore } from "./runtime/state.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { DOMAIN_RESEARCH } from "../shared/types.js";
 import { makeFixtureVrfProvider, makeSecp256k1VrfProvider } from "./chain/vrfProof.js";
+import { installRpcProcessGuards } from "../shared/rpc.js";
 
 async function main() {
   const { values } = parseArgs({
@@ -26,11 +28,20 @@ async function main() {
       "ens-name": { type: "string" },
       "vrf-privkey": { type: "string" },
       "event-poll-interval-ms": { type: "string" },
+      "event-lookback-blocks": { type: "string" },
+      "event-reorg-depth-blocks": { type: "string" },
       "review-election-difficulty": { type: "string" },
       "audit-election-difficulty": { type: "string" },
       "audit-target-limit": { type: "string" },
       "auto-start-requests": { type: "boolean" },
       "disable-auto-start-requests": { type: "boolean" },
+      "keeper-enabled": { type: "boolean" },
+      "disable-keeper": { type: "boolean" },
+      "keeper-privkey": { type: "string" },
+      "keeper-reconcile-interval-ms": { type: "string" },
+      "keeper-sync-active-requests": { type: "boolean" },
+      "disable-keeper-sync-active-requests": { type: "boolean" },
+      "keeper-sync-max-per-tick": { type: "string" },
       "start-requests-max-per-tick": { type: "string" },
       "start-requests-min-interval-ms": { type: "string" },
       "start-requests-jitter-ms": { type: "string" },
@@ -92,6 +103,12 @@ async function main() {
   const handles = loadContracts(deployment, ctx.wallet);
   const content = new ContentServiceClient(contentUrl as string);
   const state = StateStore.fromKey(stateDir as string, stateKey as string);
+  const keeperPrivateKey =
+    (values["keeper-privkey"] as string | undefined) ??
+    process.env.DAIO_KEEPER_PRIVATE_KEY ??
+    process.env.DAIO_GLOBAL_KEEPER_PRIVATE_KEY ??
+    process.env.KEEPER_PRIVATE_KEY;
+  const keeperWallet = keeperPrivateKey ? new Wallet(keeperPrivateKey, ctx.provider) : undefined;
   const vrfPrivateKey = (values["vrf-privkey"] as string | undefined) ?? process.env.AGENT_VRF_PRIVATE_KEY;
   const allowFixtureVrf = booleanSetting(undefined, "DAIO_ALLOW_FIXTURE_VRF", false);
   const vrf = vrfPrivateKey
@@ -113,14 +130,18 @@ async function main() {
     );
   }
 
+  const expectedAgentId = BigInt(values["agent-id"] ?? "1001");
+  const expectedEnsName = (values["ens-name"] as string | undefined) ?? `${label}.daio.eth`;
+  const registerEns = booleanSetting(undefined, "DAIO_REGISTER_ENS", true);
+  const targetStakeRaw = process.env.DAIO_AGENT_TARGET_STAKE_USDAIO ?? process.env.DAIO_AGENT_TARGET_STAKE;
+  const targetStake = targetStakeRaw && targetStakeRaw.trim() !== "" ? parseEther(targetStakeRaw.trim()) : undefined;
   if (values["auto-register"]) {
-    const agentId = BigInt(values["agent-id"] ?? "1001");
-    const ensName = (values["ens-name"] as string | undefined) ?? `${label}.daio.eth`;
     const res = await registerReviewerIfNeeded(handles, ctx.wallet, {
-      ensName,
-      agentId,
+      ensName: registerEns ? expectedEnsName : "",
+      agentId: expectedAgentId,
       domainMask: DOMAIN_RESEARCH,
       vrfPublicKey: vrf.publicKey,
+      stakeAmount: targetStake,
     });
     process.stdout.write(`[agent ${label}] register: ${JSON.stringify(res)}\n`);
   }
@@ -133,9 +154,60 @@ async function main() {
         `registered VRF public key does not match AGENT_VRF_PRIVATE_KEY for ${ctx.wallet.address}; re-register with the matching VRF key or use the original VRF secret`,
       );
     }
+    try {
+      const onchainAgentId = BigInt(reviewerInfo[3] as bigint | number);
+      if (values["auto-register"] && expectedAgentId !== 0n && onchainAgentId !== expectedAgentId) {
+        process.stdout.write(
+          `[agent ${label}] warning: on-chain agentId=${onchainAgentId} differs from configured AGENT_ID=${expectedAgentId}; ENS/ERC8004 identity may need repair\n`,
+        );
+      }
+      const stake = BigInt(reviewerInfo[4] as bigint | number);
+      const minStake = BigInt((await handles.reviewerRegistry.minStake()) as bigint | number);
+      const maxActive = BigInt((await handles.core.maxActiveRequests()) as bigint | number);
+      const requiredForActiveWindow = minStake * (maxActive > 0n ? maxActive : 1n);
+      const lockedStake = BigInt((await handles.reviewerRegistry.lockedStake(ctx.wallet.address)) as bigint | number);
+      const availableStake = BigInt((await handles.reviewerRegistry.availableStake(ctx.wallet.address)) as bigint | number);
+      process.stdout.write(
+        `[agent ${label}] stake: total=${formatEther(stake)} locked=${formatEther(lockedStake)} available=${formatEther(availableStake)} min=${formatEther(minStake)} requiredForMaxActive=${formatEther(requiredForActiveWindow)}\n`,
+      );
+      if (stake < requiredForActiveWindow) {
+        process.stdout.write(
+          `[agent ${label}] warning: total stake is below maxActiveRequests window; concurrent active requests can make this reviewer ineligible\n`,
+        );
+      }
+      if (availableStake < minStake) {
+        process.stdout.write(
+          `[agent ${label}] warning: available stake is below minStake; this reviewer will skip new commits until existing locks are released or stake is topped up\n`,
+        );
+      }
+    } catch (err) {
+      process.stdout.write(`[agent ${label}] warning: could not read stake diagnostics: ${(err as Error).message}\n`);
+    }
   } else {
     process.stdout.write(`[agent ${label}] reviewer is not registered; set AGENT_AUTO_REGISTER=true or register before serving\n`);
   }
+
+  const autoStartRequests = values["disable-auto-start-requests"]
+    ? false
+    : booleanSetting(
+        values["auto-start-requests"] as boolean | undefined,
+        "DAIO_AUTO_START_REQUESTS",
+        true,
+      );
+  const keeperEnabled = values["disable-keeper"]
+    ? false
+    : booleanSetting(
+        values["keeper-enabled"] as boolean | undefined,
+        "DAIO_KEEPER_ENABLED",
+        autoStartRequests,
+      );
+  const keeperSyncActiveRequests = values["disable-keeper-sync-active-requests"]
+    ? false
+    : booleanSetting(
+        values["keeper-sync-active-requests"] as boolean | undefined,
+        "DAIO_KEEPER_SYNC_ACTIVE_REQUESTS",
+        true,
+      );
 
   const cfg: AgentConfig = {
     finalityFactor: 2n,
@@ -154,19 +226,40 @@ async function main() {
       "DAIO_AUDIT_TARGET_LIMIT",
       2n,
     ),
-    autoStartRequests: values["disable-auto-start-requests"]
-      ? false
-      : booleanSetting(
-          values["auto-start-requests"] as boolean | undefined,
-          "DAIO_AUTO_START_REQUESTS",
-          true,
-        ),
+    autoStartRequests,
     eventPollIntervalMs: integerSetting(
       values["event-poll-interval-ms"] as string | undefined,
       "DAIO_EVENT_POLL_INTERVAL_MS",
       500,
       100,
     ),
+    eventLookbackBlocks: integerSetting(
+      values["event-lookback-blocks"] as string | undefined,
+      "DAIO_EVENT_LOOKBACK_BLOCKS",
+      7_200,
+      0,
+    ),
+    eventReorgDepthBlocks: integerSetting(
+      values["event-reorg-depth-blocks"] as string | undefined,
+      "DAIO_EVENT_REORG_DEPTH_BLOCKS",
+      12,
+      0,
+    ),
+    keeperEnabled,
+    keeperSyncActiveRequests,
+    keeperReconcileIntervalMs: integerSetting(
+      values["keeper-reconcile-interval-ms"] as string | undefined,
+      "DAIO_KEEPER_RECONCILE_INTERVAL_MS",
+      10_000,
+      0,
+    ),
+    keeperSyncMaxPerTick: integerSetting(
+      values["keeper-sync-max-per-tick"] as string | undefined,
+      "DAIO_KEEPER_SYNC_MAX_PER_TICK",
+      8,
+      0,
+    ),
+    keeperWallet,
     startRequestsMaxPerTick: integerSetting(
       values["start-requests-max-per-tick"] as string | undefined,
       "DAIO_START_REQUESTS_MAX_PER_TICK",
@@ -203,6 +296,8 @@ async function main() {
     process.exit(0);
   });
 }
+
+installRpcProcessGuards("agent");
 
 main().catch((err) => {
   process.stderr.write(`[agent] fatal: ${err}\n${(err as Error).stack ?? ""}\n`);

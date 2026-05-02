@@ -9,6 +9,8 @@ import { runAudit, runAuditReveal, type AuditFlowDeps } from "./auditFlow.js";
 import type { StateStore } from "./state.js";
 import type { Provider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
+import { waitForTransactionWithRetries, withRpcReadRetries } from "../../shared/rpc.js";
+import { gasLimitWithHeadroom } from "./gas.js";
 import {
   resolveRequestRuntimeConfig,
   resolveTierRuntimeConfig,
@@ -24,9 +26,16 @@ export interface AgentConfig {
   auditTargetLimit: bigint;
   autoStartRequests?: boolean;
   eventPollIntervalMs?: number;
+  eventLookbackBlocks?: number;
+  eventReorgDepthBlocks?: number;
   startRequestsMaxPerTick?: number;
   startRequestsMinIntervalMs?: number;
   startRequestsJitterMs?: number;
+  keeperEnabled?: boolean;
+  keeperReconcileIntervalMs?: number;
+  keeperSyncActiveRequests?: boolean;
+  keeperSyncMaxPerTick?: number;
+  keeperWallet?: Wallet;
   vrf: VrfProofProvider;
   label: string;
 }
@@ -76,11 +85,20 @@ function expectedQueueStartError(err: unknown): boolean {
   };
   const name = shaped.errorName ?? shaped.revert?.name ?? "";
   const message = `${shaped.shortMessage ?? ""} ${deepErrorText(err)}`;
+  const expectedSelectors = [
+    "0x75e52f4f", // QueueEmpty()
+    "0x07cc321c", // BadConfig()
+    "0x085de625", // TooEarly()
+    "0x53c034cf", // TooManyActiveRequests()
+  ];
   return (
     name === "QueueEmpty" ||
     name === "BadConfig" ||
+    name === "TooEarly" ||
+    expectedSelectors.some((selector) => message.includes(selector)) ||
     message.includes("QueueEmpty") ||
     message.includes("BadConfig") ||
+    message.includes("TooEarly") ||
     message.includes("TooManyActiveRequests")
   );
 }
@@ -88,12 +106,18 @@ function expectedQueueStartError(err: unknown): boolean {
 export class ReviewerAgent {
   private events: CoreEventStream;
   private phaseQueues = new Map<string, Promise<void>>();
-  private txQueue = new SerialQueue();
-  private txSigner: NonceManager;
+  private agentTxQueue = new SerialQueue();
+  private keeperTxQueue = new SerialQueue();
+  private agentTxSigner: NonceManager;
+  private keeperTxSigner: NonceManager;
+  private keeperUsesAgentSigner: boolean;
   private refillTimer: NodeJS.Timeout | null = null;
   private refillInFlight: Promise<void> | null = null;
   private refillRequested = false;
   private lastRefillAt = 0;
+  private keeperReconcileTimer: NodeJS.Timeout | null = null;
+  private readonly activeRequests = new Map<string, RequestStatus>();
+  private readonly phaseRetryTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly provider: Provider,
@@ -103,30 +127,59 @@ export class ReviewerAgent {
     private readonly state: StateStore,
     private readonly cfg: AgentConfig,
   ) {
-    this.events = new CoreEventStream(provider, handles.rawCore);
-    this.txSigner = new NonceManager(wallet);
+    this.events = new CoreEventStream(provider, handles.rawCore, {
+      cursorStore: {
+        load: () => this.state.loadEventCursor(),
+        save: (cursor) => this.state.saveEventCursor(cursor),
+      },
+      lookbackBlocks: cfg.eventLookbackBlocks,
+      reorgDepthBlocks: cfg.eventReorgDepthBlocks,
+    });
+    this.agentTxSigner = new NonceManager(wallet);
+    const keeperWallet = cfg.keeperWallet;
+    if (keeperWallet && keeperWallet.address.toLowerCase() !== wallet.address.toLowerCase()) {
+      this.keeperUsesAgentSigner = false;
+      this.keeperTxSigner = new NonceManager(keeperWallet);
+    } else {
+      this.keeperUsesAgentSigner = true;
+      this.keeperTxSigner = this.agentTxSigner;
+    }
   }
 
   private log(msg: string): void {
     process.stdout.write(`[agent ${this.cfg.label} ${this.wallet.address.slice(0, 10)}] ${msg}\n`);
   }
 
-  private async queuedTx<T>(task: () => Promise<T>): Promise<T> {
-    return this.txQueue.run(async () => {
+  private async queuedTxWith<T>(
+    queue: SerialQueue,
+    signer: NonceManager,
+    queueLabel: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    return queue.run(async () => {
       let lastErr: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {
-        this.txSigner.reset();
+        signer.reset();
         try {
           return await task();
         } catch (err) {
           lastErr = err;
           if (!nonceError(err) || attempt === 2) throw err;
-          this.log(`tx nonce retry ${attempt + 1}/2: ${formatError(err)}`);
+          this.log(`${queueLabel} nonce retry ${attempt + 1}/2: ${formatError(err)}`);
           await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
         }
       }
       throw lastErr;
     });
+  }
+
+  private async queuedAgentTx<T>(task: () => Promise<T>): Promise<T> {
+    return this.queuedTxWith(this.agentTxQueue, this.agentTxSigner, "agent tx", task);
+  }
+
+  private async queuedKeeperTx<T>(task: () => Promise<T>): Promise<T> {
+    if (this.keeperUsesAgentSigner) return this.queuedAgentTx(task);
+    return this.queuedTxWith(this.keeperTxQueue, this.keeperTxSigner, "keeper tx", task);
   }
 
   private async recordStatus(
@@ -168,10 +221,12 @@ export class ReviewerAgent {
       void this.handlePhaseChange(e as PhaseChange);
     });
     await this.logStartupChainConfig();
+    await this.logKeeperSigner();
     const eventPollIntervalMs = Math.max(100, this.cfg.eventPollIntervalMs ?? 500);
     await this.events.start(undefined, eventPollIntervalMs);
     this.log(`started; watching events pollIntervalMs=${eventPollIntervalMs}`);
     this.scheduleActiveRefill("startup");
+    this.scheduleKeeperReconcile();
   }
 
   stop(): void {
@@ -179,6 +234,12 @@ export class ReviewerAgent {
       clearTimeout(this.refillTimer);
       this.refillTimer = null;
     }
+    if (this.keeperReconcileTimer) {
+      clearTimeout(this.keeperReconcileTimer);
+      this.keeperReconcileTimer = null;
+    }
+    for (const timer of this.phaseRetryTimers.values()) clearTimeout(timer);
+    this.phaseRetryTimers.clear();
     this.events.stop();
   }
 
@@ -196,6 +257,7 @@ export class ReviewerAgent {
   }
 
   private maybeScheduleActiveRefill(change: PhaseChange): void {
+    this.trackRequestStatus(change.requestId, change.status);
     switch (change.status) {
       case RequestStatus.Queued:
       case RequestStatus.Finalized:
@@ -210,7 +272,7 @@ export class ReviewerAgent {
   }
 
   private scheduleActiveRefill(reason: string): void {
-    if (this.cfg.autoStartRequests === false) return;
+    if (!this.keeperEnabled()) return;
     this.refillRequested = true;
     if (this.refillTimer || this.refillInFlight) return;
 
@@ -233,6 +295,63 @@ export class ReviewerAgent {
     }, delayMs);
   }
 
+  private keeperEnabled(): boolean {
+    return this.cfg.autoStartRequests !== false && this.cfg.keeperEnabled !== false;
+  }
+
+  private async logKeeperSigner(): Promise<void> {
+    if (!this.keeperEnabled()) return;
+    const keeperAddress = await this.keeperTxSigner.getAddress();
+    if (this.keeperUsesAgentSigner) {
+      this.log(`keeper enabled; using agent tx signer ${keeperAddress}`);
+    } else {
+      this.log(`keeper enabled; using dedicated keeper signer ${keeperAddress}`);
+    }
+  }
+
+  private scheduleKeeperReconcile(): void {
+    if (!this.keeperEnabled() || this.keeperReconcileTimer) return;
+    const intervalMs = Math.max(0, this.cfg.keeperReconcileIntervalMs ?? 10_000);
+    if (intervalMs === 0) return;
+    this.keeperReconcileTimer = setTimeout(() => {
+      this.keeperReconcileTimer = null;
+      void this.syncTrackedActiveRequests("reconcile").catch((err) =>
+        this.log(`keeper active sync failed: ${formatError(err)}`),
+      );
+      this.scheduleActiveRefill("reconcile");
+      this.scheduleKeeperReconcile();
+    }, intervalMs);
+  }
+
+  private trackRequestStatus(requestId: bigint, status: RequestStatus): void {
+    const key = requestId.toString();
+    if (this.activeStatus(status)) {
+      this.activeRequests.set(key, status);
+    } else if (
+      status === RequestStatus.Queued ||
+      status === RequestStatus.Finalized ||
+      status === RequestStatus.Cancelled ||
+      status === RequestStatus.Failed ||
+      status === RequestStatus.Unresolved
+    ) {
+      this.activeRequests.delete(key);
+      const retryTimer = this.phaseRetryTimers.get(key);
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        this.phaseRetryTimers.delete(key);
+      }
+    }
+  }
+
+  private activeStatus(status: RequestStatus): boolean {
+    return [
+      RequestStatus.ReviewCommit,
+      RequestStatus.ReviewReveal,
+      RequestStatus.AuditCommit,
+      RequestStatus.AuditReveal,
+    ].includes(status);
+  }
+
   private async drainActiveRefills(reason: string): Promise<void> {
     while (this.refillRequested) {
       this.refillRequested = false;
@@ -245,7 +364,7 @@ export class ReviewerAgent {
     const maxPerTick = Math.max(0, Math.trunc(this.cfg.startRequestsMaxPerTick ?? 2));
     if (maxPerTick === 0) return;
 
-    const core = this.handles.core.connect(this.txSigner);
+    const core = this.handles.core.connect(this.keeperTxSigner);
     let attempts = maxPerTick;
     try {
       const maxActiveRaw = (await this.handles.core.maxActiveRequests()) as bigint;
@@ -259,6 +378,8 @@ export class ReviewerAgent {
     }
 
     for (let i = 0; i < attempts; i++) {
+      const queueSize = await this.keeperQueueSize("startNextRequest");
+      if (queueSize === 0n) break;
       try {
         await core.startNextRequest.staticCall();
       } catch (err) {
@@ -269,10 +390,25 @@ export class ReviewerAgent {
       }
 
       try {
-        const receipt = await this.queuedTx(async () => {
-          const tx = await core.startNextRequest();
-          return tx.wait();
+        const receipt = await this.queuedKeeperTx(async () => {
+          const queueSize = await this.keeperQueueSize("queued startNextRequest");
+          if (queueSize === 0n) return undefined;
+          try {
+            await core.startNextRequest.staticCall();
+          } catch (err) {
+            if (expectedQueueStartError(err)) return undefined;
+            throw err;
+          }
+          const gasLimit = await gasLimitWithHeadroom(
+            core.startNextRequest,
+            [],
+            "DAIO_START_NEXT_REQUEST_GAS_FLOOR",
+            300_000n,
+          );
+          const tx = await core.startNextRequest({ gasLimit });
+          return waitForTransactionWithRetries(tx);
         });
+        if (receipt === undefined) break;
         if (!receipt || receipt.status !== 1) {
           throw new Error(`startNextRequest transaction reverted`);
         }
@@ -288,13 +424,149 @@ export class ReviewerAgent {
     }
   }
 
+  private async keeperQueueSize(context: string): Promise<bigint | undefined> {
+    try {
+      const raw = await withRpcReadRetries(
+        () => this.handles.priorityQueue.currentSize() as Promise<bigint>,
+      );
+      return BigInt(raw);
+    } catch (err) {
+      this.log(`keeper could not read queue size for ${context}; falling back to staticCall: ${formatError(err)}`);
+      return undefined;
+    }
+  }
+
+  private syncActiveRequestsEnabled(): boolean {
+    return this.keeperEnabled() && this.cfg.keeperSyncActiveRequests !== false;
+  }
+
+  private async syncTrackedActiveRequests(reason: string): Promise<void> {
+    if (!this.syncActiveRequestsEnabled() || this.activeRequests.size === 0) return;
+    const maxPerTick = Math.max(0, Math.trunc(this.cfg.keeperSyncMaxPerTick ?? 8));
+    if (maxPerTick === 0) return;
+    const entries = [...this.activeRequests.entries()].slice(0, maxPerTick);
+    for (const [requestIdRaw, knownStatus] of entries) {
+      await this.syncActiveRequest(BigInt(requestIdRaw), knownStatus, reason);
+    }
+  }
+
+  private async syncActiveRequest(requestId: bigint, knownStatus: RequestStatus, reason: string): Promise<void> {
+    if (!this.syncActiveRequestsEnabled()) return;
+    const liveStatus = await this.currentRequestStatus(requestId);
+    this.trackRequestStatus(requestId, liveStatus);
+    if (!this.activeStatus(liveStatus)) {
+      await this.recordLiveStatusForStaleEvent(requestId, liveStatus, RequestStatus[knownStatus] ?? `Status${knownStatus}`);
+      return;
+    }
+
+    const core = this.handles.core.connect(this.keeperTxSigner);
+    let predictedStatus: RequestStatus;
+    try {
+      predictedStatus = Number(await core.syncRequest.staticCall(requestId)) as RequestStatus;
+    } catch (err) {
+      this.log(`keeper syncRequest preflight failed request=${requestId}: ${formatError(err)}`);
+      return;
+    }
+    if (predictedStatus === liveStatus) return;
+
+    const receipt = await this.queuedKeeperTx(async () => {
+      const gasLimit = await gasLimitWithHeadroom(
+        core.syncRequest,
+        [requestId],
+        "DAIO_SYNC_REQUEST_GAS_FLOOR",
+        2_000_000n,
+      );
+      const tx = await core.syncRequest(requestId, { gasLimit });
+      return waitForTransactionWithRetries(tx);
+    });
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(`syncRequest transaction reverted for request ${requestId}`);
+    }
+    this.log(
+      `keeper synced active request=${requestId} reason=${reason} ${RequestStatus[liveStatus]}->${RequestStatus[predictedStatus] ?? `Status${predictedStatus}`} tx=${receipt.hash} block=${receipt.blockNumber}`,
+    );
+    this.trackRequestStatus(requestId, predictedStatus);
+    if (
+      predictedStatus === RequestStatus.Queued ||
+      predictedStatus === RequestStatus.Finalized ||
+      predictedStatus === RequestStatus.Cancelled ||
+      predictedStatus === RequestStatus.Failed ||
+      predictedStatus === RequestStatus.Unresolved
+    ) {
+      this.scheduleActiveRefill(`sync-${RequestStatus[predictedStatus] ?? predictedStatus}`);
+    }
+  }
+
+  private schedulePhaseRetry(change: PhaseChange, reason: string): void {
+    if (!this.activeStatus(change.status)) return;
+    const key = change.requestId.toString();
+    if (this.phaseRetryTimers.has(key)) return;
+    const retryMs = Math.max(1_000, this.integerEnv("DAIO_DOCUMENT_RECHECK_MS", 10_000, 1_000));
+    const timer = setTimeout(() => {
+      this.phaseRetryTimers.delete(key);
+      void this.currentRequestStatus(change.requestId)
+        .then((liveStatus) => {
+          this.trackRequestStatus(change.requestId, liveStatus);
+          if (liveStatus !== change.status) return;
+          this.log(
+            `retrying ${RequestStatus[change.status] ?? `Status${change.status}`} for request ${change.requestId} after ${reason}`,
+          );
+          void this.handlePhaseChange(change);
+        })
+        .catch((err) => {
+          this.log(`phase retry status check failed request=${change.requestId}: ${formatError(err)}`);
+          this.schedulePhaseRetry(change, reason);
+        });
+    }, retryMs);
+    this.phaseRetryTimers.set(key, timer);
+  }
+
+  private integerEnv(name: string, fallback: number, min = 0): number {
+    const raw = process.env[name];
+    if (!raw || raw.trim() === "") return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < min) return fallback;
+    return parsed;
+  }
+
   private fallbackRuntimeConfig(): RuntimeConfig {
+    const fallbackPhaseTimeoutMs = this.integerEnv("DAIO_FALLBACK_PHASE_TIMEOUT_MS", 600_000, 0);
     return {
       finalityFactor: this.cfg.finalityFactor,
       reviewElectionDifficulty: this.cfg.reviewElectionDifficulty,
       auditElectionDifficulty: this.cfg.auditElectionDifficulty,
       auditTargetLimit: this.cfg.auditTargetLimit,
+      reviewCommitTimeoutMs: fallbackPhaseTimeoutMs,
+      reviewRevealTimeoutMs: fallbackPhaseTimeoutMs,
+      auditCommitTimeoutMs: fallbackPhaseTimeoutMs,
+      auditRevealTimeoutMs: fallbackPhaseTimeoutMs,
     };
+  }
+
+  private async documentWaitMsForPhase(change: PhaseChange, phaseTimeoutMs: number): Promise<number | undefined> {
+    const timeoutMs = Math.max(0, Math.trunc(phaseTimeoutMs));
+    if (timeoutMs === 0) return undefined;
+
+    const bufferMs = this.integerEnv("DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS", 180_000, 0);
+    const waitWithoutElapsed = Math.max(0, timeoutMs - bufferMs);
+    const startBlock = this.events.phaseStartBlock(change.requestId, change.status);
+    if (startBlock === undefined) return waitWithoutElapsed;
+
+    try {
+      const [phaseStartBlock, latestBlock] = await withRpcReadRetries(() =>
+        Promise.all([this.provider.getBlock(startBlock), this.provider.getBlock("latest")]),
+      );
+      if (!phaseStartBlock || !latestBlock) return waitWithoutElapsed;
+      const elapsedMs = Math.max(0, (latestBlock.timestamp - phaseStartBlock.timestamp) * 1_000);
+      const waitMs = Math.max(0, timeoutMs - elapsedMs - bufferMs);
+      this.log(
+        `request ${change.requestId} ${RequestStatus[change.status] ?? `Status${change.status}`} document wait budget=${waitMs}ms timeout=${timeoutMs}ms elapsed=${elapsedMs}ms buffer=${bufferMs}ms`,
+      );
+      return waitMs;
+    } catch (err) {
+      this.log(`document wait deadline read failed for request ${change.requestId}: ${formatError(err)}`);
+      return waitWithoutElapsed;
+    }
   }
 
   private async requestRuntimeConfig(requestId: bigint): Promise<RuntimeConfig> {
@@ -307,11 +579,11 @@ export class ReviewerAgent {
     const summary = runtimeConfigSummary(resolved.config);
     if (resolved.source === "contract-storage") {
       this.log(
-        `request ${requestId} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}`,
+        `request ${requestId} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
       );
     } else {
       this.log(
-        `request ${requestId} config fallback finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}; read failed: ${resolved.error ?? "unknown"}`,
+        `request ${requestId} config fallback finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}; read failed: ${resolved.error ?? "unknown"}`,
       );
     }
     return resolved.config;
@@ -333,7 +605,7 @@ export class ReviewerAgent {
       const summary = runtimeConfigSummary(resolved.config);
       if (resolved.source === "contract-storage") {
         this.log(
-          `tier ${name} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit}`,
+          `tier ${name} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
         );
       } else {
         this.log(`tier ${name} config fallback; storage read failed: ${resolved.error ?? "unknown"}`);
@@ -350,27 +622,57 @@ export class ReviewerAgent {
       content: this.content,
       state: this.state,
       wallet: this.wallet,
-      txSigner: this.txSigner,
+      txSigner: this.agentTxSigner,
       vrf: this.cfg.vrf,
       log: (m) => this.log(m),
-      txQueue: (task) => this.queuedTx(task),
+      txQueue: (task) => this.queuedAgentTx(task),
+      recordStatus: (requestId, phaseName, status, detail, payload) =>
+        this.recordStatus(requestId, phaseName, status, detail, payload),
     };
     const auditDeps: AuditFlowDeps = reviewDeps;
 
     try {
+      if (this.shouldCheckLiveStatus(change.status)) {
+        const liveStatus = await this.currentRequestStatus(change.requestId).catch((err) => {
+          this.log(`could not read live status for request ${change.requestId}: ${formatError(err)}`);
+          return undefined;
+        });
+        if (liveStatus !== undefined && liveStatus !== change.status) {
+          await this.recordLiveStatusForStaleEvent(change.requestId, liveStatus, phase);
+          return;
+        }
+      }
+
       switch (change.status) {
         case RequestStatus.ReviewCommit: {
           await this.recordStatus(change.requestId, phase, "running", "phase event received");
           const runtimeConfig = await this.requestRuntimeConfig(change.requestId);
+          const documentWaitMs = await this.documentWaitMsForPhase(
+            change,
+            runtimeConfig.reviewCommitTimeoutMs,
+          );
           const res = await runReview(
             reviewDeps,
             change.requestId,
             runtimeConfig.finalityFactor,
             runtimeConfig.reviewElectionDifficulty,
+            documentWaitMs,
           );
           if (!res.committed) {
             this.log(`review skip: ${res.reason}`);
-            await this.recordStatus(change.requestId, phase, "skipped", res.reason);
+            const status = res.reason === "document_unavailable" ? "document_unavailable" : "skipped";
+            await this.recordStatus(change.requestId, phase, status, res.reason);
+            if (res.reason === "document_unavailable") {
+              this.schedulePhaseRetry(change, "document_unavailable");
+              await this.syncActiveRequest(change.requestId, change.status, "document_unavailable").catch((err) =>
+                this.log(`keeper document-timeout sync failed: ${formatError(err)}`),
+              );
+            } else if (res.reason === "document_wait_aborted") {
+              const liveStatus = await this.currentRequestStatus(change.requestId).catch(() => undefined);
+              if (liveStatus !== undefined) {
+                await this.recordLiveStatusForStaleEvent(change.requestId, liveStatus, phase);
+              }
+            }
           } else {
             await this.recordStatus(change.requestId, phase, "committed", "review committed", {
               commitTx: res.commitTx,
@@ -396,16 +698,33 @@ export class ReviewerAgent {
         case RequestStatus.AuditCommit: {
           await this.recordStatus(change.requestId, phase, "running", "phase event received");
           const runtimeConfig = await this.requestRuntimeConfig(change.requestId);
+          const documentWaitMs = await this.documentWaitMsForPhase(
+            change,
+            runtimeConfig.auditCommitTimeoutMs,
+          );
           const res = await runAudit(
             auditDeps,
             change.requestId,
             runtimeConfig.finalityFactor,
             runtimeConfig.auditElectionDifficulty,
             runtimeConfig.auditTargetLimit,
+            documentWaitMs,
           );
           if (!res.committed) {
             this.log(`audit skip: ${res.reason}`);
-            await this.recordStatus(change.requestId, phase, "skipped", res.reason);
+            const status = res.reason === "document_unavailable" ? "document_unavailable" : "skipped";
+            await this.recordStatus(change.requestId, phase, status, res.reason);
+            if (res.reason === "document_unavailable") {
+              this.schedulePhaseRetry(change, "document_unavailable");
+              await this.syncActiveRequest(change.requestId, change.status, "document_unavailable").catch((err) =>
+                this.log(`keeper document-timeout sync failed: ${formatError(err)}`),
+              );
+            } else if (res.reason === "document_wait_aborted") {
+              const liveStatus = await this.currentRequestStatus(change.requestId).catch(() => undefined);
+              if (liveStatus !== undefined) {
+                await this.recordLiveStatusForStaleEvent(change.requestId, liveStatus, phase);
+              }
+            }
           } else {
             await this.recordStatus(change.requestId, phase, "committed", "audit committed", {
               commitTx: res.commitTx,
@@ -443,6 +762,46 @@ export class ReviewerAgent {
     } catch (err) {
       this.log(`dispatch error in ${RequestStatus[change.status]}: ${(err as Error).message}`);
       await this.recordStatus(change.requestId, phase, "error", (err as Error).message);
+    }
+  }
+
+  private async currentRequestStatus(requestId: bigint): Promise<RequestStatus> {
+    const lifecycle = await withRpcReadRetries(
+      () => this.handles.core.getRequestLifecycle(requestId) as Promise<readonly unknown[]>,
+    );
+    return Number(lifecycle[1] as bigint | number) as RequestStatus;
+  }
+
+  private shouldCheckLiveStatus(status: RequestStatus): boolean {
+    return [
+      RequestStatus.ReviewCommit,
+      RequestStatus.ReviewReveal,
+      RequestStatus.AuditCommit,
+      RequestStatus.AuditReveal,
+    ].includes(status);
+  }
+
+  private async recordLiveStatusForStaleEvent(
+    requestId: bigint,
+    liveStatus: RequestStatus,
+    stalePhase: string,
+  ): Promise<void> {
+    const livePhase = RequestStatus[liveStatus] ?? `Status${liveStatus}`;
+    this.log(`skip stale ${stalePhase} event for request ${requestId}; live status is ${livePhase}`);
+    switch (liveStatus) {
+      case RequestStatus.Finalized:
+        this.trackRequestStatus(requestId, liveStatus);
+        await this.recordStatus(requestId, livePhase, "finalized", "request finalized");
+        break;
+      case RequestStatus.Cancelled:
+      case RequestStatus.Failed:
+      case RequestStatus.Unresolved:
+        this.trackRequestStatus(requestId, liveStatus);
+        await this.recordStatus(requestId, livePhase, "terminal", "request ended without finalization");
+        break;
+      default:
+        this.trackRequestStatus(requestId, liveStatus);
+        break;
     }
   }
 }

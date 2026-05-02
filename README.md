@@ -322,6 +322,11 @@ RPC_URLS=https://sepolia.drpc.org,https://ethereum-sepolia-rpc.publicnode.com
 RPC_FAILOVER_STALL_TIMEOUT_MS=750
 RPC_FAILOVER_QUORUM=1
 RPC_FAILOVER_EVENT_QUORUM=1
+RPC_BATCH_MAX_COUNT=1
+RPC_READ_RETRIES=3
+RPC_READ_RETRY_BASE_MS=500
+RPC_TX_WAIT_RETRIES=5
+RPC_TX_WAIT_RETRY_BASE_MS=1000
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
 LLM_BASE_URL=http://100.94.8.47:8000/v1
@@ -335,6 +340,13 @@ CONTENT_SERVICE_PORT=18002
 CONTENT_SERVICE_HOST=127.0.0.1
 CONTENT_DB_PATH=./.data/content.sqlite
 CONTENT_REQUIRE_AGENT_SIGNATURES=true
+
+CORS_ALLOW_ORIGIN=*
+CORS_ALLOW_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS
+CORS_ALLOW_HEADERS=Content-Type,Authorization,X-Requested-With,X-Filename
+CORS_EXPOSE_HEADERS=Content-Length,Content-Type
+CORS_MAX_AGE=86400
+CORS_ALLOW_CREDENTIALS=false
 ```
 
 `RPC_URL` is the primary endpoint. `RPC_URLS` can add comma- or space-separated
@@ -343,6 +355,62 @@ service use an ethers `FallbackProvider` when more than one endpoint is
 configured. The default quorum is `1`, which favors availability for Sepolia
 operations; raise `RPC_FAILOVER_QUORUM` only when every configured endpoint is
 fast and independently reliable enough for multi-backend agreement.
+`RPC_BATCH_MAX_COUNT=1` disables ethers JSON-RPC batching, which avoids public
+RPC providers that reject large batches. `RPC_READ_RETRIES` and
+`RPC_READ_RETRY_BASE_MS` add short exponential-backoff retries around event
+polling and chain reads. `RPC_TX_WAIT_RETRIES` and
+`RPC_TX_WAIT_RETRY_BASE_MS` add retries while waiting for transaction receipts.
+`CORS_ALLOW_ORIGIN=*` makes both content-service and MarkItDown respond to
+browser preflight requests on every endpoint. For a locked-down frontend, replace
+it with a comma-separated allowlist such as `http://localhost:3000,https://app.example`.
+
+Production agents also wait for direct-call documents instead of failing the
+round immediately:
+
+```bash
+DAIO_DOCUMENT_WAIT_MS=300000
+DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
+DAIO_DOCUMENT_RETRY_MAX_MS=10000
+DAIO_DOCUMENT_RECHECK_MS=10000
+DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
+DAIO_EVENT_LOOKBACK_BLOCKS=7200
+DAIO_EVENT_REORG_DEPTH_BLOCKS=12
+DAIO_KEEPER_RECONCILE_INTERVAL_MS=10000
+DAIO_KEEPER_SYNC_ACTIVE_REQUESTS=true
+DAIO_KEEPER_SYNC_MAX_PER_TICK=8
+DAIO_KEEPER_PRIVATE_KEY=
+DAIO_START_NEXT_REQUEST_GAS_FLOOR=300000
+DAIO_SYNC_REQUEST_GAS_FLOOR=2000000
+```
+
+When the agent can read DAIOCore's on-chain request config, document waiting is
+bounded by the live phase deadline instead of the static fallback:
+`phaseTimeout - elapsedPhaseTime - DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS`.
+`DAIO_DOCUMENT_WAIT_MS` is used only when the phase timeout cannot be read.
+
+Docker Compose enables keeper duties only on `agent-1` by default. Override
+`DAIO_KEEPER_ENABLED_AGENT_N=true|false` in `.env` if a different agent should
+own `startNextRequest`. Set `DAIO_KEEPER_PRIVATE_KEY` in `.env` or in the
+keeper-enabled agent env to use a dedicated funded gas wallet for keeper-only
+`startNextRequest` and `syncRequest` transactions. Review/audit commit-reveal
+transactions still use each `AGENT_PRIVATE_KEY`, because the reviewer address
+must be the transaction sender. The keeper also probes active requests with
+`syncRequest.staticCall(...)` and sends a real `syncRequest` transaction only
+when the contract would advance the request, for example after a protocol
+timeout. Keeper gas floors add headroom above fragile RPC gas estimates; unused
+gas is not spent.
+
+For `maxActiveRequests=2`, each reviewer wallet should have at least
+`2 * ReviewerRegistry.minStake()` staked. Otherwise one active request can lock
+the wallet's available stake and make that reviewer ineligible for the next
+concurrent active request. The agent registration helper no longer uses an
+identityless stake top-up fallback, so it will not clear on-chain ENS/ERC8004
+identity fields to add stake.
+Set `DAIO_AGENT_TARGET_STAKE_USDAIO=6000` in each `.env.agent_N` for a wider
+Sepolia buffer. If the configured ENS name does not resolve to the reviewer or
+ERC-8004 agent wallet, set `DAIO_REGISTER_ENS=false`; ERC-8004 `agentId` can
+still be registered without clearing identity fields.
 
 Run the full E2E:
 
@@ -367,6 +435,23 @@ DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
 DAIO_AUDIT_REVEAL_GAS_FLOOR=12000000 \
 npm run e2e:sepolia-fork
 ```
+
+Run a live Sepolia PDF smoke/E2E against already running content-service and
+MarkItDown:
+
+```bash
+DAIO_REQUESTER_PRIVATE_KEY=<funded-requester-key> \
+CONTENT_SERVICE_URL=http://127.0.0.1:18002 \
+MARKITDOWN_URL=http://127.0.0.1:18003 \
+npm run ops:e2e:sepolia -- --mode relayed --pdf samples/2505.04223v1.pdf
+
+DAIO_REQUESTER_PRIVATE_KEY=<funded-requester-key> \
+npm run ops:e2e:sepolia -- --mode direct --pdf samples/2505.04223v1.pdf --manual-start
+```
+
+Use `GET /requests/:requestId/chain-status` on content-service to read the
+current on-chain lifecycle even if local agent status rows are still catching
+up after restart.
 
 The `contracts` submodule also includes deployment and validation helpers for
 operators. `contracts/scripts/deploy-via-deployer.js` deploys a new DAIO system
@@ -441,6 +526,7 @@ For requester UX, the content-service also exposes a relayed USDAIO flow:
 
 - `POST /request-intents/usdaio` returns the exact EIP-712 `RequestIntent` payload for `PaymentRouter.createRequestWithUSDAIOBySig(...)`.
 - `POST /requests/relayed-document` accepts the requester signature and document, sends the relayed transaction with `CONTENT_RELAYER_PRIVATE_KEY`, verifies the emitted `RequestPaid` event and lifecycle requester, then stores the document.
+- `POST /requests/document-from-tx` recovers document storage from a successful payment transaction hash if the original relayed response was missed.
 
 The requester still pays the protocol fee from their own USDAIO balance through `PaymentRouter` allowance; the relayer only pays gas.
 
@@ -467,7 +553,7 @@ The agent code is split along the boundaries described in `REVIEWER_AGENT_INTERF
 
 State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a per-agent directory. Seeds are encrypted at rest with ChaCha20-Poly1305 keyed on the container-local `AGENT_STATE_KEY`. Production Docker Compose loads that key from the corresponding `.env.agent_N` file; the E2E orchestrator generates ephemeral state keys for its child processes.
 
-`AGENT_PRIVATE_KEY`, `AGENT_VRF_PRIVATE_KEY`, and `AGENT_STATE_KEY` are all 32-byte secret values, but they protect different domains: transaction authority, sortition proofs, and local commit-reveal seed encryption. A single value may satisfy the parser in a disposable test, but production deployments should use distinct values per agent and per purpose. The content-service relayer, when enabled, adds one more hot-wallet secret: `CONTENT_RELAYER_PRIVATE_KEY`.
+`AGENT_PRIVATE_KEY`, `AGENT_VRF_PRIVATE_KEY`, and `AGENT_STATE_KEY` are all 32-byte secret values, but they protect different domains: transaction authority, sortition proofs, and local commit-reveal seed encryption. A single value may satisfy the parser in a disposable test, but production deployments should use distinct values per agent and per purpose. The content-service relayer, when enabled, adds one more hot-wallet secret: `CONTENT_RELAYER_PRIVATE_KEY`. A keeper-enabled deployment can also set `DAIO_KEEPER_PRIVATE_KEY` so keeper gas spending is isolated from reviewer commit/reveal wallets.
 
 ## Known Limitations
 

@@ -21,6 +21,39 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MARKITDOWN_MAX_UPLOAD_BYTES", str(50 * 10
 MARKITDOWN = MarkItDown(enable_plugins=os.environ.get("MARKITDOWN_ENABLE_PLUGINS", "false").lower() in {"1", "true", "yes", "on"})
 
 
+def env_setting(names: Tuple[str, ...], fallback: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return fallback
+
+
+CORS_ALLOW_ORIGIN = env_setting(("MARKITDOWN_CORS_ALLOW_ORIGIN", "CORS_ALLOW_ORIGIN"), "*")
+CORS_ALLOW_METHODS = env_setting(("MARKITDOWN_CORS_ALLOW_METHODS", "CORS_ALLOW_METHODS"), "GET,POST,OPTIONS")
+CORS_ALLOW_HEADERS = env_setting(
+    ("MARKITDOWN_CORS_ALLOW_HEADERS", "CORS_ALLOW_HEADERS"),
+    "Content-Type,Authorization,X-Requested-With,X-Filename",
+)
+CORS_EXPOSE_HEADERS = env_setting(("MARKITDOWN_CORS_EXPOSE_HEADERS", "CORS_EXPOSE_HEADERS"), "Content-Length,Content-Type")
+CORS_MAX_AGE = env_setting(("MARKITDOWN_CORS_MAX_AGE", "CORS_MAX_AGE"), "86400")
+CORS_ALLOW_CREDENTIALS = os.environ.get("MARKITDOWN_CORS_ALLOW_CREDENTIALS", os.environ.get("CORS_ALLOW_CREDENTIALS", "false")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def allowed_origin(request_origin: str | None) -> str | None:
+    entries = [origin.strip() for origin in CORS_ALLOW_ORIGIN.split(",") if origin.strip()]
+    if "*" in entries:
+        return request_origin if CORS_ALLOW_CREDENTIALS else "*"
+    if request_origin and request_origin in entries:
+        return request_origin
+    return None
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: object) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -54,6 +87,28 @@ def maybe_convert_webp(path: str) -> Tuple[str, bool]:
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[markitdown] {self.address_string()} {fmt % args}", flush=True)
+
+    def end_headers(self) -> None:
+        origin = allowed_origin(self.headers.get("Origin"))
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            if origin != "*":
+                self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS)
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            self.headers.get("Access-Control-Request-Headers", CORS_ALLOW_HEADERS),
+        )
+        self.send_header("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)
+        self.send_header("Access-Control-Max-Age", CORS_MAX_AGE)
+        if CORS_ALLOW_CREDENTIALS:
+            self.send_header("Access-Control-Allow-Credentials", "true")
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:
         if self.path == "/health":

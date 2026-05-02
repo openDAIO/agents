@@ -60,7 +60,7 @@ agents/
     └── e2e/
         ├── deploy.ts                     # programmatic ethers deployment
         ├── hardhat.ts                    # spawn/teardown hardhat node
-        ├── sortition-prescreen.ts        # find a passing reviewer triple
+        ├── sortition-prescreen.ts        # find a passing reviewer committee
         ├── orchestrate.ts                # full E2E driver
         └── cli.ts                        # `npm run e2e` entrypoint
 ```
@@ -72,7 +72,7 @@ agents/
 3. Orchestrator spawns the content-service with a relayer key and prepares `samples/paper-001.md`. The service computes `keccak256(text)` when it builds the request intent and when it stores the verified document.
 4. Orchestrator mints USDAIO and pre-registers candidate reviewers (each with ENS, agent ID, its own derived VRF public key, and enough stake for the active request window). In Sepolia fork mode, it impersonates the deployed owner only inside the fork to disable ENS/ERC8004 reviewer gates and set the Fast tier to the E2E quorum/sortition config.
 5. Requester wallet approves the PaymentRouter, asks the content API for `/request-intents/usdaio`, signs the returned EIP-712 payload, and submits `/requests/relayed-document`. The content API calls `createRequestWithUSDAIOBySig(...)`, pays gas from the relayer wallet, stores the document, and leaves the on-chain requester as the requester wallet.
-6. Orchestrator pre-screens a five-agent committee by simulating local sortition at the predicted `phaseStartBlock`, checking quorum 3 under the configured review/audit election difficulties.
+6. Orchestrator pre-screens a five-agent committee by simulating local sortition at the predicted `phaseStartBlock`, checking quorum 4 under the configured review/audit election difficulties.
 7. Five reviewer-agent child processes are spawned, each given its private key, the deployment snapshot, the content-service URL, and a per-agent state directory. They subscribe to chain events.
 8. Orchestrator or the agent keeper loop calls `core.startNextRequest()`. The request advances to `ReviewCommit` and a `StatusChanged` event fires.
 9. Each agent reads the request's copied runtime config snapshot from DAIOCore storage, then independently runs the `Review` flow defined in [REVIEWER_AGENT_INTERFACES § 5.1](REVIEWER_AGENT_INTERFACES.md#5-end-to-end-runtime-flow): eligibility check → local sortition pre-check → fetch proposal → call LLM with `task=review` → validate → store canonical artifact → `commitReview(...)` → `revealReview(...)`.
@@ -110,7 +110,7 @@ mechanism,whichallowspipelinedprocessingofinferenceortrainingtransactions. ...
 | `proposalHash` | `0x48271267013cff731a3a8609192fe561ee69256a449d26794363b5b18a8f6a58` |
 | `rubricHash` | `0x2047e2d0856cc3f51b9cf3d7055c2e469d68d58609dafe553151c530a428cb4e` |
 | `requestId` | `1` |
-| `tier` | `Fast` (current E2E default: review election difficulty 8000/10000, audit election difficulty 10000/10000, quorum 3, audit-target limit 2) |
+| `tier` | `Fast` (current E2E default: review election difficulty 10000/10000, audit election difficulty 10000/10000, quorum 4, audit-target limit 3) |
 
 #### Reviewers chosen
 
@@ -255,7 +255,7 @@ Each agent only audited the canonical target returned by `AssignmentManager.veri
 | R2 (`0x976E…`) | 8500 | 9883 | 10000 | **9883** | **44.7352…** | true | false |
 | R3 (`0x90F7…`) | 8600 | 10000 | 10000 | **10000** | **45.2647…** | true | false |
 
-In the recorded legacy run, R1 was excluded by VRF sortition and the protocol still finalized with the configured quorum. Current E2E runs use five spawned agents, quorum 3, review difficulty 8000/10000, and audit difficulty 10000/10000.
+In the recorded legacy run, R1 was excluded by VRF sortition and the protocol still finalized with the configured quorum. Current E2E runs use five spawned agents, quorum 4, review difficulty 10000/10000, audit difficulty 10000/10000, and audit target limit 3.
 
 ### Verbatim orchestrator stdout
 
@@ -355,11 +355,12 @@ Run the deployed-contract Sepolia fork E2E:
 ```bash
 RPC_URL=https://sepolia.drpc.org \
 E2E_AGENT_COUNT=5 \
-E2E_QUORUM=3 \
+E2E_QUORUM=4 \
 E2E_REQUEST_COUNT=2 \
 E2E_MAX_ACTIVE_REQUESTS=2 \
-E2E_REVIEW_VRF_DIFFICULTY=8000 \
+E2E_REVIEW_VRF_DIFFICULTY=10000 \
 E2E_AUDIT_VRF_DIFFICULTY=10000 \
+E2E_AUDIT_TARGET_LIMIT=3 \
 DAIO_REVIEW_COMMIT_GAS_FLOOR=7000000 \
 DAIO_REVIEW_REVEAL_GAS_FLOOR=2000000 \
 DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
@@ -426,9 +427,9 @@ Both local and Sepolia fork E2E runs use `DAIOVRFCoordinator` + `FRAINVRFVerifie
 
 The legacy fixture VRF path is disabled unless `DAIO_ALLOW_FIXTURE_VRF=true` is set explicitly. Production and Sepolia fork runs should keep it disabled and provide `AGENT_VRF_PRIVATE_KEY`.
 
-The orchestrator's prescreen routine uses the same DAIO VRF message builder as the agents and verifies generated proofs through the deployed `FRAINVRFVerifier.randomnessFromProof(...)`. This avoids relying on coordinator state while choosing a five-agent committee for a predicted review `phaseStartBlock`. Audit sortition that depends on a future stable block is intentionally not forced during prescreen; the agents re-check audit eligibility at runtime through the deployed coordinator before sending audit commits.
+The orchestrator's prescreen routine uses the same DAIO VRF message builder as the agents and verifies generated proofs through the deployed `FRAINVRFVerifier.randomnessFromProof(...)`. This avoids relying on coordinator state while choosing a five-agent committee for a predicted review `phaseStartBlock`. Audit sortition that depends on a future stable block is intentionally not forced during prescreen; the agents re-check audit eligibility at runtime through the deployed coordinator before sending audit commits. For full-sortition deployments, agents first probe the no-proof audit path and fall back to target VRF proofs when attached to an older deployed AssignmentManager.
 
-For the current five-agent, quorum-three E2E, `reviewDiff=8000` and `auditDiff=10000` are the reliable validation defaults. A `6000/6000` stress run exercises the 60% VRF path, but it can legitimately miss audit quorum under real sortition and should be treated as an availability test, not a guaranteed finalization test.
+For the current five-agent, quorum-four E2E, `reviewDiff=10000`, `auditDiff=10000`, and `auditTargetLimit=3` are the reliable validation defaults. Lower-probability stress runs exercise VRF availability behavior, but they can legitimately miss quorum under real sortition and should not be treated as guaranteed finalization tests.
 
 ### Content service as the canonical store
 
@@ -471,7 +472,7 @@ State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a
 ## Known Limitations
 
 - The Sepolia fork E2E mutates fork-local state to register local test reviewers and set a deterministic Fast-tier E2E config. It does not send transactions to Sepolia and does not replace deployed contract code.
-- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 3 to leave margin under review sortition, while audit sortition is ultimately enforced at runtime.
+- `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime sortition checks. The E2E prescreen chooses five agents for quorum 4 under the current full-sortition profile, while audit sortition is ultimately enforced at runtime.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
 - `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested. In rare low-token responses the model can emit `reasoning_content` without final JSON `content`; use the documented token budget and `reasoning_effort=low`.
 

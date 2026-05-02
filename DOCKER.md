@@ -299,9 +299,9 @@ Optional deployment toggles:
 | `ENABLE_AUTO_CONVERT_HOOK` | `true` | deploy and wire Uniswap v4 auto-convert hook |
 
 The helper wires the same operational profile used by the current Sepolia
-deployment: `maxActiveRequests=2`, review quorum `3`, audit quorum `3`, review
-sortition `8000/10000`, audit sortition `10000/10000`, and Fast-tier audit
-target limit `2`.
+deployment: `maxActiveRequests=2`, review quorum `4`, audit quorum `4`, review
+sortition `10000/10000`, audit sortition `10000/10000`, and Fast-tier audit
+target limit `3`.
 
 After a new deployment, convert the printed addresses into
 `.deployments/sepolia.json`, update the public address fields in `.env.example`,
@@ -553,7 +553,7 @@ Agent logs should show contract-derived config. A healthy boot includes lines
 similar to:
 
 ```text
-config from contract storage finality=2 reviewDiff=8000 auditDiff=10000 auditTargetLimit=2
+config from contract storage finality=2 reviewDiff=10000 auditDiff=10000 auditTargetLimit=3
 ```
 
 If an agent exits immediately, check:
@@ -614,11 +614,12 @@ Optional Sepolia fork E2E validation against the deployed contract addresses:
 ```sh
 RPC_URL=<sepolia-rpc-url> \
 E2E_AGENT_COUNT=5 \
-E2E_QUORUM=3 \
+E2E_QUORUM=4 \
 E2E_REQUEST_COUNT=2 \
 E2E_MAX_ACTIVE_REQUESTS=2 \
-E2E_REVIEW_VRF_DIFFICULTY=8000 \
+E2E_REVIEW_VRF_DIFFICULTY=10000 \
 E2E_AUDIT_VRF_DIFFICULTY=10000 \
+E2E_AUDIT_TARGET_LIMIT=3 \
 DAIO_REVIEW_COMMIT_GAS_FLOOR=7000000 \
 DAIO_REVIEW_REVEAL_GAS_FLOOR=2000000 \
 DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
@@ -673,11 +674,11 @@ OPTIMIZER_RUNS=10 npx hardhat compile
 npx hardhat run scripts/generated-wallets-fork-e2e.js --network hardhat
 ```
 
-The reliable E2E finalization default is review VRF `8000/10000` and audit VRF
-`10000/10000`. Setting both review and audit difficulty to `6000` exercises a
-stricter 60% sortition path, but real audit VRF may legitimately miss quorum
-for a five-agent, quorum-three run. Treat that as a stress/availability
-scenario rather than a guaranteed success case.
+The reliable E2E finalization default is review VRF `10000/10000`, audit VRF
+`10000/10000`, quorum `4`, and Fast-tier audit target limit `3`. Lower
+sortition probabilities exercise availability behavior, but real VRF may
+legitimately miss quorum for a five-agent run. Treat those as
+stress/availability scenarios rather than guaranteed success cases.
 
 ## 12. API Flow
 

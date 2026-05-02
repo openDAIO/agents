@@ -21,10 +21,10 @@ const ROOT = path.resolve(here, "../..");
 
 const FAST = 0;
 const E2E_AGENT_COUNT = Number(process.env.E2E_AGENT_COUNT ?? "5");
-const E2E_QUORUM = Number(process.env.E2E_QUORUM ?? "3");
-const E2E_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_REVIEW_VRF_DIFFICULTY ?? "8000");
+const E2E_QUORUM = Number(process.env.E2E_QUORUM ?? "4");
+const E2E_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_REVIEW_VRF_DIFFICULTY ?? "10000");
 const E2E_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AUDIT_VRF_DIFFICULTY ?? "10000");
-const E2E_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AUDIT_TARGET_LIMIT ?? "2");
+const E2E_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AUDIT_TARGET_LIMIT ?? "3");
 const E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY ?? "1");
 const E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY ?? "1");
 const E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT ?? "1");

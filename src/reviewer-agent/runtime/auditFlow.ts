@@ -3,7 +3,7 @@ import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } 
 import { ContentServiceClient } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
-import { AUDIT_SORTITION, RequestStatus } from "../../shared/types.js";
+import { AUDIT_SORTITION, RequestStatus, SCALE } from "../../shared/types.js";
 import { buildAuditMessages } from "../llm/prompts.js";
 import { chat, extractJson } from "../llm/client.js";
 import { parseAudit } from "../llm/validate.js";
@@ -66,20 +66,38 @@ export async function runAudit(
   );
   if (targetProofs.length === 0) return { committed: false, reason: "no candidate targets" };
 
-  const verified = (await handles.assignmentManager.verifiedCanonicalAuditTargets(
-    await handles.vrfCoordinator.getAddress(),
-    vrf.publicKey,
-    coreAddress,
-    requestId,
-    wallet.address,
-    reviewers,
-    targetProofs,
-    auditEpoch,
-    startBlockBigInt,
-    finalityFactor,
-    auditElectionDifficulty,
-    auditTargetLimit,
-  )) as readonly [boolean, readonly string[]];
+  const vrfCoordinatorAddress = await handles.vrfCoordinator.getAddress();
+  const verifyTargets = (proofs: typeof targetProofs) =>
+    handles.assignmentManager.verifiedCanonicalAuditTargets(
+      vrfCoordinatorAddress,
+      vrf.publicKey,
+      coreAddress,
+      requestId,
+      wallet.address,
+      reviewers,
+      proofs,
+      auditEpoch,
+      startBlockBigInt,
+      finalityFactor,
+      auditElectionDifficulty,
+      auditTargetLimit,
+    ) as Promise<readonly [boolean, readonly string[]]>;
+
+  let commitTargetProofs = targetProofs;
+  let verified: readonly [boolean, readonly string[]];
+  if (auditElectionDifficulty >= SCALE) {
+    const fullSortition = await verifyTargets([]);
+    if (fullSortition[0] && fullSortition[1].length > 0) {
+      verified = fullSortition;
+      commitTargetProofs = [];
+      log("audit: full-sortition path detected; committing without target VRF proofs");
+    } else {
+      verified = await verifyTargets(targetProofs);
+      log("audit: deployed assignment manager requires target VRF proofs for full-sortition config");
+    }
+  } else {
+    verified = await verifyTargets(targetProofs);
+  }
   const ok = verified[0];
   const selectedTargets = verified[1].map((a) => getAddress(a));
   if (!ok || selectedTargets.length === 0) {
@@ -210,7 +228,7 @@ export async function runAudit(
   state.save(cur);
 
   const cr = handles.commitReveal.connect(deps.txSigner);
-  const commitArgs = [requestId, resultHash, BigInt(seed), targetProofs] as const;
+  const commitArgs = [requestId, resultHash, BigInt(seed), commitTargetProofs] as const;
   const gasLimit = await gasLimitWithHeadroom(
     cr.commitAudit,
     commitArgs,

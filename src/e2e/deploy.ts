@@ -42,7 +42,7 @@ export function tierConfig(opts: {
   auditRevealTimeout: number;
 }): unknown {
   const {
-    reviewElectionDifficulty = 8000,
+    reviewElectionDifficulty = 10000,
     auditElectionDifficulty = 10000,
     ...rest
   } = opts;
@@ -150,13 +150,13 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       FAST,
       tierConfig({
-        reviewElectionDifficulty: 8000,
+        reviewElectionDifficulty: 10000,
         auditElectionDifficulty: 10000,
-        reviewCommitQuorum: 3,
-        reviewRevealQuorum: 3,
-        auditCommitQuorum: 3,
-        auditRevealQuorum: 3,
-        auditTargetLimit: 2,
+        reviewCommitQuorum: 4,
+        reviewRevealQuorum: 4,
+        auditCommitQuorum: 4,
+        auditRevealQuorum: 4,
+        auditTargetLimit: 3,
         minIncomingAudit: 1,
         auditCoverageQuorum: 7000,
         contributionThreshold: 1000,

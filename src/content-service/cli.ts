@@ -6,6 +6,7 @@ const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
 const dbPath = process.env.CONTENT_DB_PATH ?? "./.data/content.sqlite";
 const deploymentPath = process.env.CONTENT_DEPLOYMENT_PATH ?? process.env.DAIO_DEPLOYMENT_PATH ?? "./.deployments/local.json";
 const rpcUrl = process.env.CONTENT_CHAIN_RPC_URL ?? process.env.RPC_URL;
+const rpcUrls = process.env.CONTENT_CHAIN_RPC_URLS ?? process.env.RPC_URLS;
 const relayerPrivateKey = process.env.CONTENT_RELAYER_PRIVATE_KEY ?? process.env.RELAYER_PRIVATE_KEY;
 const relayerConfirmations = Number(process.env.CONTENT_RELAYER_CONFIRMATIONS ?? "1");
 const requireAgentSignatures = !["0", "false", "no", "off"].includes(
@@ -15,7 +16,7 @@ const requireAgentSignatures = !["0", "false", "no", "off"].includes(
 const { app, db } = buildServer({
   dbPath,
   logger: process.env.CONTENT_SERVICE_LOG === "1",
-  chain: { deploymentPath, rpcUrl },
+  chain: { deploymentPath, rpcUrl, rpcUrls },
   relayer: {
     privateKey: relayerPrivateKey,
     confirmations: Number.isFinite(relayerConfirmations) && relayerConfirmations >= 0 ? relayerConfirmations : 1,

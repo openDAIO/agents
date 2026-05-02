@@ -318,6 +318,10 @@ Local E2E/content-service `.env` values:
 
 ```bash
 RPC_URL=https://sepolia.drpc.org
+RPC_URLS=https://sepolia.drpc.org,https://ethereum-sepolia-rpc.publicnode.com
+RPC_FAILOVER_STALL_TIMEOUT_MS=750
+RPC_FAILOVER_QUORUM=1
+RPC_FAILOVER_EVENT_QUORUM=1
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
 LLM_BASE_URL=http://100.94.8.47:8000/v1
@@ -332,6 +336,13 @@ CONTENT_SERVICE_HOST=127.0.0.1
 CONTENT_DB_PATH=./.data/content.sqlite
 CONTENT_REQUIRE_AGENT_SIGNATURES=true
 ```
+
+`RPC_URL` is the primary endpoint. `RPC_URLS` can add comma- or space-separated
+fallback endpoints; duplicate entries are ignored. Agents and the content
+service use an ethers `FallbackProvider` when more than one endpoint is
+configured. The default quorum is `1`, which favors availability for Sepolia
+operations; raise `RPC_FAILOVER_QUORUM` only when every configured endpoint is
+fast and independently reliable enough for multi-backend agreement.
 
 Run the full E2E:
 
@@ -355,6 +366,16 @@ DAIO_AUDIT_COMMIT_GAS_FLOOR=12000000 \
 DAIO_AUDIT_REVEAL_GAS_FLOOR=12000000 \
 npm run e2e:sepolia-fork
 ```
+
+The `contracts` submodule also includes deployment and validation helpers for
+operators. `contracts/scripts/deploy-via-deployer.js` deploys a new DAIO system
+through `DAIOSystemDeployer` when intentionally moving to a new contract set.
+`contracts/scripts/generated-wallets-fork-e2e.js` validates the already deployed
+Sepolia addresses on a local fork using generated reviewer wallet keys as both
+transaction keys and VRF keys, relayed USDAIO requests, real FRAIN VRF proofs,
+and round-ledger finalization. The Docker serving path still uses
+`.deployments/sepolia.json`; after any new contract deployment, update that
+snapshot before starting agents.
 
 Optional fork controls:
 

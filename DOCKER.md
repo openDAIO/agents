@@ -239,6 +239,60 @@ macOS encoding:
 base64 < .deployments/sepolia.json | tr -d '\n'
 ```
 
+### New Contract Deployment Path
+
+The current `contracts` submodule includes a staged deployment helper,
+`contracts/scripts/deploy-via-deployer.js`, backed by
+`contracts/contracts/deploy/DAIOSystemDeployer.sol`. Use this path when you are
+intentionally deploying a new DAIO contract set, not when you are only serving
+the already deployed Sepolia addresses.
+
+Compile with the production optimizer profile before deploying:
+
+```sh
+cd contracts
+npm ci
+OPTIMIZER_RUNS=10 npx hardhat compile
+```
+
+The 0.8.24 contracts compile with `runs=10`, `viaIR=true`, and
+`bytecodeHash=none`; the 0.6.12 wrapper compiler keeps `runs=200` from
+`hardhat.config.js`.
+
+Sepolia deployment requires a funded deployer key and the external integration
+addresses. The script already knows the current Sepolia defaults, but production
+operators should pass them explicitly when moving to a new environment:
+
+```sh
+SEPOLIA_RPC_URL=<sepolia-rpc-url> \
+PRIVATE_KEY=<deployer-private-key> \
+ENS_REGISTRY_ADDRESS=0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e \
+ERC8004_IDENTITY_REGISTRY=0x8004A818BFB912233c491871b3d84c89A494BD9e \
+ERC8004_REPUTATION_REGISTRY=0x8004B663056A597Dffe9eCcC1965A193B7388713 \
+UNIVERSAL_ROUTER_ADDRESS=0x3A9D48AB9751398BbFa63ad67599Bb04e4BdF98b \
+POOL_MANAGER_ADDRESS=0xE03A1074c86CFeDd5C142C4F04F1a1536e203543 \
+npx hardhat run scripts/deploy-via-deployer.js --network sepolia
+```
+
+Optional deployment toggles:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `ENABLE_ENS_VERIFIER` | `true` | deploy and wire ENS verifier |
+| `ENABLE_ERC8004_ADAPTER` | `true` | deploy and wire ERC-8004 adapter |
+| `ENABLE_AUTO_CONVERT_HOOK` | `true` | deploy and wire Uniswap v4 auto-convert hook |
+
+The helper wires the same operational profile used by the current Sepolia
+deployment: `maxActiveRequests=2`, review quorum `3`, audit quorum `3`, review
+sortition `8000/10000`, audit sortition `10000/10000`, and Fast-tier audit
+target limit `2`.
+
+After a new deployment, convert the printed addresses into
+`.deployments/sepolia.json`, update the public address fields in `.env.example`,
+rebuild the Docker image, and run Sepolia fork validation before serving
+traffic. The agent stack reads the deployment snapshot at runtime; it does not
+discover a new deployment automatically.
+
 ## 7. Configure `.env` and `.env.agent_*`
 
 Edit the shared `.env` on the EC2 host:
@@ -252,11 +306,21 @@ Shared chain/content fields:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `RPC_URL` | yes | Sepolia RPC used by content-service and deployment checks |
+| `RPC_URLS` | recommended | comma- or space-separated fallback RPC endpoints; `RPC_URL` is tried first |
+| `CONTENT_CHAIN_RPC_URLS` | optional | content-service-specific fallback list; defaults to `RPC_URLS` when omitted |
+| `RPC_FAILOVER_STALL_TIMEOUT_MS` | optional | delay before the next RPC backend is tried, default `750` |
+| `RPC_FAILOVER_QUORUM` | optional | backend response quorum, default `1` for availability |
+| `RPC_FAILOVER_EVENT_QUORUM` | optional | event polling quorum, default `1` |
+| `RPC_FAILOVER_EVENT_WORKERS` | optional | event backend workers, default `2` |
+| `RPC_FAILOVER_CACHE_TIMEOUT_MS` | optional | provider cache timeout, default `250` |
 | `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json`; compose also mounts this snapshot for agents |
 | `DAIO_DEPLOYMENT_JSON_B64` | optional | use only when overriding the mounted snapshot |
 
 Public deployment address fields in `.env.example` are documentation for
 operators and downstream services. Runtime services read the deployment snapshot.
+Treat RPC URLs with API keys as operational secrets. The bundled defaults use
+public endpoints for quick start only; production should provide at least two
+dedicated Sepolia RPC providers in `RPC_URLS`.
 
 Content API fields:
 
@@ -299,6 +363,10 @@ Per-agent chain/LLM fields:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `RPC_URL` | yes | Sepolia RPC used by this agent |
+| `RPC_URLS` | recommended | per-agent fallback RPC list; use endpoints owned by that operator |
+| `RPC_FAILOVER_STALL_TIMEOUT_MS` | optional | delay before trying the next RPC backend, default `750` |
+| `RPC_FAILOVER_QUORUM` | optional | backend response quorum, default `1` |
+| `RPC_FAILOVER_EVENT_QUORUM` | optional | event polling quorum, default `1` |
 | `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
 | `CONTENT_SERVICE_URL` | yes | overridden to `http://content-service:18002` by bundled compose |
 | `LLM_BASE_URL` | yes | OpenAI-compatible base URL chosen by this operator |
@@ -546,6 +614,49 @@ That command is a pre-production validation tool. It forks Sepolia locally and
 uses `./.deployments/sepolia.json` addresses without replacing deployed contract
 code. It is not the production serving process.
 
+The `contracts` submodule also provides a lower-level generated-wallet fork E2E
+that talks directly to the deployed Sepolia addresses on a local fork. Use it
+after generated reviewer wallets are registered, staked, funded, and registered
+with VRF public keys derived from the same wallet private keys. It validates the
+deployed payment router, relayed request path, real FRAIN VRF proof generation,
+review/audit commits and reveals, finalization, and round-ledger accounting
+without starting the off-chain agent containers. If production uses separate
+`AGENT_PRIVATE_KEY` and `AGENT_VRF_PRIVATE_KEY` values, prefer the agent-level
+`npm run e2e:sepolia-fork` path or adapt the contract helper before relying on
+it.
+
+Create a temporary shell-only env file outside version control:
+
+```sh
+cat > contracts/.env.generated-wallets-fork <<'EOF'
+HARDHAT_FORK_URL=<sepolia-rpc-url>
+DAIO_REQUESTER_PRIVATE_KEY=<requester-private-key-with-usdaio-approval>
+DAIO_RELAYER_PRIVATE_KEY=<relayer-private-key-with-sepolia-eth>
+DAIO_AGENT_1_ADDRESS=<registered-reviewer-1-address>
+DAIO_AGENT_1_PRIVATE_KEY=<registered-reviewer-1-private-key>
+DAIO_AGENT_2_ADDRESS=<registered-reviewer-2-address>
+DAIO_AGENT_2_PRIVATE_KEY=<registered-reviewer-2-private-key>
+DAIO_AGENT_3_ADDRESS=<registered-reviewer-3-address>
+DAIO_AGENT_3_PRIVATE_KEY=<registered-reviewer-3-private-key>
+DAIO_AGENT_4_ADDRESS=<registered-reviewer-4-address>
+DAIO_AGENT_4_PRIVATE_KEY=<registered-reviewer-4-private-key>
+DAIO_AGENT_5_ADDRESS=<registered-reviewer-5-address>
+DAIO_AGENT_5_PRIVATE_KEY=<registered-reviewer-5-private-key>
+EOF
+chmod 600 contracts/.env.generated-wallets-fork
+```
+
+Then run:
+
+```sh
+cd contracts
+set -a
+. ./.env.generated-wallets-fork
+set +a
+OPTIMIZER_RUNS=10 npx hardhat compile
+npx hardhat run scripts/generated-wallets-fork-e2e.js --network hardhat
+```
+
 The reliable E2E finalization default is review VRF `8000/10000` and audit VRF
 `10000/10000`. Setting both review and audit difficulty to `6000` exercises a
 stricter 60% sortition path, but real audit VRF may legitimately miss quorum
@@ -726,6 +837,21 @@ docker compose up -d
 docker compose ps
 ```
 
+That update path follows the submodule commits pinned by the parent repository.
+When intentionally moving to the latest upstream submodule commits, do it as a
+separate change and review the resulting contract delta before deployment:
+
+```sh
+git submodule update --remote --recursive
+git diff --submodule=log -- contracts tools/markitdown
+docker compose config --quiet
+docker compose build
+```
+
+If the `contracts` pointer changes, re-run Sepolia fork validation and confirm
+that `.deployments/sepolia.json` still matches the deployed contract set before
+restarting production services.
+
 Restart a single service:
 
 ```sh
@@ -791,6 +917,8 @@ Repository:
 - `git submodule status --recursive` reviewed.
 - `contracts` submodule matches the deployed ABI/spec.
 - `.deployments/sepolia.json` matches the deployed Sepolia contracts.
+- If the `contracts` submodule was advanced, contract delta was reviewed with
+  `git diff --submodule=log -- contracts`.
 
 Environment:
 
@@ -799,10 +927,14 @@ Environment:
 - `.env` permission set to `600`.
 - `.env.agent_*` permission set to `600`.
 - `RPC_URL` set.
+- `RPC_URLS` contains at least two production-grade Sepolia RPC endpoints when possible.
+- RPC provider allowlists include the EC2 public IP or NAT egress IP.
+- `RPC_FAILOVER_QUORUM=1` unless all configured RPC backends are fast enough for multi-backend agreement.
 - `DAIO_DEPLOYMENT_FILE=sepolia.json` set, or `DAIO_DEPLOYMENT_JSON_B64` set.
 - `CONTENT_RELAYER_PRIVATE_KEY` set if relayed request creation is enabled.
 - `CONTENT_REQUIRE_AGENT_SIGNATURES=true`.
 - Each `.env.agent_N` has `RPC_URL`, `LLM_BASE_URL`, `LLM_MODEL`, timeout, max tokens, and char budget set.
+- Each `.env.agent_N` has `RPC_URLS` set to that agent operator's allowed RPC fallback list.
 - Each `.env.agent_N` has a distinct `AGENT_STATE_KEY`.
 - Each `.env.agent_N` has its own `AGENT_PRIVATE_KEY`.
 - Each `.env.agent_N` has its own `AGENT_VRF_PRIVATE_KEY`.
@@ -832,6 +964,8 @@ Boot:
 - MarkItDown sample conversion succeeds.
 - LLM smoke call succeeds.
 - Agent logs show contract-derived config and no VRF mismatch.
+- Optional generated-wallet Sepolia fork E2E passes after live reviewer wallets
+  are registered, staked, funded, and approved for the test flow.
 
 Serving:
 

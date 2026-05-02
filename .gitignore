@@ -21,6 +21,7 @@ samples/*.md
 .env
 .env.agent
 .env.agent_*
+.env.agent.raw_sample
 .env.local
 .env.*.local
 !.env.agent.example

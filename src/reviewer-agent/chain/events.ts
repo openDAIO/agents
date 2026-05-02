@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { Contract, EventLog, JsonRpcProvider } from "ethers";
+import type { Contract, EventLog, Provider } from "ethers";
 import { RequestStatus } from "../../shared/types.js";
 
 export interface PhaseChange {
@@ -28,7 +28,7 @@ export interface FinalizedEvent {
 }
 
 export class CoreEventStream extends EventEmitter {
-  private readonly provider: JsonRpcProvider;
+  private readonly provider: Provider;
   private readonly core: Contract;
   private polling = false;
   private lastBlock = 0;
@@ -36,7 +36,7 @@ export class CoreEventStream extends EventEmitter {
   private readonly phases: Map<string, PhaseChange[]> = new Map();
   private readonly reveals: Map<string, ReviewReveal[]> = new Map();
 
-  constructor(provider: JsonRpcProvider, core: Contract) {
+  constructor(provider: Provider, core: Contract) {
     super();
     this.provider = provider;
     this.core = core;

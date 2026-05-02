@@ -7,7 +7,7 @@ import { agentStatusMessage } from "../../shared/agent-signing.js";
 import { runReview, runReviewReveal, type ReviewFlowDeps } from "./reviewFlow.js";
 import { runAudit, runAuditReveal, type AuditFlowDeps } from "./auditFlow.js";
 import type { StateStore } from "./state.js";
-import type { JsonRpcProvider } from "ethers";
+import type { Provider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
 import {
   resolveRequestRuntimeConfig,
@@ -23,6 +23,7 @@ export interface AgentConfig {
   auditElectionDifficulty: bigint;
   auditTargetLimit: bigint;
   autoStartRequests?: boolean;
+  eventPollIntervalMs?: number;
   startRequestsMaxPerTick?: number;
   startRequestsMinIntervalMs?: number;
   startRequestsJitterMs?: number;
@@ -95,7 +96,7 @@ export class ReviewerAgent {
   private lastRefillAt = 0;
 
   constructor(
-    private readonly provider: JsonRpcProvider,
+    private readonly provider: Provider,
     private readonly wallet: Wallet,
     private readonly handles: ContractHandles,
     private readonly content: ContentServiceClient,
@@ -167,8 +168,9 @@ export class ReviewerAgent {
       void this.handlePhaseChange(e as PhaseChange);
     });
     await this.logStartupChainConfig();
-    await this.events.start();
-    this.log(`started; watching events`);
+    const eventPollIntervalMs = Math.max(100, this.cfg.eventPollIntervalMs ?? 500);
+    await this.events.start(undefined, eventPollIntervalMs);
+    this.log(`started; watching events pollIntervalMs=${eventPollIntervalMs}`);
     this.scheduleActiveRefill("startup");
   }
 

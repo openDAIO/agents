@@ -8,7 +8,7 @@ import { JsonRpcProvider, JsonRpcSigner, NonceManager, Wallet, ZeroAddress, getA
 import { startHardhatNode, HARDHAT_PRIV_KEYS } from "./hardhat.js";
 import { deployAll, tierConfig } from "./deploy.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
-import { registerReviewerIfNeeded } from "../reviewer-agent/chain/registration.js";
+import type { RegisterParams } from "../reviewer-agent/chain/registration.js";
 import { preScreenCommittee } from "./sortition-prescreen.js";
 import { ContentServiceClient } from "../shared/content-client.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
@@ -34,16 +34,29 @@ const E2E_LLM_MAX_TOKENS = "2048";
 const E2E_LLM_PROPOSAL_CHAR_BUDGET = "16000";
 const E2E_MAX_ACTIVE_REQUESTS = Number(process.env.E2E_MAX_ACTIVE_REQUESTS ?? process.env.DAIO_MAX_ACTIVE_REQUESTS ?? "2");
 const E2E_REQUEST_COUNT = Number(process.env.E2E_REQUEST_COUNT ?? "2");
+const E2E_EVENT_POLL_INTERVAL_MS = Number(process.env.E2E_EVENT_POLL_INTERVAL_MS ?? "500");
+const E2E_AGENT_EVENT_POLL_INTERVAL_MS = Number(process.env.E2E_AGENT_EVENT_POLL_INTERVAL_MS ?? E2E_EVENT_POLL_INTERVAL_MS);
 const E2E_AGENT_AUTO_START_REQUESTS = booleanEnv(process.env.E2E_AGENT_AUTO_START_REQUESTS, false);
 const E2E_CHAIN_MODE = process.env.E2E_CHAIN_MODE ?? (booleanEnv(process.env.E2E_SEPOLIA_FORK, false) ? "sepolia-fork" : "local");
 const E2E_SEPOLIA_DEPLOYMENT_PATH = path.resolve(
   ROOT,
   process.env.E2E_SEPOLIA_DEPLOYMENT_PATH ?? ".deployments/sepolia.json",
 );
+const E2E_SEPOLIA_FORK_BLOCK_RAW =
+  process.env.E2E_SEPOLIA_FORK_BLOCK?.trim() ? process.env.E2E_SEPOLIA_FORK_BLOCK : process.env.HARDHAT_FORK_BLOCK;
 const E2E_SEPOLIA_FORK_BLOCK =
-  process.env.E2E_SEPOLIA_FORK_BLOCK && process.env.E2E_SEPOLIA_FORK_BLOCK.trim() !== ""
-    ? Number(process.env.E2E_SEPOLIA_FORK_BLOCK)
+  E2E_SEPOLIA_FORK_BLOCK_RAW && E2E_SEPOLIA_FORK_BLOCK_RAW.trim() !== ""
+    ? Number(E2E_SEPOLIA_FORK_BLOCK_RAW)
     : undefined;
+
+interface ExternalE2EAccounts {
+  requesterKey: string;
+  relayerKey: string;
+  agentKeys: string[];
+  agentVrfKeys: string[];
+  agentIds: bigint[];
+  ensNames: string[];
+}
 
 interface RunResult {
   ok: boolean;
@@ -61,6 +74,54 @@ function booleanEnv(raw: string | undefined, fallback: boolean): boolean {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   throw new Error(`invalid boolean env value: ${raw}`);
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required for external-account E2E`);
+  return value;
+}
+
+function optionalEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function assertAddressMatchesKey(label: string, privateKey: string, expectedAddress?: string): void {
+  if (!expectedAddress) return;
+  const actual = new Wallet(privateKey).address;
+  if (getAddress(expectedAddress) !== actual) {
+    throw new Error(`${label} address does not match its configured private key`);
+  }
+}
+
+function loadExternalE2EAccounts(agentCount: number): ExternalE2EAccounts | undefined {
+  const hasExternalAccounts = Boolean(
+    optionalEnv("DAIO_REQUESTER_PRIVATE_KEY") ||
+      optionalEnv("DAIO_RELAYER_PRIVATE_KEY") ||
+      optionalEnv("DAIO_AGENT_1_PRIVATE_KEY"),
+  );
+  if (!hasExternalAccounts) return undefined;
+
+  const requesterKey = requireEnv("DAIO_REQUESTER_PRIVATE_KEY");
+  const relayerKey = requireEnv("DAIO_RELAYER_PRIVATE_KEY");
+  assertAddressMatchesKey("DAIO_REQUESTER", requesterKey, optionalEnv("DAIO_REQUESTER_ADDRESS"));
+  assertAddressMatchesKey("DAIO_RELAYER", relayerKey, optionalEnv("DAIO_RELAYER_ADDRESS"));
+
+  const agentKeys: string[] = [];
+  const agentVrfKeys: string[] = [];
+  const agentIds: bigint[] = [];
+  const ensNames: string[] = [];
+  for (let i = 1; i <= agentCount; i++) {
+    const key = requireEnv(`DAIO_AGENT_${i}_PRIVATE_KEY`);
+    assertAddressMatchesKey(`DAIO_AGENT_${i}`, key, optionalEnv(`DAIO_AGENT_${i}_ADDRESS`));
+    agentKeys.push(key);
+    agentVrfKeys.push(optionalEnv(`DAIO_AGENT_${i}_VRF_PRIVATE_KEY`) ?? key);
+    agentIds.push(BigInt(optionalEnv(`DAIO_AGENT_${i}_AGENT_ID`) ?? String(1000 + i)));
+    ensNames.push(optionalEnv(`DAIO_AGENT_${i}_ENS_NAME`) ?? `reviewer-${i}.daio.eth`);
+  }
+
+  return { requesterKey, relayerKey, agentKeys, agentVrfKeys, agentIds, ensNames };
 }
 
 async function startContentService(relayerKey?: string): Promise<{
@@ -160,6 +221,10 @@ function quantityHex(value: bigint): string {
   return `0x${value.toString(16)}`;
 }
 
+async function setForkEthBalance(provider: JsonRpcProvider, address: string, amount = parseEther("100")): Promise<void> {
+  await provider.send("hardhat_setBalance", [getAddress(address), quantityHex(amount)]);
+}
+
 async function impersonateAccount(provider: JsonRpcProvider, address: string): Promise<NonceManager> {
   const account = getAddress(address);
   await provider.send("hardhat_impersonateAccount", [account]);
@@ -172,6 +237,7 @@ async function prepareSepoliaForkState(input: {
   deployment: DeploymentSnapshot;
   candidateKeys: string[];
   requesterKey: string;
+  relayerKey?: string;
   localFunderKey: string;
   reviewerStake: bigint;
 }): Promise<void> {
@@ -223,11 +289,52 @@ async function prepareSepoliaForkState(input: {
   const funder = new NonceManager(new Wallet(input.localFunderKey, input.provider));
   const funderHandles = loadContracts(input.deployment, funder);
   const requester = new Wallet(input.requesterKey);
+  await setForkEthBalance(input.provider, requester.address);
+  if (input.relayerKey) await setForkEthBalance(input.provider, new Wallet(input.relayerKey).address);
+  for (const key of input.candidateKeys) {
+    await setForkEthBalance(input.provider, new Wallet(key).address);
+  }
   await (await funderHandles.usdaio.mint(requester.address, parseEther("1000"))).wait();
   for (const key of input.candidateKeys) {
     await (await funderHandles.usdaio.mint(new Wallet(key).address, input.reviewerStake)).wait();
   }
   process.stdout.write(`[orchestrate] sepolia fork: minted USDAIO to local requester and reviewer wallets\n`);
+}
+
+async function ensureReviewerRegisteredForE2E(
+  handles: ReturnType<typeof loadContracts>,
+  wallet: Wallet,
+  params: RegisterParams,
+): Promise<{ updated: boolean; txHash?: string }> {
+  const targetStake = params.stakeAmount ?? parseEther("1000");
+  const reviewerInfo = await handles.reviewerRegistry.getReviewer(wallet.address);
+  const registered = Boolean(reviewerInfo[0]);
+  const currentStake = BigInt(reviewerInfo[4] as bigint | number);
+  const registeredVrf = (await handles.reviewerRegistry.vrfPublicKey(wallet.address)) as readonly [bigint, bigint];
+  const vrfMatches = registeredVrf[0] === params.vrfPublicKey[0] && registeredVrf[1] === params.vrfPublicKey[1];
+
+  if (registered && currentStake >= targetStake && vrfMatches) {
+    return { updated: false };
+  }
+
+  const stakeDelta = currentStake < targetStake ? targetStake - currentStake : 1n;
+  const managed = new NonceManager(wallet);
+  const stakeVaultAddr = await handles.stakeVault.getAddress();
+  const allowance = (await handles.usdaio.allowance(wallet.address, stakeVaultAddr)) as bigint;
+  if (allowance < stakeDelta) {
+    await (await handles.usdaio.connect(managed).approve(stakeVaultAddr, stakeDelta)).wait();
+  }
+
+  const tx = await handles.reviewerRegistry.connect(managed).registerReviewer(
+    params.ensName,
+    id(params.ensName),
+    params.agentId,
+    params.domainMask,
+    params.vrfPublicKey,
+    stakeDelta,
+  );
+  const receipt = await tx.wait();
+  return { updated: true, txHash: receipt?.hash };
 }
 
 function spawnAgent(opts: {
@@ -244,6 +351,7 @@ function spawnAgent(opts: {
   auditElectionDifficulty: bigint;
   auditTargetLimit: bigint;
   vrfPrivkey: string;
+  eventPollIntervalMs: number;
 }): ChildProcess {
   const child = spawn(
     "npx",
@@ -276,6 +384,8 @@ function spawnAgent(opts: {
       opts.auditTargetLimit.toString(),
       "--vrf-privkey",
       opts.vrfPrivkey,
+      "--event-poll-interval-ms",
+      opts.eventPollIntervalMs.toString(),
     ],
     {
       cwd: ROOT,
@@ -286,6 +396,11 @@ function spawnAgent(opts: {
         LLM_MAX_TOKENS: process.env.E2E_LLM_MAX_TOKENS ?? E2E_LLM_MAX_TOKENS,
         LLM_PROPOSAL_CHAR_BUDGET: process.env.E2E_LLM_PROPOSAL_CHAR_BUDGET ?? E2E_LLM_PROPOSAL_CHAR_BUDGET,
         DAIO_AUTO_START_REQUESTS: String(E2E_AGENT_AUTO_START_REQUESTS),
+        DAIO_EVENT_POLL_INTERVAL_MS: opts.eventPollIntervalMs.toString(),
+        DAIO_REVIEW_COMMIT_GAS_FLOOR: process.env.DAIO_REVIEW_COMMIT_GAS_FLOOR ?? "7000000",
+        DAIO_REVIEW_REVEAL_GAS_FLOOR: process.env.DAIO_REVIEW_REVEAL_GAS_FLOOR ?? "2000000",
+        DAIO_AUDIT_COMMIT_GAS_FLOOR: process.env.DAIO_AUDIT_COMMIT_GAS_FLOOR ?? "12000000",
+        DAIO_AUDIT_REVEAL_GAS_FLOOR: process.env.DAIO_AUDIT_REVEAL_GAS_FLOOR ?? "12000000",
       },
     },
   );
@@ -302,7 +417,7 @@ async function awaitFinalized(
   timeoutMs = 600_000,
 ): Promise<{ score: bigint; confidence: bigint }> {
   const events = new CoreEventStream(provider, core);
-  await events.start();
+  await events.start(undefined, E2E_EVENT_POLL_INTERVAL_MS);
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       events.stop();
@@ -388,6 +503,12 @@ async function main(): Promise<RunResult> {
   if (!Number.isInteger(E2E_REQUEST_COUNT) || E2E_REQUEST_COUNT <= 0) {
     throw new Error("E2E_REQUEST_COUNT must be a positive integer");
   }
+  if (!Number.isInteger(E2E_EVENT_POLL_INTERVAL_MS) || E2E_EVENT_POLL_INTERVAL_MS < 100) {
+    throw new Error("E2E_EVENT_POLL_INTERVAL_MS must be an integer >= 100");
+  }
+  if (!Number.isInteger(E2E_AGENT_EVENT_POLL_INTERVAL_MS) || E2E_AGENT_EVENT_POLL_INTERVAL_MS < 100) {
+    throw new Error("E2E_AGENT_EVENT_POLL_INTERVAL_MS must be an integer >= 100");
+  }
   process.stdout.write(`[orchestrate] starting E2E\n`);
 
   // 1. Hardhat node
@@ -407,11 +528,18 @@ async function main(): Promise<RunResult> {
   // signers: 0=owner, 1=treasury, 2=requester, 3.. candidate reviewers.
   // Register the full local candidate pool, then spawn a deterministic 5-agent
   // committee that satisfies quorum=3 under the configured review/audit sortition.
+  const externalAccounts = loadExternalE2EAccounts(E2E_AGENT_COUNT);
+  if (externalAccounts) {
+    process.stdout.write(`[orchestrate] using ${externalAccounts.agentKeys.length} external E2E agent accounts from environment\n`);
+  }
   const ownerKey = HARDHAT_PRIV_KEYS[0]!;
-  const treasuryKey = HARDHAT_PRIV_KEYS[1]!;
-  const requesterKey = HARDHAT_PRIV_KEYS[2]!;
-  const candidateKeys = HARDHAT_PRIV_KEYS.slice(3);
-  const candidateVrfKeys = candidateKeys.map((_, i) => `0x${BigInt(i + 1).toString(16).padStart(64, "0")}`);
+  const treasuryKey = externalAccounts?.relayerKey ?? HARDHAT_PRIV_KEYS[1]!;
+  const requesterKey = externalAccounts?.requesterKey ?? HARDHAT_PRIV_KEYS[2]!;
+  const candidateKeys = externalAccounts?.agentKeys ?? HARDHAT_PRIV_KEYS.slice(3);
+  const candidateVrfKeys =
+    externalAccounts?.agentVrfKeys ?? candidateKeys.map((_, i) => `0x${BigInt(i + 1).toString(16).padStart(64, "0")}`);
+  const candidateAgentIds = externalAccounts?.agentIds ?? candidateKeys.map((_, i) => BigInt(1001 + i));
+  const candidateEnsNames = externalAccounts?.ensNames ?? candidateKeys.map((_, i) => `reviewer-${i + 1}.daio.eth`);
 
   // 2. Deploy locally or attach to deployed Sepolia addresses on a local fork.
   let deployment: DeploymentSnapshot;
@@ -471,6 +599,7 @@ async function main(): Promise<RunResult> {
       deployment,
       candidateKeys,
       requesterKey,
+      relayerKey: treasuryKey,
       localFunderKey: ownerKey,
       reviewerStake,
     });
@@ -478,10 +607,10 @@ async function main(): Promise<RunResult> {
 
   for (let i = 0; i < candidateKeys.length; i++) {
     const wallet = new Wallet(candidateKeys[i]!, provider);
-    const ensName = `reviewer-${i + 1}.daio.eth`;
-    await registerReviewerIfNeeded(handles, wallet, {
+    const ensName = candidateEnsNames[i]!;
+    await ensureReviewerRegisteredForE2E(handles, wallet, {
       ensName,
-      agentId: BigInt(1001 + i),
+      agentId: candidateAgentIds[i]!,
       domainMask: DOMAIN_RESEARCH,
       vrfPublicKey: candidateVrfProviders[i]!.publicKey,
       stakeAmount: reviewerStake,
@@ -618,13 +747,14 @@ async function main(): Promise<RunResult> {
       deploymentPath,
       stateDir: path.join(runStateRoot, `agent-${i + 1}`),
       stateKey: `0x${crypto.randomBytes(32).toString("hex")}`,
-      agentId: BigInt(1001 + idx),
-      ensName: `reviewer-${idx + 1}.daio.eth`,
+      agentId: candidateAgentIds[idx]!,
+      ensName: candidateEnsNames[idx]!,
       label: `R${i + 1}`,
       reviewElectionDifficulty: E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY,
       auditElectionDifficulty: E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY,
       auditTargetLimit: E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT,
       vrfPrivkey: candidateVrfKeys[idx]!,
+      eventPollIntervalMs: E2E_AGENT_EVENT_POLL_INTERVAL_MS,
     });
     agentChildren.push(child);
     process.stdout.write(`[orchestrate] spawned agent R${i + 1} for ${wallet.address}\n`);

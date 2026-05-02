@@ -1,4 +1,4 @@
-import { AbiCoder, keccak256, toBeHex, type JsonRpcProvider } from "ethers";
+import { AbiCoder, keccak256, toBeHex, type Provider } from "ethers";
 import type { ContractHandles } from "../chain/contracts.js";
 
 export interface RuntimeConfig {
@@ -29,7 +29,7 @@ function mappingSlot(key: bigint, slot: bigint): bigint {
   return BigInt(keccak256(ABI_CODER.encode(["uint256", "uint256"], [key, slot])));
 }
 
-async function storageWord(provider: JsonRpcProvider, address: string, slot: bigint): Promise<bigint> {
+async function storageWord(provider: Provider, address: string, slot: bigint): Promise<bigint> {
   return BigInt(await provider.getStorage(address, toBeHex(slot, 32)));
 }
 
@@ -43,7 +43,7 @@ function decodeRuntimeConfigWord(word: bigint): RuntimeConfig {
 }
 
 async function resolveFromStorage(
-  provider: JsonRpcProvider,
+  provider: Provider,
   handles: ContractHandles,
   slot: bigint,
   fallback: RuntimeConfig,
@@ -66,7 +66,7 @@ async function resolveFromStorage(
 }
 
 export async function resolveTierRuntimeConfig(
-  provider: JsonRpcProvider,
+  provider: Provider,
   handles: ContractHandles,
   tier: bigint,
   fallback: RuntimeConfig,
@@ -75,7 +75,7 @@ export async function resolveTierRuntimeConfig(
 }
 
 export async function resolveRequestRuntimeConfig(
-  provider: JsonRpcProvider,
+  provider: Provider,
   handles: ContractHandles,
   requestId: bigint,
   fallback: RuntimeConfig,

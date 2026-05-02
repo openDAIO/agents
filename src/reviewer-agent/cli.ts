@@ -25,6 +25,7 @@ async function main() {
       "agent-id": { type: "string" },
       "ens-name": { type: "string" },
       "vrf-privkey": { type: "string" },
+      "event-poll-interval-ms": { type: "string" },
       "review-election-difficulty": { type: "string" },
       "audit-election-difficulty": { type: "string" },
       "audit-target-limit": { type: "string" },
@@ -87,7 +88,7 @@ async function main() {
   };
 
   const deployment = JSON.parse(readFileSync(deploymentPath as string, "utf8")) as DeploymentSnapshot;
-  const ctx = makeChainContext(rpc as string, privkey as string);
+  const ctx = makeChainContext(rpc as string, privkey as string, process.env.RPC_URLS);
   const handles = loadContracts(deployment, ctx.wallet);
   const content = new ContentServiceClient(contentUrl as string);
   const state = StateStore.fromKey(stateDir as string, stateKey as string);
@@ -160,6 +161,12 @@ async function main() {
           "DAIO_AUTO_START_REQUESTS",
           true,
         ),
+    eventPollIntervalMs: integerSetting(
+      values["event-poll-interval-ms"] as string | undefined,
+      "DAIO_EVENT_POLL_INTERVAL_MS",
+      500,
+      100,
+    ),
     startRequestsMaxPerTick: integerSetting(
       values["start-requests-max-per-tick"] as string | undefined,
       "DAIO_START_REQUESTS_MAX_PER_TICK",

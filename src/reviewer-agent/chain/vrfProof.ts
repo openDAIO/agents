@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { AbiCoder, ZeroAddress, ZeroHash, type JsonRpcProvider } from "ethers";
+import { AbiCoder, ZeroAddress, ZeroHash, type Provider } from "ethers";
 import { secp256k1 } from "@noble/curves/secp256k1";
 
 export type VrfProof = [bigint, bigint, bigint, bigint];
@@ -102,7 +102,7 @@ function randomScalar(): bigint {
   }
 }
 
-export async function daioVrfMessage(provider: JsonRpcProvider, input: VrfProofInput): Promise<Uint8Array> {
+export async function daioVrfMessage(provider: Provider, input: VrfProofInput): Promise<Uint8Array> {
   const network = await provider.getNetwork();
   const stableBlock = input.phaseStartBlock > input.finalityFactor ? input.phaseStartBlock - input.finalityFactor : 0n;
   let stableBlockHash = ZeroHash;
@@ -137,7 +137,7 @@ export function makeFixtureVrfProvider(publicKey: VrfPublicKey, proof: VrfProof)
   };
 }
 
-export function makeSecp256k1VrfProvider(privateKey: string, provider: JsonRpcProvider): VrfProofProvider {
+export function makeSecp256k1VrfProvider(privateKey: string, provider: Provider): VrfProofProvider {
   const scalar = parseScalar(privateKey);
   const publicKey = pointTuple(secp256k1.ProjectivePoint.BASE.multiply(scalar).toAffine());
   return {

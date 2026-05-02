@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { existsSync, readFileSync } from "node:fs";
-import { getAddress, Interface, JsonRpcProvider, NonceManager, Wallet, keccak256, toUtf8Bytes } from "ethers";
+import { getAddress, Interface, NonceManager, Wallet, keccak256, toUtf8Bytes, type Provider } from "ethers";
 import { z } from "zod";
 import { ContentDB } from "./db.js";
 import { ReviewArtifact, AuditArtifact } from "../shared/schemas.js";
@@ -10,12 +10,14 @@ import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { RequestStatus, Tier } from "../shared/types.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
+import { makeRpcProvider, parseRpcUrls, rpcFailoverOptionsFromEnv } from "../shared/rpc.js";
 
 export interface ServerOptions {
   dbPath: string;
   logger?: boolean;
   chain?: {
     rpcUrl?: string;
+    rpcUrls?: string;
     deploymentPath?: string;
   };
   relayer?: {
@@ -274,12 +276,11 @@ async function verifyRequestTransaction(input: {
   textHash: string;
   deploymentPath: string;
   rpcUrl?: string;
+  rpcUrls?: string;
 }) {
   const deployment = loadDeploymentSnapshot(input.deploymentPath);
-  const rpcUrl = input.rpcUrl ?? deployment.rpcUrl;
-  if (!rpcUrl) throw new Error("chain rpc url not configured");
-
-  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+  const rpcUrls = parseRpcUrls(input.rpcUrl ?? deployment.rpcUrl, input.rpcUrls);
+  const provider = makeRpcProvider(rpcUrls, rpcFailoverOptionsFromEnv());
   const paymentRouterAddress = getAddress(deployment.contracts.paymentRouter);
   const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
   const receipt = await provider.getTransactionReceipt(input.txHash);
@@ -402,15 +403,15 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   const app = Fastify({ logger: opts.logger ?? false, bodyLimit: 25 * 1024 * 1024 });
   const deploymentPath = opts.chain?.deploymentPath ?? "./.deployments/local.json";
   const rpcUrl = opts.chain?.rpcUrl;
+  const rpcUrls = opts.chain?.rpcUrls;
   const requireAgentSignatures = opts.requireAgentSignatures ?? true;
-  let relayerProvider: JsonRpcProvider | undefined;
+  let relayerProvider: Provider | undefined;
   let relayerSigner: NonceManager | undefined;
 
-  function chainProvider(): JsonRpcProvider {
+  function chainProvider(): Provider {
     const deployment = loadDeploymentSnapshot(deploymentPath);
-    const url = rpcUrl ?? deployment.rpcUrl;
-    if (!url) throw new Error("chain rpc url not configured");
-    relayerProvider ??= new JsonRpcProvider(url, undefined, { staticNetwork: true });
+    const urls = parseRpcUrls(rpcUrl ?? deployment.rpcUrl, rpcUrls);
+    relayerProvider ??= makeRpcProvider(urls, rpcFailoverOptionsFromEnv());
     return relayerProvider;
   }
 
@@ -584,6 +585,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
         textHash: normalized.proposalHash,
         deploymentPath,
         rpcUrl,
+        rpcUrls,
       });
     } catch (err) {
       reply.code(503);
@@ -763,6 +765,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
         textHash: hash,
         deploymentPath,
         rpcUrl,
+        rpcUrls,
       });
     } catch (err) {
       reply.code(503);

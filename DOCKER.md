@@ -210,6 +210,12 @@ local health endpoints:
 bash scripts/ops/start-sepolia-stack.sh
 ```
 
+That clone/scp/start path is the intended production path for full Sepolia API
+serving. With `CONTENT_RELAYER_PRIVATE_KEY` set and funded, it enables relayed
+request creation, direct document submission, canonical Markdown reads,
+status/reason reads, signed report/audit/status writes, MarkItDown conversion,
+and all five reviewer agents.
+
 ## 6. Deployment Snapshot
 
 The production Sepolia snapshot is committed as:
@@ -817,6 +823,11 @@ MARKITDOWN_BIND=<tailscale-ip>
 For public traffic, prefer a reverse proxy or API gateway with TLS,
 authentication, rate limits, and upload limits. Keep MarkItDown private unless a
 trusted caller requires direct access.
+
+Browser frontends should call the content API through the same HTTPS origin when
+possible. If the frontend is hosted on a different origin, add the required CORS
+headers in the reverse proxy or API gateway; the bundled content-service and
+MarkItDown containers do not add CORS headers themselves.
 
 Minimal Nginx shape for the content API:
 

@@ -11,6 +11,60 @@ DAIO agent stack. It serves the current deployment in
 - one local SQLite content database
 - one local state directory per agent
 
+For full API serving, including requester-sponsored relayed requests, provide:
+
+- `.env` with Sepolia RPCs, `CONTENT_RELAYER_PRIVATE_KEY`, content-service
+  settings, and MarkItDown settings
+- `.env.agent_1` through `.env.agent_5`, one independent reviewer config per
+  agent
+- five registered/staked reviewer wallets with matching VRF keys
+- one funded relayer wallet for the content-service relayed-request API
+
+## 0. One-Page Deployment Path
+
+On a fresh EC2 host:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git ca-certificates curl gnupg
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"
+newgrp docker
+
+git clone --recursive git@github.com:openDAIO/agents.git daio-agents
+cd daio-agents
+git submodule update --init --recursive
+```
+
+From the operator workstation, copy only the secret env files into the checkout:
+
+```sh
+scp .env .env.agent_1 .env.agent_2 .env.agent_3 .env.agent_4 .env.agent_5 \
+  ubuntu@<ec2-ip>:~/daio-agents/
+```
+
+Then start the Sepolia production stack:
+
+```sh
+cd ~/daio-agents
+chmod 600 .env .env.agent_*
+bash scripts/ops/start-sepolia-stack.sh
+```
+
+The script validates env files, builds Docker images, starts `content-service`,
+`markitdown`, and `agent-1..5`, then checks local health endpoints. Use:
+
+```sh
+docker compose --env-file .env ps
+docker compose --env-file .env logs -f content-service
+docker compose --env-file .env logs -f agent-1
+```
+
+If the frontend is public, keep `CONTENT_SERVICE_BIND=127.0.0.1` and expose the
+content API through HTTPS reverse proxy/API gateway. Only bind service ports to
+`0.0.0.0` or a private interface when the EC2 security group already restricts
+the source addresses.
+
 ## 1. Install Docker On EC2
 
 Use Ubuntu 22.04 or 24.04. The five-agent stack is comfortable on 8 vCPU and
@@ -93,6 +147,17 @@ MARKITDOWN_ENABLE_PLUGINS=false
 `CONTENT_RELAYER_PRIVATE_KEY` is required if `/requests/relayed-document` should
 submit Sepolia transactions. Without it, the read/write content APIs still boot,
 but relayed request creation cannot complete.
+
+Full API serving means:
+
+- `CONTENT_RELAYER_PRIVATE_KEY` is set and funded, enabling
+  `POST /requests/relayed-document`.
+- `CONTENT_REQUIRE_AGENT_SIGNATURES=true`, enabling signed agent artifact/status
+  writes while rejecting unsigned impersonation attempts.
+- `content-service` is reachable by the frontend or API gateway, enabling
+  request, document, markdown, status, reason, report, and audit endpoints.
+- `markitdown` is reachable by the upload path that needs conversion, enabling
+  `POST /convert`.
 
 The default bind values keep both APIs local to the EC2 host. To expose through
 Tailscale or a private network, set `CONTENT_SERVICE_BIND` or `MARKITDOWN_BIND`
@@ -196,9 +261,20 @@ started; watching events
 
 ## 7. Served APIs
 
+All endpoints below are available after `scripts/ops/start-sepolia-stack.sh`
+starts healthy containers. Endpoints that send Sepolia transactions additionally
+need the configured relayer/reviewer wallet to be funded and authorized on-chain.
+
 ### Content Service
 
 Default host port: `127.0.0.1:18002`.
+
+For a browser frontend, expose this service through the same HTTPS origin or
+through an API gateway/reverse proxy. The service itself does not add CORS
+headers by default, so cross-origin browser traffic needs CORS policy at the
+gateway layer. Keep requester-facing write endpoints authenticated/rate-limited
+and keep agent-only write endpoints signed with
+`CONTENT_REQUIRE_AGENT_SIGNATURES=true`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -226,7 +302,11 @@ arbitrary filesystem read/write API.
 For third-party agents, prefer `GET /requests/:requestId/markdown`. It returns
 JSON metadata plus `proposal.markdown` by default. Passing `?format=raw` or
 `Accept: text/markdown` returns only the Markdown body and includes
-`X-DAIO-Proposal-URI` and `X-DAIO-Proposal-Hash` headers.
+`ETag`, `X-DAIO-Proposal-URI`, and `X-DAIO-Proposal-Hash` headers.
+
+On-chain contract views/events remain the source of truth for request lifecycle,
+participants, scores, rewards, and slashing. Content API rows are the off-chain
+document/rationale/status cache used by the frontend and third-party agents.
 
 ### MarkItDown
 

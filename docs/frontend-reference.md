@@ -9,6 +9,26 @@ Default local service URLs:
 
 Production deployments should put both APIs behind TLS, authentication, rate limits, and upload size controls.
 
+Browser frontends should normally call these services through the same HTTPS
+origin or through an API gateway/reverse proxy. The bundled services do not add
+browser CORS headers by default. If the frontend is served from a different
+origin, add CORS policy at the gateway layer and keep write endpoints
+authenticated.
+
+Trust boundaries:
+
+- Public/requester-facing: `POST /request-intents/usdaio`,
+  `POST /requests/relayed-document`, and `POST /convert` if users upload files
+  through your frontend.
+- Public/read-facing, if the deployment intentionally supports third-party
+  reviewers: `GET /requests/:requestId/document`,
+  `GET /requests/:requestId/markdown`, `GET /proposals/:id/markdown`,
+  `GET /reports/:hash`, and `GET /audits/:hash`.
+- Agent/internal writes: `POST /reports`, `POST /audits`, and
+  `PUT /agent-status`. Keep `CONTENT_REQUIRE_AGENT_SIGNATURES=true` so these
+  writes must be signed by the corresponding reviewer/auditor wallet.
+- Internal by default: reviewer-agent containers. They do not expose HTTP APIs.
+
 ## Constants
 
 Request status values from `DAIOCore.RequestStatus`:
@@ -107,6 +127,28 @@ Errors:
 - `422 conversion_failed`
 
 ## Content API
+
+Endpoint summary:
+
+| Method | Path | Frontend use |
+| --- | --- | --- |
+| `GET` | `/health` | Health check. |
+| `POST` | `/request-intents/usdaio` | Build the EIP-712 `RequestIntent` for requester signing. |
+| `POST` | `/requests/relayed-document` | Relay a signed USDAIO request and store the verified document. |
+| `POST` | `/requests/:requestId/document` | Store a document after the requester already created the on-chain request directly. |
+| `GET` | `/requests/:requestId/document` | Read stored document metadata and verified payment/request metadata. |
+| `GET` | `/requests/:requestId/markdown` | Read the canonical converted Markdown for a request. |
+| `GET` | `/requests/:requestId/agent-statuses` | List all known off-chain agent statuses for a request. |
+| `GET` | `/requests/:requestId/agents/:agent/status` | Read one agent's off-chain status. |
+| `GET` | `/requests/:requestId/agents/:agent/reasons` | Read one agent's persisted final review/audit rationales. |
+| `POST` | `/proposals` | Store proposal Markdown directly; mostly internal/debug. |
+| `GET` | `/proposals/:id` | Read a stored proposal. |
+| `GET` | `/proposals/:id/markdown` | Read stored proposal Markdown as JSON or raw Markdown. |
+| `POST` | `/reports` | Agent-only signed review artifact writer. |
+| `GET` | `/reports/:hash` | Read a canonical review artifact. |
+| `POST` | `/audits` | Agent-only signed audit artifact writer. |
+| `GET` | `/audits/:hash` | Read a canonical audit artifact. |
+| `PUT` | `/agent-status` | Agent-only signed status writer. |
 
 ### `GET /health`
 
@@ -318,6 +360,39 @@ Response shape is the same `document` object returned by `POST /requests/relayed
 
 Returns the stored verified document and on-chain payment metadata.
 
+Response:
+
+```json
+{
+  "updatedAt": 1770000000000,
+  "verified": {
+    "requestId": "1",
+    "requester": "0xRequester",
+    "proposalURI": "content://proposals/paper-001",
+    "proposalHash": "0x...",
+    "rubricHash": "0x...",
+    "domainMask": "1",
+    "tier": 0,
+    "tierName": "Fast",
+    "priorityFee": "0",
+    "txHash": "0x...",
+    "paymentFunction": "createRequestWithUSDAIOBySig",
+    "paymentToken": "0xUSDAIO",
+    "amountPaid": "100000000000000000000",
+    "blockNumber": 123456,
+    "status": 1,
+    "statusName": "Queued"
+  },
+  "proposal": {
+    "uri": "content://proposals/paper-001",
+    "id": "paper-001",
+    "hash": "0x...",
+    "mimeType": "text/markdown",
+    "text": "# Document markdown"
+  }
+}
+```
+
 ### `GET /requests/:requestId/markdown`
 
 Returns the stored Markdown document for a verified request. This is the
@@ -354,8 +429,39 @@ GET /requests/1/markdown?format=raw
 Accept: text/markdown
 ```
 
-The raw response uses `Content-Type: text/markdown` and includes
-`X-DAIO-Proposal-URI` and `X-DAIO-Proposal-Hash` headers.
+The raw response uses `Content-Type: text/markdown` and includes `ETag`,
+`X-DAIO-Proposal-URI`, and `X-DAIO-Proposal-Hash` headers.
+
+### `GET /proposals/:id/markdown`
+
+Returns stored proposal Markdown directly by content id. Frontends normally
+prefer `GET /requests/:requestId/markdown` for request pages because it also
+includes the verified request metadata. This proposal endpoint is useful for
+debugging, explorer pages, and third-party reviewers that already know the
+`content://proposals/<id>` URI.
+
+JSON response:
+
+```json
+{
+  "uri": "content://proposals/paper-001",
+  "id": "paper-001",
+  "hash": "0x...",
+  "mimeType": "text/markdown",
+  "bytes": 12345,
+  "markdown": "# Converted markdown"
+}
+```
+
+Raw Markdown response:
+
+```http
+GET /proposals/paper-001/markdown?format=raw
+Accept: text/markdown
+```
+
+The raw response uses `Content-Type: text/markdown` and includes `ETag`,
+`X-DAIO-Proposal-URI`, and `X-DAIO-Proposal-Hash` headers.
 
 ### `GET /requests/:requestId/agent-statuses`
 
@@ -449,6 +555,79 @@ These are mostly agent/internal, but they can be useful for debugging or explore
 | `GET` | `/audits/:hash` | Read a stored audit artifact. |
 | `PUT` | `/agent-status` | Agent-only status writer; with signature enforcement, body includes `signature`. Frontends should normally read status endpoints instead. |
 
+Proposal response shape for `POST /proposals` and `GET /proposals/:id`:
+
+```json
+{
+  "uri": "content://proposals/paper-001",
+  "id": "paper-001",
+  "hash": "0x...",
+  "mimeType": "text/markdown",
+  "text": "# Document markdown"
+}
+```
+
+Review artifact response shape for `POST /reports` and `GET /reports/:hash`:
+
+```json
+{
+  "uri": "content://reports/0x...",
+  "hash": "0x...",
+  "artifact": {
+    "schema": "daio.review.artifact.v1",
+    "requestId": "1",
+    "reviewer": "0xReviewer",
+    "proposalScore": 6200,
+    "report": {
+      "summary": "...",
+      "rubricAssessments": [
+        {
+          "criterion": "Novelty",
+          "score": 6100,
+          "rationale": "..."
+        }
+      ],
+      "strengths": [],
+      "weaknesses": [],
+      "risks": [],
+      "recommendation": "borderline",
+      "confidence": 8200
+    },
+    "source": {
+      "proposalURI": "content://proposals/paper-001",
+      "proposalHash": "0x...",
+      "rubricHash": "0x..."
+    },
+    "metadata": {}
+  }
+}
+```
+
+Audit artifact response shape for `POST /audits` and `GET /audits/:hash`:
+
+```json
+{
+  "uri": "content://audits/0x...",
+  "hash": "0x...",
+  "artifact": {
+    "schema": "daio.audit.artifact.v1",
+    "requestId": "1",
+    "auditor": "0xAuditor",
+    "targets": ["0xReviewer"],
+    "scores": [7800],
+    "rationales": ["..."],
+    "source": {
+      "proposalURI": "content://proposals/paper-001",
+      "proposalHash": "0x..."
+    },
+    "metadata": {}
+  }
+}
+```
+
+For signed artifact writes, the server recomputes `hash` from canonical JSON and
+verifies the wallet signature before persisting.
+
 ## Contract Views
 
 Use the deployment snapshot, usually `./.deployments/sepolia.json`, for contract addresses. The frontend should construct ethers/viem contracts with the ABI artifacts under `contracts/artifacts`.
@@ -525,6 +704,18 @@ Recommended UI loop:
 2. Use returned `retryCount` as `attempt`.
 3. Read `getRoundAggregate(requestId, attempt, 0..2)`.
 4. For known reviewer addresses, read `getReviewerRoundScore(...)` and `getReviewerRoundAccounting(...)`.
+
+Interpretation notes:
+
+- Contract views/events are the settlement source of truth for lifecycle status,
+  participant acceptance, finalized scores, rewards, and slashing.
+- Content API records are off-chain convenience data for documents, final
+  rationales, and current agent observability. They can lag chain events during
+  processing.
+- `GET /requests/:requestId/markdown` is the canonical off-chain document body
+  for a request; its `proposal.hash` equals the on-chain `proposalHash`.
+- The reasons endpoint intentionally reports `rawThinking.available=false`.
+  Hidden chain-of-thought is not persisted or exposed.
 
 ### `ReviewerRegistry`
 

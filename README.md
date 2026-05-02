@@ -443,6 +443,11 @@ For requester UX, the content-service also exposes a relayed USDAIO flow:
 
 The requester still pays the protocol fee from their own USDAIO balance through `PaymentRouter` allowance; the relayer only pays gas.
 
+For frontend-facing HTTP endpoints and on-chain view calls, use
+[docs/frontend-reference.md](docs/frontend-reference.md) as the integration
+contract. It also records which endpoints are requester-facing, third-party
+reviewer-facing, or agent/internal.
+
 ### Event ordering
 
 The agent's chain-event poller in [src/reviewer-agent/chain/events.ts](src/reviewer-agent/chain/events.ts) merges `StatusChanged`, `ReviewRevealed`, and `RequestFinalized` log batches into a single chronological stream sorted by `(blockNumber, logIndex)` before emitting. This is important because a `ReviewRevealed` and the subsequent `StatusChanged(AuditCommit)` can land in the same transaction (the contract calls `_advance` immediately after `emit ReviewRevealed`); without chronological merging, an `AuditCommit` listener can fire before the matching `ReviewRevealed` is recorded into the agent's local state, causing the auditor to skip itself.

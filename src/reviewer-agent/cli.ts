@@ -39,14 +39,14 @@ async function main() {
   });
 
   const rpc = values.rpc ?? "http://127.0.0.1:8545";
-  const privkey = values.privkey;
+  const privkey = values.privkey ?? process.env.AGENT_PRIVATE_KEY;
   const contentUrl = values["content-svc"] ?? "http://127.0.0.1:18002";
   const deploymentPath = values.deployment;
   const stateDir = values["state-dir"] ?? "./.state/agent";
   const stateKey = values["state-key"] ?? process.env.AGENT_STATE_KEY;
   const label = values.label ?? "reviewer";
 
-  if (!privkey) throw new Error("--privkey required");
+  if (!privkey) throw new Error("--privkey or AGENT_PRIVATE_KEY required");
   if (!deploymentPath) throw new Error("--deployment required");
   if (!stateKey) throw new Error("--state-key or AGENT_STATE_KEY required");
 

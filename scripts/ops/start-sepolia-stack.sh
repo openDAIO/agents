@@ -25,7 +25,7 @@ printf '[serve] validating compose config\n'
 "${COMPOSE[@]}" config --quiet
 
 printf '[serve] building images\n'
-"${COMPOSE[@]}" build
+"${COMPOSE[@]}" build content-service markitdown
 
 printf '[serve] starting content-service, markitdown, and five agents\n'
 "${COMPOSE[@]}" up -d

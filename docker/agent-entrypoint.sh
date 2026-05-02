@@ -13,16 +13,10 @@ AGENT_STATE_DIR="${AGENT_STATE_DIR:-/app/state/$AGENT_LABEL}"
 
 set -- npm run agent -- \
   --rpc "$RPC_URL" \
-  --privkey "$AGENT_PRIVATE_KEY" \
   --content-svc "$CONTENT_SERVICE_URL" \
   --deployment "$DAIO_DEPLOYMENT_PATH" \
   --state-dir "$AGENT_STATE_DIR" \
-  --state-key "$AGENT_STATE_KEY" \
   --label "$AGENT_LABEL"
-
-if [ -n "${AGENT_VRF_PRIVATE_KEY:-}" ]; then
-  set -- "$@" --vrf-privkey "$AGENT_VRF_PRIVATE_KEY"
-fi
 
 if [ "${AGENT_AUTO_REGISTER:-false}" = "true" ] || [ "${AGENT_AUTO_REGISTER:-false}" = "1" ]; then
   : "${AGENT_ID:?AGENT_ID is required when AGENT_AUTO_REGISTER=true}"

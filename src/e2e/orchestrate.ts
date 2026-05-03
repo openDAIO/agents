@@ -163,6 +163,7 @@ async function startContentService(input?: string | {
       CONTENT_SERVICE_HOST: host,
       ...(opts ? {
         CONTENT_CHAIN_RPC_URL: opts.rpcUrl,
+        CONTENT_CHAIN_RPC_URLS: "",
         CONTENT_DEPLOYMENT_PATH: opts.deploymentPath,
         CONTENT_DB_PATH: opts.dbPath,
       } : {}),

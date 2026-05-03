@@ -377,7 +377,7 @@ DAIO_DOCUMENT_WAIT_MS=300000
 DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
 DAIO_DOCUMENT_RETRY_MAX_MS=10000
 DAIO_DOCUMENT_RECHECK_MS=10000
-DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_MIN_COMMIT_TIME_REMAINING_MS=120000
 DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
 DAIO_EVENT_LOOKBACK_BLOCKS=7200
 DAIO_EVENT_REORG_DEPTH_BLOCKS=12
@@ -389,10 +389,14 @@ DAIO_START_NEXT_REQUEST_GAS_FLOOR=300000
 DAIO_SYNC_REQUEST_GAS_FLOOR=2000000
 ```
 
-When the agent can read DAIOCore's on-chain request config, document waiting is
-bounded by the live phase deadline instead of the static fallback:
-`phaseTimeout - elapsedPhaseTime - DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS`.
-`DAIO_DOCUMENT_WAIT_MS` is used only when the phase timeout cannot be read.
+When the agent can read DAIOCore's on-chain request config, missing-document
+waits fill the live active phase instead of stopping early:
+`phaseTimeout - elapsedPhaseTime`. `DAIO_DOCUMENT_WAIT_MS` is used only when the
+phase timeout cannot be read. If a document appears very late,
+`DAIO_MIN_COMMIT_TIME_REMAINING_MS` prevents the agent from starting LLM/commit
+work that is unlikely to land before the commit window closes; before the phase
+times out, the request remains `waiting_document` rather than being marked
+`document_unavailable`.
 
 Docker Compose enables keeper duties only on `agent-1` by default. Override
 `DAIO_KEEPER_ENABLED_AGENT_N=true|false` in `.env` if a different agent should

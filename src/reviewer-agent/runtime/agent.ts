@@ -11,6 +11,7 @@ import type { Provider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
 import { waitForTransactionWithRetries, withRpcReadRetries } from "../../shared/rpc.js";
 import { gasLimitWithHeadroom } from "./gas.js";
+import { readPhaseTiming } from "./phaseTiming.js";
 import {
   resolveRequestRuntimeConfig,
   resolveTierRuntimeConfig,
@@ -560,6 +561,10 @@ export class ReviewerAgent {
     return parsed;
   }
 
+  private minCommitTimeRemainingMs(): number {
+    return this.integerEnv("DAIO_MIN_COMMIT_TIME_REMAINING_MS", 120_000, 0);
+  }
+
   private fallbackRuntimeConfig(): RuntimeConfig {
     const fallbackPhaseTimeoutMs = this.integerEnv("DAIO_FALLBACK_PHASE_TIMEOUT_MS", 600_000, 0);
     return {
@@ -578,25 +583,18 @@ export class ReviewerAgent {
     const timeoutMs = Math.max(0, Math.trunc(phaseTimeoutMs));
     if (timeoutMs === 0) return undefined;
 
-    const bufferMs = this.integerEnv("DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS", 180_000, 0);
-    const waitWithoutElapsed = Math.max(0, timeoutMs - bufferMs);
     const startBlock = this.events.phaseStartBlock(change.requestId, change.status);
-    if (startBlock === undefined) return waitWithoutElapsed;
 
     try {
-      const [phaseStartBlock, latestBlock] = await withRpcReadRetries(() =>
-        Promise.all([this.provider.getBlock(startBlock), this.provider.getBlock("latest")]),
-      );
-      if (!phaseStartBlock || !latestBlock) return waitWithoutElapsed;
-      const elapsedMs = Math.max(0, (latestBlock.timestamp - phaseStartBlock.timestamp) * 1_000);
-      const waitMs = Math.max(0, timeoutMs - elapsedMs - bufferMs);
+      const timing = await readPhaseTiming(this.provider, startBlock, timeoutMs);
+      if (!timing) return undefined;
       this.log(
-        `request ${change.requestId} ${RequestStatus[change.status] ?? `Status${change.status}`} document wait budget=${waitMs}ms timeout=${timeoutMs}ms elapsed=${elapsedMs}ms buffer=${bufferMs}ms`,
+        `request ${change.requestId} ${RequestStatus[change.status] ?? `Status${change.status}`} document wait remaining=${timing.remainingMs}ms timeout=${timing.timeoutMs}ms elapsed=${timing.elapsedMs}ms`,
       );
-      return waitMs;
+      return timing.remainingMs;
     } catch (err) {
-      this.log(`document wait deadline read failed for request ${change.requestId}: ${formatError(err)}`);
-      return waitWithoutElapsed;
+      this.log(`document wait phase timing read failed for request ${change.requestId}: ${formatError(err)}`);
+      return timeoutMs;
     }
   }
 
@@ -687,11 +685,20 @@ export class ReviewerAgent {
             change.requestId,
             runtimeConfig.finalityFactor,
             runtimeConfig.reviewElectionDifficulty,
-            documentWaitMs,
+            {
+              documentWaitMs,
+              phaseTimeoutMs: runtimeConfig.reviewCommitTimeoutMs,
+              minCommitTimeRemainingMs: this.minCommitTimeRemainingMs(),
+            },
           );
           if (!res.committed) {
             this.log(`review skip: ${res.reason}`);
-            const status = res.reason === "document_unavailable" ? "document_unavailable" : "skipped";
+            const status =
+              res.reason === "document_unavailable"
+                ? "document_unavailable"
+                : res.reason === "too_late_for_commit"
+                  ? "too_late_for_commit"
+                  : "skipped";
             await this.recordStatus(change.requestId, phase, status, res.reason);
             if (res.reason === "document_unavailable") {
               this.schedulePhaseRetry(change, "document_unavailable");
@@ -739,11 +746,20 @@ export class ReviewerAgent {
             runtimeConfig.finalityFactor,
             runtimeConfig.auditElectionDifficulty,
             runtimeConfig.auditTargetLimit,
-            documentWaitMs,
+            {
+              documentWaitMs,
+              phaseTimeoutMs: runtimeConfig.auditCommitTimeoutMs,
+              minCommitTimeRemainingMs: this.minCommitTimeRemainingMs(),
+            },
           );
           if (!res.committed) {
             this.log(`audit skip: ${res.reason}`);
-            const status = res.reason === "document_unavailable" ? "document_unavailable" : "skipped";
+            const status =
+              res.reason === "document_unavailable"
+                ? "document_unavailable"
+                : res.reason === "too_late_for_commit"
+                  ? "too_late_for_commit"
+                  : "skipped";
             await this.recordStatus(change.requestId, phase, status, res.reason);
             if (res.reason === "document_unavailable") {
               this.schedulePhaseRetry(change, "document_unavailable");

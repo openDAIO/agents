@@ -20,6 +20,7 @@ import {
   waitForRequestDocument,
 } from "./document.js";
 import { waitForTransactionWithRetries } from "../../shared/rpc.js";
+import { phaseHasMinimumRemaining } from "./phaseTiming.js";
 
 export interface ReviewFlowDeps {
   handles: ContractHandles;
@@ -40,12 +41,43 @@ export interface ReviewFlowDeps {
   ) => Promise<void>;
 }
 
+export interface PhaseWorkOptions {
+  documentWaitMs?: number;
+  phaseTimeoutMs?: number;
+  minCommitTimeRemainingMs?: number;
+}
+
+async function hasReviewCommitWindow(
+  deps: ReviewFlowDeps,
+  requestId: bigint,
+  startBlock: number,
+  options: PhaseWorkOptions,
+): Promise<boolean> {
+  if (!deps.wallet.provider) return true;
+  try {
+    const result = await phaseHasMinimumRemaining(
+      deps.wallet.provider,
+      startBlock,
+      options.phaseTimeoutMs,
+      options.minCommitTimeRemainingMs,
+    );
+    if (result.ok) return true;
+    deps.log(
+      `review: too late for commit request ${requestId}; remaining=${result.timing.remainingMs}ms min=${options.minCommitTimeRemainingMs}ms timeout=${result.timing.timeoutMs}ms elapsed=${result.timing.elapsedMs}ms`,
+    );
+    return false;
+  } catch (err) {
+    deps.log(`review: commit window check failed for request ${requestId}: ${(err as Error).message}`);
+    return true;
+  }
+}
+
 export async function runReview(
   deps: ReviewFlowDeps,
   requestId: bigint,
   finalityFactor: bigint,
   reviewElectionDifficulty: bigint,
-  documentWaitMs?: number,
+  options: PhaseWorkOptions = {},
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; reportHash?: string; reportURI?: string }> {
   const { handles, events, content, state, wallet, vrf, log } = deps;
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.ReviewCommit);
@@ -70,13 +102,13 @@ export async function runReview(
   let document: RequestDocumentRecord;
   try {
     document = await waitForRequestDocument(content, requestId, {
-      waitMs: documentWaitMs,
+      waitMs: options.documentWaitMs,
       log,
       onWaiting: (info) =>
         deps.recordStatus?.(requestId, "ReviewCommit", "waiting_document", "request document not registered yet", {
           elapsedMs: info.elapsedMs,
           nextRetryMs: info.nextRetryMs,
-          waitMs: documentWaitMs,
+          waitMs: options.documentWaitMs,
         }) ?? Promise.resolve(),
       shouldContinue: async () => {
         try {
@@ -137,6 +169,9 @@ export async function runReview(
   if (!passed) {
     log(`review: sortition NOT passed for request ${requestId}, skip`);
     return { committed: false, reason: "sortition_fail" };
+  }
+  if (!(await hasReviewCommitWindow(deps, requestId, startBlock, options))) {
+    return { committed: false, reason: "too_late_for_commit" };
   }
   log(`review: sortition passed; running review for request ${requestId}`);
 
@@ -212,6 +247,9 @@ export async function runReview(
   const stored = await content.putReport(artifact, artifactSignature);
   if (stored.hash !== reportHash) {
     throw new Error(`report hash mismatch between client (${reportHash}) and server (${stored.hash})`);
+  }
+  if (!(await hasReviewCommitWindow(deps, requestId, startBlock, options))) {
+    return { committed: false, reason: "too_late_for_commit", reportHash, reportURI: stored.uri };
   }
 
   const seed = `0x${crypto.randomBytes(32).toString("hex")}`;

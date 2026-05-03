@@ -19,6 +19,7 @@ import {
   waitForRequestDocument,
 } from "./document.js";
 import { waitForTransactionWithRetries } from "../../shared/rpc.js";
+import { phaseHasMinimumRemaining } from "./phaseTiming.js";
 
 export interface AuditFlowDeps {
   handles: ContractHandles;
@@ -39,13 +40,44 @@ export interface AuditFlowDeps {
   ) => Promise<void>;
 }
 
+export interface PhaseWorkOptions {
+  documentWaitMs?: number;
+  phaseTimeoutMs?: number;
+  minCommitTimeRemainingMs?: number;
+}
+
+async function hasAuditCommitWindow(
+  deps: AuditFlowDeps,
+  requestId: bigint,
+  startBlock: number,
+  options: PhaseWorkOptions,
+): Promise<boolean> {
+  if (!deps.wallet.provider) return true;
+  try {
+    const result = await phaseHasMinimumRemaining(
+      deps.wallet.provider,
+      startBlock,
+      options.phaseTimeoutMs,
+      options.minCommitTimeRemainingMs,
+    );
+    if (result.ok) return true;
+    deps.log(
+      `audit: too late for commit request ${requestId}; remaining=${result.timing.remainingMs}ms min=${options.minCommitTimeRemainingMs}ms timeout=${result.timing.timeoutMs}ms elapsed=${result.timing.elapsedMs}ms`,
+    );
+    return false;
+  } catch (err) {
+    deps.log(`audit: commit window check failed for request ${requestId}: ${(err as Error).message}`);
+    return true;
+  }
+}
+
 export async function runAudit(
   deps: AuditFlowDeps,
   requestId: bigint,
   finalityFactor: bigint,
   auditElectionDifficulty: bigint,
   auditTargetLimit: bigint,
-  documentWaitMs?: number,
+  options: PhaseWorkOptions = {},
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; auditHash?: string; auditURI?: string }> {
   const { handles, events, content, state, wallet, vrf, log } = deps;
 
@@ -158,13 +190,13 @@ export async function runAudit(
   let document: RequestDocumentRecord;
   try {
     document = await waitForRequestDocument(content, requestId, {
-      waitMs: documentWaitMs,
+      waitMs: options.documentWaitMs,
       log,
       onWaiting: (info) =>
         deps.recordStatus?.(requestId, "AuditCommit", "waiting_document", "request document not registered yet", {
           elapsedMs: info.elapsedMs,
           nextRetryMs: info.nextRetryMs,
-          waitMs: documentWaitMs,
+          waitMs: options.documentWaitMs,
         }) ?? Promise.resolve(),
       shouldContinue: async () => {
         try {
@@ -195,6 +227,10 @@ export async function runAudit(
   }
   const domainMask = BigInt(document.verified.domainMask);
   const tierName = document.verified.tierName;
+
+  if (!(await hasAuditCommitWindow(deps, requestId, startBlock, options))) {
+    return { committed: false, reason: "too_late_for_commit" };
+  }
 
   const ensName = `reviewer-${wallet.address.slice(2, 8).toLowerCase()}.daio.eth`;
   const agentId = (await handles.reviewerRegistry.agentId(wallet.address)) as bigint;
@@ -263,6 +299,9 @@ export async function runAudit(
   const stored = await content.putAudit(artifact, artifactSignature);
   if (stored.hash !== auditHash) {
     throw new Error(`audit hash mismatch between client (${auditHash}) and server (${stored.hash})`);
+  }
+  if (!(await hasAuditCommitWindow(deps, requestId, startBlock, options))) {
+    return { committed: false, reason: "too_late_for_commit", auditHash, auditURI: stored.uri };
   }
 
   const seed = `0x${crypto.randomBytes(32).toString("hex")}`;

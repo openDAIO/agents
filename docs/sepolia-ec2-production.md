@@ -160,7 +160,7 @@ DAIO_DOCUMENT_WAIT_MS=300000
 DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
 DAIO_DOCUMENT_RETRY_MAX_MS=10000
 DAIO_DOCUMENT_RECHECK_MS=10000
-DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_MIN_COMMIT_TIME_REMAINING_MS=120000
 DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
 DAIO_EVENT_LOOKBACK_BLOCKS=7200
 DAIO_EVENT_REORG_DEPTH_BLOCKS=12
@@ -182,6 +182,15 @@ compatibility, and retryable provider failures such as `408`, `429`, and
 transient network errors are retried/logged instead of crashing the agent
 process. Public free-tier RPCs can still add latency under load; paid or
 dedicated Sepolia RPCs are preferred for sustained testing.
+
+When a direct on-chain request enters an active phase before its document is
+registered in content-service, agents keep the request tracked and report
+`waiting_document` for the full remaining active phase. They no longer mark
+`document_unavailable` early because of a document deadline buffer. If the
+document finally appears too close to the commit deadline,
+`DAIO_MIN_COMMIT_TIME_REMAINING_MS` prevents starting LLM/commit work that is
+unlikely to land before the phase closes; keeper reconciliation then lets the
+contract timeout path free the active slot.
 
 Full API serving means:
 
@@ -248,7 +257,7 @@ DAIO_DOCUMENT_WAIT_MS=300000
 DAIO_DOCUMENT_RETRY_INITIAL_MS=1000
 DAIO_DOCUMENT_RETRY_MAX_MS=10000
 DAIO_DOCUMENT_RECHECK_MS=10000
-DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS=180000
+DAIO_MIN_COMMIT_TIME_REMAINING_MS=120000
 DAIO_FALLBACK_PHASE_TIMEOUT_MS=600000
 DAIO_EVENT_LOOKBACK_BLOCKS=7200
 DAIO_EVENT_REORG_DEPTH_BLOCKS=12

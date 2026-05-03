@@ -166,9 +166,9 @@ for i in 1 2 3 4 5; do
   if [ -n "$document_recheck_ms" ] && ! [[ "$document_recheck_ms" =~ ^[0-9]+$ ]]; then
     die "$file DAIO_DOCUMENT_RECHECK_MS must be an integer millisecond value"
   fi
-  document_deadline_buffer_ms="$(optional_env "$file" "DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS")"
-  if [ -n "$document_deadline_buffer_ms" ] && ! [[ "$document_deadline_buffer_ms" =~ ^[0-9]+$ ]]; then
-    die "$file DAIO_DOCUMENT_PHASE_DEADLINE_BUFFER_MS must be an integer millisecond value"
+  min_commit_time_remaining_ms="$(optional_env "$file" "DAIO_MIN_COMMIT_TIME_REMAINING_MS")"
+  if [ -n "$min_commit_time_remaining_ms" ] && ! [[ "$min_commit_time_remaining_ms" =~ ^[0-9]+$ ]]; then
+    die "$file DAIO_MIN_COMMIT_TIME_REMAINING_MS must be an integer millisecond value"
   fi
   fallback_phase_timeout_ms="$(optional_env "$file" "DAIO_FALLBACK_PHASE_TIMEOUT_MS")"
   if [ -n "$fallback_phase_timeout_ms" ] && ! [[ "$fallback_phase_timeout_ms" =~ ^[0-9]+$ ]]; then

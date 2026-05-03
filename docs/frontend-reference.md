@@ -747,7 +747,7 @@ Interpretation notes:
 
 | View | Returns | Frontend use |
 | --- | --- | --- |
-| `getReviewer(address reviewer)` | `(registered, active, suspended, agentId, stake, domainMask, completedRequests, semanticStrikes, protocolFaults, cooldownUntilBlock)` | Reviewer profile. |
+| `getReviewer(address reviewer)` | `(registered, active, suspended, agentId, stake, domainMask, completedRequests, semanticStrikes, protocolFaults, cooldownUntilBlock, ensNode, ensName)` | Reviewer profile. |
 | `isEligible(address reviewer, uint256 domainMask)` | `bool` | Show whether reviewer can participate in a domain. |
 | `availableStake(address reviewer)` | `uint256` | Stake capacity for new active requests. |
 | `lockedStake(address reviewer)` | `uint256` | Total locked stake. |
@@ -826,8 +826,7 @@ Mostly agent/debug-facing. Frontends usually do not need this for normal user pa
 
 | View | Returns | Frontend use |
 | --- | --- | --- |
-| `verifiedCanonicalAuditTargets(...)` | `(bool ok, address[] selectedTargets)` | Debug audit assignment reproduction. |
-| `AUDIT_SORTITION()` | `bytes32` | Constant. |
+| `verifiedCanonicalAuditTargets(...)` | `(bool ok, address[] selectedTargets)` | Debug full-audit assignment preview; pass empty target proofs. |
 | `SCALE()` | `uint256` | Constant, normally `10000`. |
 
 ## Suggested Frontend Screens

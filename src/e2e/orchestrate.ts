@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { JsonRpcProvider, JsonRpcSigner, NonceManager, Wallet, ZeroAddress, getAddress, id, keccak256, parseEther, toUtf8Bytes } from "ethers";
+import { JsonRpcProvider, JsonRpcSigner, NonceManager, Wallet, ZeroAddress, getAddress, id, keccak256, namehash, parseEther, toUtf8Bytes } from "ethers";
 import { startHardhatNode, HARDHAT_PRIV_KEYS } from "./hardhat.js";
 import { deployAll, tierConfig } from "./deploy.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
@@ -21,13 +21,13 @@ const ROOT = path.resolve(here, "../..");
 
 const FAST = 0;
 const E2E_AGENT_COUNT = Number(process.env.E2E_AGENT_COUNT ?? "5");
-const E2E_QUORUM = Number(process.env.E2E_QUORUM ?? "4");
-const E2E_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_REVIEW_VRF_DIFFICULTY ?? "10000");
+const E2E_QUORUM = Number(process.env.E2E_QUORUM ?? "3");
+const E2E_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_REVIEW_VRF_DIFFICULTY ?? "8000");
 const E2E_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AUDIT_VRF_DIFFICULTY ?? "10000");
-const E2E_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AUDIT_TARGET_LIMIT ?? "3");
+const E2E_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AUDIT_TARGET_LIMIT ?? "2");
 const E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_REVIEW_VRF_DIFFICULTY ?? "1");
-const E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY ?? "1");
-const E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT ?? "1");
+const E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_VRF_DIFFICULTY ?? "10000");
+const E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT = BigInt(process.env.E2E_AGENT_FALLBACK_AUDIT_TARGET_LIMIT ?? "2");
 const E2E_AUDIT_PHASE_START_BLOCK_OFFSET = 6n;
 const E2E_LLM_TIMEOUT_MS = "300000";
 const E2E_LLM_MAX_TOKENS = "2048";
@@ -267,17 +267,17 @@ async function prepareSepoliaForkState(input: {
           auditCommitQuorum: E2E_QUORUM,
           auditRevealQuorum: E2E_QUORUM,
           auditTargetLimit: Number(E2E_AUDIT_TARGET_LIMIT),
-          minIncomingAudit: 1,
+          minIncomingAudit: E2E_QUORUM - 1,
           auditCoverageQuorum: 7000,
           contributionThreshold: 1000,
           reviewEpochSize: 25,
           auditEpochSize: 25,
           finalityFactor: 2,
-          maxRetries: 0,
-          reviewCommitTimeout: 30 * 60,
-          reviewRevealTimeout: 30 * 60,
-          auditCommitTimeout: 30 * 60,
-          auditRevealTimeout: 30 * 60,
+          maxRetries: 1,
+          reviewCommitTimeout: 10 * 60,
+          reviewRevealTimeout: 10 * 60,
+          auditCommitTimeout: 10 * 60,
+          auditRevealTimeout: 10 * 60,
         }),
       )
     ).wait();
@@ -310,10 +310,18 @@ async function ensureReviewerRegisteredForE2E(
   const reviewerInfo = await handles.reviewerRegistry.getReviewer(wallet.address);
   const registered = Boolean(reviewerInfo[0]);
   const currentStake = BigInt(reviewerInfo[4] as bigint | number);
+  const currentAgentId = BigInt((reviewerInfo.agentId ?? reviewerInfo[3]) as bigint | number);
+  const currentEnsNode = String((reviewerInfo.ensNode ?? reviewerInfo[10]) as string | undefined ?? "");
+  const currentEnsName = String((reviewerInfo.ensName ?? reviewerInfo[11]) as string | undefined ?? "");
+  const expectedEnsNode = params.ensName ? namehash(params.ensName) : "0x0000000000000000000000000000000000000000000000000000000000000000";
   const registeredVrf = (await handles.reviewerRegistry.vrfPublicKey(wallet.address)) as readonly [bigint, bigint];
   const vrfMatches = registeredVrf[0] === params.vrfPublicKey[0] && registeredVrf[1] === params.vrfPublicKey[1];
+  const metadataMatches =
+    currentAgentId === params.agentId &&
+    currentEnsName === params.ensName &&
+    currentEnsNode.toLowerCase() === expectedEnsNode.toLowerCase();
 
-  if (registered && currentStake >= targetStake && vrfMatches) {
+  if (registered && currentStake >= targetStake && vrfMatches && metadataMatches) {
     return { updated: false };
   }
 
@@ -327,7 +335,7 @@ async function ensureReviewerRegisteredForE2E(
 
   const tx = await handles.reviewerRegistry.connect(managed).registerReviewer(
     params.ensName,
-    id(params.ensName),
+    expectedEnsNode,
     params.agentId,
     params.domainMask,
     params.vrfPublicKey,
@@ -527,7 +535,7 @@ async function main(): Promise<RunResult> {
   const provider = new JsonRpcProvider(node.rpcUrl, undefined, { staticNetwork: true });
   // signers: 0=owner, 1=treasury, 2=requester, 3.. candidate reviewers.
   // Register the full local candidate pool, then spawn a deterministic 5-agent
-  // committee that satisfies quorum=3 under the configured review/audit sortition.
+  // committee that satisfies quorum=3 under review sortition plus full-audit obligations.
   const externalAccounts = loadExternalE2EAccounts(E2E_AGENT_COUNT);
   if (externalAccounts) {
     process.stdout.write(`[orchestrate] using ${externalAccounts.agentKeys.length} external E2E agent accounts from environment\n`);

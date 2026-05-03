@@ -34,6 +34,11 @@ function deepErrorText(err: unknown): string {
   return parts.join(" ");
 }
 
+function resultValue<T>(result: unknown, name: string, index: number): T | undefined {
+  const record = result as Record<string, unknown>;
+  return (record[name] ?? (result as readonly unknown[])[index]) as T | undefined;
+}
+
 export async function registerReviewerIfNeeded(
   handles: ContractHandles,
   wallet: Wallet,
@@ -45,7 +50,25 @@ export async function registerReviewerIfNeeded(
   const reviewerInfo = await handles.reviewerRegistry.getReviewer(wallet.address);
   const registered = Boolean(reviewerInfo[0]);
   const currentStake = registered ? BigInt(reviewerInfo[4] as bigint | number) : 0n;
-  const stakeDelta = desiredStake > currentStake ? desiredStake - currentStake : 0n;
+  const identity = {
+    ensName: params.ensName,
+    ensNode: params.ensName ? namehash(params.ensName) : ZeroHash,
+    agentId: params.agentId,
+  };
+  const currentAgentId = registered ? BigInt(resultValue<bigint | number>(reviewerInfo, "agentId", 3) ?? 0n) : 0n;
+  const currentEnsNode = registered ? String(resultValue<string>(reviewerInfo, "ensNode", 10) ?? ZeroHash) : ZeroHash;
+  const currentEnsName = registered ? String(resultValue<string>(reviewerInfo, "ensName", 11) ?? "") : "";
+  const currentVrf = registered
+    ? ((await handles.reviewerRegistry.vrfPublicKey(wallet.address)) as readonly [bigint, bigint])
+    : undefined;
+  const metadataChanged =
+    currentAgentId !== identity.agentId ||
+    currentEnsNode.toLowerCase() !== identity.ensNode.toLowerCase() ||
+    currentEnsName !== identity.ensName ||
+    !currentVrf ||
+    currentVrf[0] !== params.vrfPublicKey[0] ||
+    currentVrf[1] !== params.vrfPublicKey[1];
+  const stakeDelta = desiredStake > currentStake ? desiredStake - currentStake : metadataChanged ? 1n : 0n;
   if (registered && stakeDelta === 0n) return { registered: false };
 
   const managed = new NonceManager(wallet);
@@ -67,11 +90,6 @@ export async function registerReviewerIfNeeded(
       params.vrfPublicKey,
       stakeDelta,
     );
-  const identity = {
-    ensName: params.ensName,
-    ensNode: params.ensName ? namehash(params.ensName) : ZeroHash,
-    agentId: params.agentId,
-  };
   try {
     const tx = await register(identity);
     const receipt = await waitForTransactionWithRetries(tx);

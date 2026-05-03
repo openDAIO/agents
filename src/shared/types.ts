@@ -24,7 +24,6 @@ export enum Tier {
 export const DOMAIN_RESEARCH = 1n;
 
 export const REVIEW_SORTITION = keccak256(toUtf8Bytes("DAIO_REVIEW_SORTITION"));
-export const AUDIT_SORTITION = keccak256(toUtf8Bytes("DAIO_AUDIT_SORTITION"));
 
 export interface DeploymentSnapshot {
   chainId: number;
@@ -43,10 +42,16 @@ export interface DeploymentSnapshot {
     vrfCoordinator: string;
     vrfVerifier: string;
     core: string;
+    coreImplementation?: string;
+    coreProxyAdmin?: string;
+    infoReader?: string;
     paymentRouter: string;
     acceptedTokenRegistry: string;
     swapAdapter: string;
     universalRouter: string;
+    ensVerifier?: string;
+    erc8004Adapter?: string;
+    autoConvertHook?: string;
   };
   signers?: {
     owner: string;

@@ -4,6 +4,7 @@ import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/c
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
 import { REVIEW_SORTITION, RequestStatus } from "../../shared/types.js";
+import { readReviewerMetadata } from "../chain/reviewerMetadata.js";
 import { sortitionPass } from "../chain/sortition.js";
 import { buildReviewMessages } from "../llm/prompts.js";
 import { chat, extractJson } from "../llm/client.js";
@@ -185,8 +186,7 @@ export async function runReview(
     throw new Error(`proposal hash mismatch: onchain=${document.verified.proposalHash} computed=${computedHash}`);
   }
 
-  const ensName = `reviewer-${wallet.address.slice(2, 8).toLowerCase()}.daio.eth`;
-  const agentId = (await handles.reviewerRegistry.agentId(wallet.address)) as bigint;
+  const reviewerMetadata = await readReviewerMetadata(handles, wallet.address);
 
   const messages = buildReviewMessages({
     schema: "daio.llm.input.v1",
@@ -207,8 +207,8 @@ export async function runReview(
     },
     reviewer: {
       wallet: wallet.address,
-      ensName,
-      agentId: agentId.toString(),
+      ensName: reviewerMetadata.ensName,
+      agentId: reviewerMetadata.agentId.toString(),
       domainMask: domainMask.toString(),
     },
     content: {

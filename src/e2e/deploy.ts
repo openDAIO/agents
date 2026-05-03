@@ -1,10 +1,10 @@
 import {
+  Contract,
   ContractFactory,
   NonceManager,
   Wallet,
   parseEther,
   type JsonRpcProvider,
-  type Contract,
 } from "ethers";
 import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
@@ -103,14 +103,26 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
   const priorityQueue = await deploy(owner, Artifacts.DAIOPriorityQueue(), []);
   const vrfVerifier = await deploy(owner, Artifacts.FRAINVRFVerifier(), []);
   const vrfCoordinator = await deploy(owner, Artifacts.DAIOVRFCoordinator(), [vrfVerifier.address]);
-  const core = await deploy(owner, Artifacts.DAIOCore(), [
+  const coreArtifact = Artifacts.DAIOCore();
+  const coreImplementation = await deploy(owner, coreArtifact, []);
+  const coreInitializer = new ContractFactory(coreArtifact.abi as never[], coreArtifact.bytecode, owner).interface.encodeFunctionData("initialize", [
     treasury.address,
     commitReveal.address,
     priorityQueue.address,
     vrfCoordinator.address,
     maxActiveRequests,
   ]);
+  const coreProxy = await deploy(owner, Artifacts.DAIOTransparentUpgradeableProxy(), [
+    coreImplementation.address,
+    ownerWallet.address,
+    coreInitializer,
+  ]);
+  const core = {
+    contract: new Contract(coreProxy.address, coreArtifact.abi as never[], owner),
+    address: coreProxy.address,
+  };
   const roundLedger = await deploy(owner, Artifacts.DAIORoundLedger(), []);
+  const infoReader = await deploy(owner, Artifacts.DAIOInfoReader(), [core.address]);
 
   // Wire modules
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -150,24 +162,24 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       FAST,
       tierConfig({
-        reviewElectionDifficulty: 10000,
+        reviewElectionDifficulty: 8000,
         auditElectionDifficulty: 10000,
-        reviewCommitQuorum: 4,
-        reviewRevealQuorum: 4,
-        auditCommitQuorum: 4,
-        auditRevealQuorum: 4,
-        auditTargetLimit: 3,
-        minIncomingAudit: 1,
+        reviewCommitQuorum: 3,
+        reviewRevealQuorum: 3,
+        auditCommitQuorum: 3,
+        auditRevealQuorum: 3,
+        auditTargetLimit: 2,
+        minIncomingAudit: 2,
         auditCoverageQuorum: 7000,
         contributionThreshold: 1000,
         reviewEpochSize: 25,
         auditEpochSize: 25,
         finalityFactor: 2,
-        maxRetries: 0,
-        reviewCommitTimeout: 30 * 60,
-        reviewRevealTimeout: 30 * 60,
-        auditCommitTimeout: 30 * 60,
-        auditRevealTimeout: 30 * 60,
+        maxRetries: 1,
+        reviewCommitTimeout: 10 * 60,
+        reviewRevealTimeout: 10 * 60,
+        auditCommitTimeout: 10 * 60,
+        auditRevealTimeout: 10 * 60,
       }),
     )
   ).wait();
@@ -175,22 +187,22 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       STANDARD,
       tierConfig({
-        reviewCommitQuorum: 2,
-        reviewRevealQuorum: 2,
-        auditCommitQuorum: 2,
-        auditRevealQuorum: 2,
+        reviewCommitQuorum: 4,
+        reviewRevealQuorum: 4,
+        auditCommitQuorum: 4,
+        auditRevealQuorum: 4,
         auditTargetLimit: 3,
-        minIncomingAudit: 2,
+        minIncomingAudit: 3,
         auditCoverageQuorum: 8000,
         contributionThreshold: 1500,
         reviewEpochSize: 50,
         auditEpochSize: 50,
         finalityFactor: 3,
         maxRetries: 1,
-        reviewCommitTimeout: 2 * 60 * 60,
-        reviewRevealTimeout: 2 * 60 * 60,
-        auditCommitTimeout: 2 * 60 * 60,
-        auditRevealTimeout: 2 * 60 * 60,
+        reviewCommitTimeout: 30 * 60,
+        reviewRevealTimeout: 30 * 60,
+        auditCommitTimeout: 30 * 60,
+        auditRevealTimeout: 30 * 60,
       }),
     )
   ).wait();
@@ -198,22 +210,22 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       CRITICAL,
       tierConfig({
-        reviewCommitQuorum: 2,
-        reviewRevealQuorum: 2,
-        auditCommitQuorum: 2,
-        auditRevealQuorum: 2,
-        auditTargetLimit: 2,
-        minIncomingAudit: 3,
+        reviewCommitQuorum: 5,
+        reviewRevealQuorum: 5,
+        auditCommitQuorum: 5,
+        auditRevealQuorum: 5,
+        auditTargetLimit: 4,
+        minIncomingAudit: 4,
         auditCoverageQuorum: 10000,
-        contributionThreshold: 1000,
-        reviewEpochSize: 25,
-        auditEpochSize: 25,
-        finalityFactor: 2,
-        maxRetries: 0,
-        reviewCommitTimeout: 30 * 60,
-        reviewRevealTimeout: 30 * 60,
-        auditCommitTimeout: 30 * 60,
-        auditRevealTimeout: 30 * 60,
+        contributionThreshold: 2000,
+        reviewEpochSize: 100,
+        auditEpochSize: 100,
+        finalityFactor: 5,
+        maxRetries: 2,
+        reviewCommitTimeout: 60 * 60,
+        reviewRevealTimeout: 60 * 60,
+        auditCommitTimeout: 60 * 60,
+        auditRevealTimeout: 60 * 60,
       }),
     )
   ).wait();
@@ -262,6 +274,8 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
       vrfCoordinator: vrfCoordinator.address,
       vrfVerifier: vrfVerifier.address,
       core: core.address,
+      coreImplementation: coreImplementation.address,
+      infoReader: infoReader.address,
       paymentRouter: paymentRouter.address,
       acceptedTokenRegistry: acceptedTokenRegistry.address,
       swapAdapter: swapAdapter.address,

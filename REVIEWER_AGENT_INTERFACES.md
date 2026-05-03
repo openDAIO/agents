@@ -19,7 +19,7 @@ The agent implementation must separate three layers:
 | --- | --- |
 | LLM | Reads request/report content and returns structured semantic outputs only. |
 | Agent runtime | Fetches content, verifies hashes, canonicalizes outputs, stores reports, computes hashes, creates VRF proofs, manages seeds, submits transactions, and monitors events. |
-| Contracts | Validate identity, eligibility, VRF selection, commit/reveal consistency, canonical audit targets, scoring, settlement, slashing, and reputation. |
+| Contracts | Validate identity, eligibility, review VRF selection, commit/reveal consistency, full-audit targets, scoring, settlement, slashing, and reputation. |
 
 The LLM must never receive or emit private keys, transaction calldata signatures, wallet mnemonics, raw commit seeds, or VRF secret material. The runtime owns those.
 
@@ -247,7 +247,7 @@ The runtime must verify every target report:
 
 | Check | Required behavior |
 | --- | --- |
-| Target is canonical | Target must be returned by `AssignmentManager.verifiedCanonicalAuditTargets` or reconstructed from the same VRF rules. |
+| Target is canonical | Target must be every revealed reviewer except the auditor, in `ReviewRevealed` log order. |
 | No self-audit | `targetReviewer != auditor`. |
 | Revealed review exists | Target must have emitted `ReviewRevealed` for the request. |
 | `reportHash` | Fetched report artifact must hash to the on-chain `reportHash`. |
@@ -310,8 +310,8 @@ The official reviewer-facing write entrypoint is `DAIOCommitRevealManager`. The 
 | `DAIOCore` | Read request lifecycle/results and emits phase events. |
 | `DAIOCommitRevealManager` | Submit review/audit commits and reveals. |
 | `ReviewerRegistry` | Read registration, eligibility, public VRF key, and agent ID. |
-| `DAIOVRFCoordinator` | Build and verify VRF messages/randomness. In test/MVP deployments, `MockVRFCoordinator` exposes the same `randomness(...)` view and is a drop-in substitute. |
-| `AssignmentManager` | Preflight canonical audit targets. |
+| `DAIOVRFCoordinator` | Build and verify review VRF messages/randomness. In test/MVP deployments, `MockVRFCoordinator` exposes the same `randomness(...)` view and is a drop-in substitute. |
+| `AssignmentManager` | Compatibility helper for full-audit target previews; audit commits no longer submit target proofs. |
 | `ReputationReader` (optional) | Read long-term and request-level reputation signals. Request-level signals are also available directly from `DAIOCore.getReviewerResult(requestId, reviewer)` (see § 4.4), so a runtime that only needs request-level data may skip this contract. |
 | `StakeVault` / `USDAIO` | Registration stake approval and balance checks. |
 
@@ -343,6 +343,8 @@ ReviewerRegistry.agentId(address reviewer)
 
 Eligibility requires registration, active state, no suspension, enough available stake, no cooldown, matching domain mask, and passing the reputation gate.
 
+`getReviewer` also returns `ensNode` and `ensName`; runtimes should pass that registered metadata to the LLM instead of inventing display names locally.
+
 A test/MVP runtime that registered every reviewer with a single shared VRF public key (e.g. when targeting `MockVRFCoordinator`) may load that key from its deployment configuration instead of issuing a per-call `vrfPublicKey(...)` read. Production deployments with per-reviewer keypairs must read `vrfPublicKey(reviewer)` from the registry on every VRF operation.
 
 ### 4.3 Request and Event Indexing
@@ -370,14 +372,15 @@ The phase start block needed for VRF messages is the block number of the transac
 | Phase | Required phase start block |
 | --- | --- |
 | Review sortition | Block where status became `ReviewCommit`. |
-| Audit target sortition | Block where status became `AuditCommit`. |
+| Audit target selection | Block where status became `AuditCommit`; no VRF message is needed in the current full-audit flow. |
 
 The runtime must also know the deployed tier configuration, especially:
 
 | Config | Use |
 | --- | --- |
 | `reviewElectionDifficulty` | Local precheck for review sortition. |
-| `auditElectionDifficulty` | Local precheck and target selection. |
+| `auditElectionDifficulty` | Must be `10000` in current full-audit configs. |
+| `auditTargetLimit` | Must equal `reviewRevealQuorum - 1`; agents audit every revealed peer. |
 | `reviewEpochSize` / `auditEpochSize` | Interpreting lifecycle epochs. |
 | `finalityFactor` | VRF message construction. |
 | timeouts | Avoid committing if reveal cannot be completed in time. |
@@ -444,21 +447,6 @@ DAIOVRFCoordinator.messageFor(
 )
 ```
 
-For audit target sortition:
-
-```solidity
-DAIOVRFCoordinator.messageFor(
-    core,
-    requestId,
-    keccak256("DAIO_AUDIT_SORTITION"),
-    auditEpoch,
-    auditor,
-    targetReviewer,
-    auditPhaseStartBlock,
-    finalityFactor
-)
-```
-
 The runtime signs/proves the returned message using the reviewer's VRF secret key and submits the proof as `uint256[4]`.
 
 Sortition score:
@@ -468,7 +456,7 @@ score = uint256(keccak256(abi.encode(phase, requestId, participant, target, rand
 pass = score < electionDifficulty
 ```
 
-`target` is `address(0)` for review sortition and the target reviewer address for audit sortition.
+`target` is `address(0)` for review sortition. The current full-audit flow does not use target-specific audit VRF proofs.
 
 When the deployment uses `MockVRFCoordinator` (test/MVP path), the runtime may bypass `messageFor` and the VRF signing step entirely: any non-zero `uint256[4]` is accepted as a proof, and `randomness(...)` is computed deterministically by hashing the same inputs that `messageFor` would have encoded. A common pattern is to load a single `(publicKey, proof)` pair from a known VRF test vector (e.g. `lib/vrf-solidity/test/data.json` decoded via `FRAINVRFVerifier.decodePoint` / `decodeProof`) and reuse it across all phases. Sortition divergence between participants then comes from the participant address term inside the local `score = keccak256(...) % 10000` check, which is identical to the production formula. Production deployments with `DAIOVRFCoordinator` + `FRAINVRFVerifier` and per-reviewer keypairs must perform the full `messageFor` + sign + submit flow.
 
@@ -531,31 +519,11 @@ Audit preconditions:
 | --- | --- |
 | Request status | `AuditCommit`. |
 | Auditor | Must have revealed its own review for the same request. |
-| Target proofs | One proof for each revealed reviewer except self, in revealed-reviewer order. |
-| Canonical targets | Must match `AssignmentManager.verifiedCanonicalAuditTargets`. |
+| Target proofs | Must be an empty array. Non-empty target proofs are rejected. |
+| Canonical targets | Must be every revealed reviewer except self, in revealed-reviewer order. |
 | LLM output | Valid `daio.audit.output.v1`. |
 
-Target proof array order is critical. It must follow the `ReviewRevealed` event order for all revealed reviewers, skipping the auditor itself.
-
-Preflight canonical targets:
-
-```solidity
-AssignmentManager.verifiedCanonicalAuditTargets(
-    vrfCoordinator,
-    publicKey,
-    core,
-    requestId,
-    auditor,
-    revealedReviewers,
-    targetProofs,
-    auditEpoch,
-    auditPhaseStartBlock,
-    finalityFactor,
-    auditElectionDifficulty,
-    auditTargetLimit
-)
-returns (bool ok, address[] selectedTargets)
-```
+Target order is critical. It must follow the `ReviewRevealed` event order for all revealed reviewers, skipping the auditor itself.
 
 Commit:
 
@@ -571,7 +539,7 @@ DAIOCommitRevealManager.commitAudit(
     requestId,
     resultHash,
     seed,
-    targetProofs
+    new uint256[4][](0)
 )
 ```
 
@@ -646,19 +614,18 @@ ERC-8004 feedback is written by `ReputationLedger` through `ERC8004Adapter`; the
 2. Confirm this auditor emitted `ReviewRevealed` for the same request.
 3. Reconstruct `auditPhaseStartBlock` from the phase-change event block.
 4. Reconstruct `revealedReviewers` from `ReviewRevealed` events in log order.
-5. Build one target-specific VRF proof for each revealed reviewer except self.
-6. Preflight `AssignmentManager.verifiedCanonicalAuditTargets`.
-7. If no canonical targets are selected, do not call the LLM or commit audit.
-8. Fetch every canonical target report and verify `reportHash`.
-9. Call LLM with `task = "audit"` and canonical targets in exact order.
-10. Validate LLM JSON, target order, and score bounds.
-11. Optionally store an off-chain audit artifact.
-12. Generate private `seed`.
-13. Compute `resultHash`.
-14. Submit `commitAudit`.
-15. Watch `StatusChanged(requestId, AuditReveal)`.
-16. Submit `revealAudit` before timeout.
-17. Persist target list, scores, seed, and transaction hashes.
+5. Select every revealed reviewer except self, preserving `ReviewRevealed` log order.
+6. If no canonical targets are selected, do not call the LLM or commit audit.
+7. Fetch every canonical target report and verify `reportHash`.
+8. Call LLM with `task = "audit"` and canonical targets in exact order.
+9. Validate LLM JSON, target order, and score bounds.
+10. Optionally store an off-chain audit artifact.
+11. Generate private `seed`.
+12. Compute `resultHash`.
+13. Submit `commitAudit` with an empty target-proof array.
+14. Watch `StatusChanged(requestId, AuditReveal)`.
+15. Submit `revealAudit` before timeout.
+16. Persist target list, scores, seed, and transaction hashes.
 
 ## 6. Fault Avoidance Rules
 
@@ -666,11 +633,11 @@ The runtime must avoid these cases because the current contracts can slash or ma
 
 | Fault | Avoidance rule |
 | --- | --- |
-| Invalid VRF proof | Build proofs from exact `messageFor` inputs. |
-| Sortition failure | Precheck pass when config is available; otherwise accept risk before submitting. |
+| Invalid review VRF proof | Build proofs from exact `messageFor` inputs. |
+| Review sortition failure | Precheck pass when config is available; otherwise accept risk before submitting. |
 | Missing reveal after commit | Never commit unless output and seed are durably stored and reveal automation is active. |
 | Commit/reveal mismatch | Derive reveal payload from the exact values used for `resultHash`. |
-| Non-canonical audit target | Use `AssignmentManager` preflight and preserve target order. |
+| Non-canonical audit target | Audit every revealed peer and preserve target order. |
 | Self-audit | Reject any target equal to auditor wallet. |
 | Duplicate audit target | Reject duplicate targets before commit. |
 | Score out of bounds | Validate every score is integer `0..10000`. |
@@ -731,7 +698,7 @@ The current E2E path verifies:
 1. Direct USDAIO request creation through `PaymentRouter`.
 2. Request queue start through `DAIOCore.startNextRequest`.
 3. Review commit/reveal through `DAIOCommitRevealManager`.
-4. Audit target proof validation through `AssignmentManager`.
+4. Full-audit target validation by `DAIOCore`.
 5. Audit commit/reveal through `DAIOCommitRevealManager`.
 6. Finalization through `ConsensusScoring`, `Settlement`, `ReputationLedger`, and `StakeVault`.
 
@@ -741,8 +708,7 @@ Current contract limitations relevant to agent builders:
 | --- | --- |
 | `phaseStartedBlock` is not exposed by a getter. | Index `StatusChanged` event block numbers. |
 | Revealed reviewer list is internal. | Reconstruct from `ReviewRevealed` events in log order. |
-| Tier config is not exposed by a getter. | Load deployment config off-chain or add a view getter in a future contract change. The reference implementation reads tier-config values (`reviewElectionDifficulty`, `auditElectionDifficulty`, `auditTargetLimit`, `finalityFactor`) from a deployment snapshot or an agent flag. |
+| Tier config is not exposed by a getter. | Load deployment config off-chain or add a view getter in a future contract change. The reference implementation reads tier-config values (`reviewElectionDifficulty`, `auditElectionDifficulty`, `auditTargetLimit`, `finalityFactor`) from storage with fallback flags. |
 | Audit rationale is not stored on-chain. | Store optional audit artifacts off-chain; only target scores affect current contracts. |
 | Test/MVP VRF | The reference implementation deploys `MockVRFCoordinator` and registers all reviewers with a single VRF public key derived from a known test vector. This is sufficient to exercise sortition, commit/reveal, audit, and finalization but does not produce real BN254 randomness. Production should swap in `DAIOVRFCoordinator` + `FRAINVRFVerifier` plus per-reviewer keypairs. |
 | Crash recovery | The reference implementation polls events from the chain head on startup and does not replay historical `StatusChanged` / `ReviewRevealed` events. An agent that crashes between commit and reveal cannot resume on its own. Production should replay events from the request's creation block on boot. |
-

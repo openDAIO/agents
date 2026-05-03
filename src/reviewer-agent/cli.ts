@@ -214,12 +214,12 @@ async function main() {
     reviewElectionDifficulty: bigintSetting(
       values["review-election-difficulty"] as string | undefined,
       "DAIO_REVIEW_ELECTION_DIFFICULTY",
-      5000n,
+      8000n,
     ),
     auditElectionDifficulty: bigintSetting(
       values["audit-election-difficulty"] as string | undefined,
       "DAIO_AUDIT_ELECTION_DIFFICULTY",
-      5000n,
+      10000n,
     ),
     auditTargetLimit: bigintSetting(
       values["audit-target-limit"] as string | undefined,

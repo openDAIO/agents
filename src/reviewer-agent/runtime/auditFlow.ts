@@ -3,7 +3,8 @@ import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } 
 import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
-import { AUDIT_SORTITION, RequestStatus, SCALE } from "../../shared/types.js";
+import { RequestStatus } from "../../shared/types.js";
+import { readReviewerMetadata } from "../chain/reviewerMetadata.js";
 import { buildAuditMessages } from "../llm/prompts.js";
 import { chat, extractJson } from "../llm/client.js";
 import { parseAudit } from "../llm/validate.js";
@@ -79,7 +80,9 @@ export async function runAudit(
   auditTargetLimit: bigint,
   options: PhaseWorkOptions = {},
 ): Promise<{ committed: boolean; reason?: string; commitTx?: string; auditHash?: string; auditURI?: string }> {
-  const { handles, events, content, state, wallet, vrf, log } = deps;
+  const { handles, events, content, state, wallet, log } = deps;
+  void auditElectionDifficulty;
+  void auditTargetLimit;
 
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.AuditCommit);
   if (startBlock === undefined) return { committed: false, reason: "no audit phase start block" };
@@ -113,62 +116,10 @@ export async function runAudit(
   if (existingParticipants.some((addr) => getAddress(addr) === getAddress(wallet.address))) {
     return { committed: false, reason: "already_committed_onchain" };
   }
-  const startBlockBigInt = BigInt(startBlock);
-  const coreAddress = await handles.core.getAddress();
-  const targetProofs = await Promise.all(
-    candidateTargets.map((target) =>
-      vrf.proofFor({
-        coreAddress,
-        requestId,
-        phase: AUDIT_SORTITION,
-        epoch: auditEpoch,
-        participant: wallet.address,
-        target,
-        phaseStartBlock: startBlockBigInt,
-        finalityFactor,
-      }),
-    ),
-  );
-  if (targetProofs.length === 0) return { committed: false, reason: "no candidate targets" };
-
-  const vrfCoordinatorAddress = await handles.vrfCoordinator.getAddress();
-  const verifyTargets = (proofs: typeof targetProofs) =>
-    handles.assignmentManager.verifiedCanonicalAuditTargets(
-      vrfCoordinatorAddress,
-      vrf.publicKey,
-      coreAddress,
-      requestId,
-      wallet.address,
-      reviewers,
-      proofs,
-      auditEpoch,
-      startBlockBigInt,
-      finalityFactor,
-      auditElectionDifficulty,
-      auditTargetLimit,
-    ) as Promise<readonly [boolean, readonly string[]]>;
-
-  let commitTargetProofs = targetProofs;
-  let verified: readonly [boolean, readonly string[]];
-  if (auditElectionDifficulty >= SCALE) {
-    const fullSortition = await verifyTargets([]);
-    if (fullSortition[0] && fullSortition[1].length > 0) {
-      verified = fullSortition;
-      commitTargetProofs = [];
-      log("audit: full-sortition path detected; committing without target VRF proofs");
-    } else {
-      verified = await verifyTargets(targetProofs);
-      log("audit: deployed assignment manager requires target VRF proofs for full-sortition config");
-    }
-  } else {
-    verified = await verifyTargets(targetProofs);
-  }
-  const ok = verified[0];
-  const selectedTargets = verified[1].map((a) => getAddress(a));
-  if (!ok || selectedTargets.length === 0) {
-    return { committed: false, reason: `no canonical targets (ok=${ok}, count=${selectedTargets.length})` };
-  }
-  log(`audit: canonical targets = [${selectedTargets.join(",")}]`);
+  void auditEpoch;
+  void finalityFactor;
+  const selectedTargets = candidateTargets;
+  log(`audit: full-audit targets = [${selectedTargets.join(",")}]`);
 
   const targetReports = await Promise.all(
     selectedTargets.map(async (addr) => {
@@ -232,8 +183,7 @@ export async function runAudit(
     return { committed: false, reason: "too_late_for_commit" };
   }
 
-  const ensName = `reviewer-${wallet.address.slice(2, 8).toLowerCase()}.daio.eth`;
-  const agentId = (await handles.reviewerRegistry.agentId(wallet.address)) as bigint;
+  const reviewerMetadata = await readReviewerMetadata(handles, wallet.address);
 
   const messages = buildAuditMessages({
     schema: "daio.llm.input.v1",
@@ -254,8 +204,8 @@ export async function runAudit(
     },
     auditor: {
       wallet: wallet.address,
-      ensName,
-      agentId: agentId.toString(),
+      ensName: reviewerMetadata.ensName,
+      agentId: reviewerMetadata.agentId.toString(),
     },
     content: {
       proposal: { uri: proposal.uri, mimeType: proposal.mimeType, text: proposal.text },
@@ -329,7 +279,7 @@ export async function runAudit(
   state.save(cur);
 
   const cr = handles.commitReveal.connect(deps.txSigner);
-  const commitArgs = [requestId, resultHash, BigInt(seed), commitTargetProofs] as const;
+  const commitArgs = [requestId, resultHash, BigInt(seed), []] as const;
   const gasLimit = await gasLimitWithHeadroom(
     cr.commitAudit,
     commitArgs,

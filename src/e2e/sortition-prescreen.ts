@@ -1,5 +1,5 @@
 import { AbiCoder, keccak256, Wallet, ZeroAddress, type JsonRpcProvider } from "ethers";
-import { REVIEW_SORTITION, AUDIT_SORTITION } from "../shared/types.js";
+import { REVIEW_SORTITION } from "../shared/types.js";
 import type { ContractHandles } from "../reviewer-agent/chain/contracts.js";
 import { daioVrfMessage, type VrfProof, type VrfProofProvider, type VrfPublicKey } from "../reviewer-agent/chain/vrfProof.js";
 
@@ -18,7 +18,8 @@ export interface PreScreenInput {
   auditTargetLimit: bigint;
   provider: JsonRpcProvider;
   reviewPhaseStartBlock: bigint;
-  // approximate auditPhaseStartedBlock = reviewPhaseStartBlock + 4 (mirrors test helper).
+  // Retained for older callers; full-audit contracts no longer use audit phase
+  // blocks for target sortition.
   auditPhaseStartBlockOffset: bigint;
   requestId: bigint;
   committeeEpoch: bigint;
@@ -117,13 +118,18 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
       auditPhaseStartBlockOffset: req.auditPhaseStartBlockOffset ?? input.auditPhaseStartBlockOffset,
     })),
   ];
-  const requiredAuditTargets = Math.min(Number(input.auditTargetLimit), input.quorum - 1);
+  const requiredAuditTargets = input.quorum - 1;
   if (input.agentCount < input.quorum) throw new Error("prescreen: agentCount must be >= quorum");
   if (requiredAuditTargets <= 0) throw new Error("prescreen: audit target requirement must be positive");
+  if (input.auditElectionDifficulty !== SCALE) {
+    throw new Error("prescreen: full-audit flow requires auditElectionDifficulty=10000");
+  }
+  if (input.auditTargetLimit !== BigInt(requiredAuditTargets)) {
+    throw new Error(`prescreen: full-audit flow requires auditTargetLimit = quorum - 1 (${requiredAuditTargets})`);
+  }
 
   // Memoize sortition checks
   const reviewCache = new Map<string, boolean>();
-  const auditCache = new Map<string, boolean>();
 
   const reviewPass = async (idx: number, req: (typeof requests)[number]): Promise<boolean> => {
     const addr = wallets[idx]!.address;
@@ -157,52 +163,6 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
     return ok;
   };
 
-  const auditPass = async (auditorIdx: number, targetIdx: number, req: (typeof requests)[number]): Promise<boolean> => {
-    const auditor = wallets[auditorIdx]!.address;
-    const target = wallets[targetIdx]!.address;
-    const auditPhaseStartBlock = req.reviewPhaseStartBlock + req.auditPhaseStartBlockOffset;
-    const key = `${req.requestId}|${auditPhaseStartBlock}|${req.auditEpoch}|${auditor}|${target}`;
-    if (auditCache.has(key)) return auditCache.get(key)!;
-    if (input.auditElectionDifficulty >= SCALE) {
-      auditCache.set(key, true);
-      return true;
-    }
-    const auditStableBlock = auditPhaseStartBlock > input.finalityFactor ? auditPhaseStartBlock - input.finalityFactor : 0n;
-    const currentBlock = BigInt(await input.provider.getBlockNumber());
-    if (auditStableBlock > currentBlock) {
-      auditCache.set(key, true);
-      return true;
-    }
-    const vrf = input.vrfProviders[auditorIdx]!;
-    const proof = await vrf.proofFor({
-      coreAddress,
-      requestId: req.requestId,
-      phase: AUDIT_SORTITION,
-      epoch: req.auditEpoch,
-      participant: auditor,
-      target,
-      phaseStartBlock: auditPhaseStartBlock,
-      finalityFactor: input.finalityFactor,
-    });
-    const ok = await verifiedSortitionPass({
-      handles: input.handles,
-      provider: input.provider,
-      coreAddress,
-      publicKey: vrf.publicKey,
-      proof,
-      requestId: req.requestId,
-      phase: AUDIT_SORTITION,
-      epoch: req.auditEpoch,
-      participant: auditor,
-      target,
-      phaseStartBlock: auditPhaseStartBlock,
-      finalityFactor: input.finalityFactor,
-      difficulty: input.auditElectionDifficulty,
-    });
-    auditCache.set(key, ok);
-    return ok;
-  };
-
   const indexes = wallets.map((_, i) => i);
   for (const combo of combinations(indexes, input.agentCount)) {
     let firstReviewPassIndexes: number[] | undefined;
@@ -218,19 +178,7 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
         break;
       }
 
-      let completeAuditGraph = true;
-      for (const auditorIdx of reviewPassIndexes) {
-        let selectedTargets = 0;
-        for (const targetIdx of reviewPassIndexes) {
-          if (auditorIdx === targetIdx) continue;
-          if (await auditPass(auditorIdx, targetIdx, req)) selectedTargets++;
-        }
-        if (selectedTargets < reviewPassIndexes.length - 1 || selectedTargets < requiredAuditTargets) {
-          completeAuditGraph = false;
-          break;
-        }
-      }
-      if (!completeAuditGraph) {
+      if (reviewPassIndexes.length - 1 < requiredAuditTargets) {
         satisfiesAllRequests = false;
         break;
       }

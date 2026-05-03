@@ -45,6 +45,36 @@ export interface AgentStatusRow {
   updatedAt: number;
 }
 
+export interface AgentContextEventRow {
+  id: number;
+  requestId: string;
+  agentKey: string;
+  agent: string;
+  eventType: string;
+  phase: string | null;
+  status: string | null;
+  detail: string | null;
+  payloadJson: string;
+  createdAt: number;
+}
+
+export interface AgentQaHistoryRow {
+  id: number;
+  requestId: string;
+  agentKey: string;
+  agent: string;
+  sessionId: string;
+  question: string;
+  answer: string;
+  confidence: number;
+  contextSummaryJson: string;
+  model: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  createdAt: number;
+}
+
 export class ContentDB {
   private readonly db: Database.Database;
 
@@ -116,6 +146,38 @@ export class ContentDB {
         updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
         PRIMARY KEY (request_id, agent_key)
       );
+      CREATE TABLE IF NOT EXISTS agent_context_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL,
+        agent_key TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        phase TEXT,
+        status TEXT,
+        detail TEXT,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+      );
+      CREATE INDEX IF NOT EXISTS agent_context_events_lookup
+        ON agent_context_events (request_id, agent_key, created_at DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS agent_qa_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL,
+        agent_key TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        confidence INTEGER NOT NULL,
+        context_summary_json TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS agent_qa_history_lookup
+        ON agent_qa_history (request_id, agent_key, session_id, created_at DESC, id DESC);
     `);
   }
 
@@ -309,6 +371,16 @@ export class ContentDB {
            updated_at=strftime('%s','now')`,
       )
       .run({ ...row, detail: row.detail ?? null });
+    this.appendAgentContextEvent({
+      requestId: row.requestId,
+      agentKey: row.agentKey,
+      agent: row.agent,
+      eventType: "status_update",
+      phase: row.phase,
+      status: row.status,
+      detail: row.detail ?? null,
+      payloadJson: row.payloadJson,
+    });
   }
 
   getAgentStatus(requestId: string, agentKey: string): AgentStatusRow | undefined {
@@ -346,6 +418,189 @@ export class ContentDB {
          ORDER BY updated_at DESC, agent ASC`,
       )
       .all(requestId) as AgentStatusRow[];
+  }
+
+  appendAgentContextEvent(row: {
+    requestId: string;
+    agentKey: string;
+    agent: string;
+    eventType: string;
+    phase?: string | null;
+    status?: string | null;
+    detail?: string | null;
+    payloadJson: string;
+  }): AgentContextEventRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO agent_context_events (
+           request_id,
+           agent_key,
+           agent,
+           event_type,
+           phase,
+           status,
+           detail,
+           payload_json
+         ) VALUES (
+           @requestId,
+           @agentKey,
+           @agent,
+           @eventType,
+           @phase,
+           @status,
+           @detail,
+           @payloadJson
+         )`,
+      )
+      .run({
+        ...row,
+        phase: row.phase ?? null,
+        status: row.status ?? null,
+        detail: row.detail ?? null,
+      });
+    return this.db
+      .prepare(
+        `SELECT
+           id,
+           request_id AS requestId,
+           agent_key AS agentKey,
+           agent,
+           event_type AS eventType,
+           phase,
+           status,
+           detail,
+           payload_json AS payloadJson,
+           created_at AS createdAt
+         FROM agent_context_events
+         WHERE id = ?`,
+      )
+      .get(info.lastInsertRowid) as AgentContextEventRow;
+  }
+
+  listAgentContextEvents(requestId: string, agentKey: string, limit: number): AgentContextEventRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           id,
+           request_id AS requestId,
+           agent_key AS agentKey,
+           agent,
+           event_type AS eventType,
+           phase,
+           status,
+           detail,
+           payload_json AS payloadJson,
+           created_at AS createdAt
+         FROM agent_context_events
+         WHERE request_id = ? AND agent_key = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(requestId, agentKey, limit) as AgentContextEventRow[];
+    return rows.reverse();
+  }
+
+  insertAgentQaHistory(row: {
+    requestId: string;
+    agentKey: string;
+    agent: string;
+    sessionId: string;
+    question: string;
+    answer: string;
+    confidence: number;
+    contextSummaryJson: string;
+    model: string;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    totalTokens?: number | null;
+    createdAt: number;
+  }): AgentQaHistoryRow {
+    const info = this.db
+      .prepare(
+        `INSERT INTO agent_qa_history (
+           request_id,
+           agent_key,
+           agent,
+           session_id,
+           question,
+           answer,
+           confidence,
+           context_summary_json,
+           model,
+           prompt_tokens,
+           completion_tokens,
+           total_tokens,
+           created_at
+         ) VALUES (
+           @requestId,
+           @agentKey,
+           @agent,
+           @sessionId,
+           @question,
+           @answer,
+           @confidence,
+           @contextSummaryJson,
+           @model,
+           @promptTokens,
+           @completionTokens,
+           @totalTokens,
+           @createdAt
+         )`,
+      )
+      .run({
+        ...row,
+        promptTokens: row.promptTokens ?? null,
+        completionTokens: row.completionTokens ?? null,
+        totalTokens: row.totalTokens ?? null,
+      });
+    return this.db
+      .prepare(
+        `SELECT
+           id,
+           request_id AS requestId,
+           agent_key AS agentKey,
+           agent,
+           session_id AS sessionId,
+           question,
+           answer,
+           confidence,
+           context_summary_json AS contextSummaryJson,
+           model,
+           prompt_tokens AS promptTokens,
+           completion_tokens AS completionTokens,
+           total_tokens AS totalTokens,
+           created_at AS createdAt
+         FROM agent_qa_history
+         WHERE id = ?`,
+      )
+      .get(info.lastInsertRowid) as AgentQaHistoryRow;
+  }
+
+  listAgentQaHistory(requestId: string, agentKey: string, sessionId: string, limit: number): AgentQaHistoryRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           id,
+           request_id AS requestId,
+           agent_key AS agentKey,
+           agent,
+           session_id AS sessionId,
+           question,
+           answer,
+           confidence,
+           context_summary_json AS contextSummaryJson,
+           model,
+           prompt_tokens AS promptTokens,
+           completion_tokens AS completionTokens,
+           total_tokens AS totalTokens,
+           created_at AS createdAt
+         FROM agent_qa_history
+         WHERE request_id = ? AND agent_key = ? AND session_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(requestId, agentKey, sessionId, limit) as AgentQaHistoryRow[];
+    return rows.reverse();
   }
 
   close(): void {

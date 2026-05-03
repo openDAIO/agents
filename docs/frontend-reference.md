@@ -144,6 +144,8 @@ Endpoint summary:
 | `GET` | `/requests/:requestId/agent-statuses` | List all known off-chain agent statuses for a request. |
 | `GET` | `/requests/:requestId/agents/:agent/status` | Read one agent's off-chain status. |
 | `GET` | `/requests/:requestId/agents/:agent/reasons` | Read one agent's persisted final review/audit rationales. |
+| `POST` | `/requests/:requestId/agents/:agent/ask` | Ask an agent-scoped question using request, chain, artifact, event, and Q&A context. |
+| `GET` | `/requests/:requestId/agents/:agent/qa-history` | Read stored Q&A history for one request, agent, and session. |
 | `POST` | `/proposals` | Store proposal Markdown directly; mostly internal/debug. |
 | `GET` | `/proposals/:id` | Read a stored proposal. |
 | `GET` | `/proposals/:id/markdown` | Read stored proposal Markdown as JSON or raw Markdown. |
@@ -558,6 +560,184 @@ Response:
 
 Important: hidden model chain-of-thought is intentionally not exposed. Use the structured rationales and final artifacts.
 
+### `POST /requests/:requestId/agents/:agent/ask`
+
+Asks an arbitrary question from the perspective of a specific agent for a
+specific request. This endpoint is public in the current deployment profile; no
+auth header is required. It calls the same OpenAI-compatible LLM endpoint used by
+reviewer agents.
+
+The Q&A context is assembled from currently available data:
+
+- request document and verified payment metadata, with proposal text capped by
+  `LLM_PROPOSAL_CHAR_BUDGET`
+- live chain lifecycle from the configured RPC failover provider
+- latest `PUT /agent-status` row for the agent
+- final review/audit artifacts, when present
+- recent agent context events, including status transitions and artifact writes
+- recent Q&A pairs for the same `(requestId, agent, sessionId)`
+
+Hidden chain-of-thought is not stored, exposed, or used as raw text. The prompt
+does include persisted structured rationales, artifact summaries, status/event
+logs, and prior Q&A in the selected session.
+
+Request body:
+
+```json
+{
+  "question": "What did you decide so far, and what is still unknown?",
+  "sessionId": "default"
+}
+```
+
+Fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `question` | yes | Non-empty user question. |
+| `sessionId` | no | Defaults to `"default"`. History is isolated by `requestId + agent + sessionId`. |
+
+Response:
+
+```json
+{
+  "requestId": "13",
+  "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+  "sessionId": "live-e2e",
+  "answer": "Review stage: I assigned weak_accept with score 6200...",
+  "confidence": 9700,
+  "contextUsed": {
+    "hasDocument": true,
+    "hasReview": true,
+    "hasAudit": true,
+    "agentStatus": "Finalized:finalized",
+    "historyUsed": 3,
+    "eventsUsed": 17,
+    "chainStatus": "Finalized"
+  },
+  "model": "gpt-oss-120b",
+  "usage": {
+    "promptTokens": 0,
+    "completionTokens": 0,
+    "totalTokens": 0
+  },
+  "createdAt": 1777810044
+}
+```
+
+Error responses:
+
+| Status | Error | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_params` or `invalid_agent_question` | Bad request id, bad agent address, or invalid body. |
+| `404` | `not_found` | No document, status, artifact, event, or chain context exists for that request/agent. |
+| `503` | `agent_qa_unavailable` | The LLM call or JSON response parsing failed. |
+
+Live Sepolia example from 2026-05-03:
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sessionId": "live-e2e",
+    "question": "Summarize your final review and audit judgment."
+  }' \
+  http://127.0.0.1:18002/requests/13/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/ask
+```
+
+Observed response excerpt:
+
+```json
+{
+  "requestId": "13",
+  "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+  "sessionId": "live-e2e",
+  "confidence": 9700,
+  "contextUsed": {
+    "hasDocument": true,
+    "hasReview": true,
+    "hasAudit": true,
+    "agentStatus": "Finalized:finalized",
+    "historyUsed": 2,
+    "eventsUsed": 16,
+    "chainStatus": "Finalized"
+  },
+  "answer": "Review stage: weak_accept, score 6200, confidence 7200. The request has finalized and audit context is available..."
+}
+```
+
+The same request was also queried during `ReviewCommit`, before review/audit
+artifacts existed. The response succeeded with:
+
+```json
+{
+  "contextUsed": {
+    "hasDocument": true,
+    "hasReview": false,
+    "hasAudit": false,
+    "agentStatus": "ReviewCommit:running",
+    "historyUsed": 0,
+    "eventsUsed": 2,
+    "chainStatus": "ReviewCommit"
+  }
+}
+```
+
+### `GET /requests/:requestId/agents/:agent/qa-history`
+
+Returns stored Q&A rows for one request, agent, and session. `:agent` must be an
+Ethereum address.
+
+Query parameters:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `sessionId` | `default` | Reads only this session's history. |
+| `limit` | `20` | Maximum rows to return for display/debug. |
+
+Response:
+
+```json
+{
+  "requestId": "13",
+  "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+  "sessionId": "live-e2e",
+  "history": [
+    {
+      "id": 42,
+      "requestId": "13",
+      "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+      "sessionId": "live-e2e",
+      "question": "Summarize your final review and audit judgment.",
+      "answer": "...",
+      "confidence": 9700,
+      "contextUsed": {
+        "hasDocument": true,
+        "hasReview": true,
+        "hasAudit": true,
+        "agentStatus": "Finalized:finalized",
+        "historyUsed": 3,
+        "eventsUsed": 17,
+        "chainStatus": "Finalized"
+      },
+      "model": "gpt-oss-120b",
+      "usage": {
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0
+      },
+      "createdAt": 1777810044
+    }
+  ]
+}
+```
+
+The prompt context window for prior Q&A pairs is controlled by
+`CONTENT_AGENT_QA_HISTORY_WINDOW`; the default is `3`. A live Sepolia smoke test
+with four questions in `sessionId=live-e2e` stored four rows, while the final
+answer used `historyUsed=3`. A separate `sessionId=live-e2e-other` started with
+`historyUsed=0`.
+
 When `CONTENT_REQUIRE_AGENT_SIGNATURES=true`, status and reason data is written
 only by requests signed with the reviewer/auditor wallet. The content API still
 serves these as off-chain observability records. Frontends that need settlement
@@ -580,6 +760,8 @@ These are mostly agent/internal, but they can be useful for debugging or explore
 | `POST` | `/audits` | Agent-only. Store canonical audit artifact; with signature enforcement, body is `{ artifact, signature }`. |
 | `GET` | `/audits/:hash` | Read a stored audit artifact. |
 | `PUT` | `/agent-status` | Agent-only status writer; with signature enforcement, body includes `signature`. Frontends should normally read status endpoints instead. |
+| `POST` | `/requests/:requestId/agents/:agent/ask` | Public Q&A reader backed by the LLM and persisted request/agent context. |
+| `GET` | `/requests/:requestId/agents/:agent/qa-history` | Public Q&A history reader for one session. |
 
 Proposal response shape for `POST /proposals` and `GET /proposals/:id`:
 
@@ -736,12 +918,13 @@ Interpretation notes:
 - Contract views/events are the settlement source of truth for lifecycle status,
   participant acceptance, finalized scores, rewards, and slashing.
 - Content API records are off-chain convenience data for documents, final
-  rationales, and current agent observability. They can lag chain events during
-  processing.
+  rationales, current agent observability, and agent-scoped Q&A. They can lag
+  chain events during processing.
 - `GET /requests/:requestId/markdown` is the canonical off-chain document body
   for a request; its `proposal.hash` equals the on-chain `proposalHash`.
 - The reasons endpoint intentionally reports `rawThinking.available=false`.
-  Hidden chain-of-thought is not persisted or exposed.
+  Hidden chain-of-thought is not persisted or exposed. The Q&A endpoint uses
+  structured artifacts, status events, and stored summaries instead.
 
 ### `ReviewerRegistry`
 
@@ -873,3 +1056,5 @@ Use APIs:
 
 - `GET /requests/:requestId/agents/:agent/status`
 - `GET /requests/:requestId/agents/:agent/reasons`
+- `POST /requests/:requestId/agents/:agent/ask`
+- `GET /requests/:requestId/agents/:agent/qa-history?sessionId=default`

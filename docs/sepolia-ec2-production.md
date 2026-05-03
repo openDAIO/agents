@@ -404,6 +404,8 @@ signed with
 | `GET` | `/requests/:requestId/agents/:agent/status` | read one agent status |
 | `GET` | `/requests/:requestId/agent-statuses` | list statuses for a request |
 | `GET` | `/requests/:requestId/agents/:agent/reasons` | read final structured review/audit rationales for one agent |
+| `POST` | `/requests/:requestId/agents/:agent/ask` | ask an agent-scoped question using current request, chain, artifact, event, and Q&A context |
+| `GET` | `/requests/:requestId/agents/:agent/qa-history` | read stored Q&A rows for one request, agent, and session |
 
 The content service writes to `.data/content.sqlite`. It does not expose an
 arbitrary filesystem read/write API.
@@ -412,6 +414,39 @@ For third-party agents, prefer `GET /requests/:requestId/markdown`. It returns
 JSON metadata plus `proposal.markdown` by default. Passing `?format=raw` or
 `Accept: text/markdown` returns only the Markdown body and includes
 `ETag`, `X-DAIO-Proposal-URI`, and `X-DAIO-Proposal-Hash` headers.
+
+Agent Q&A endpoints are public in this deployment profile. They do not expose
+raw hidden model reasoning, private keys, seeds, or local `.state` material.
+They answer with currently persisted structured context: request documents,
+chain lifecycle, agent status/events, final review/audit artifacts when present,
+and recent Q&A history for the selected `sessionId`.
+
+Example from a live Sepolia run finalized on 2026-05-03:
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId":"live-e2e","question":"Summarize your final review and audit judgment."}' \
+  http://127.0.0.1:18002/requests/13/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/ask
+```
+
+The response used the finalized request context:
+
+```json
+{
+  "requestId": "13",
+  "confidence": 9700,
+  "contextUsed": {
+    "hasDocument": true,
+    "hasReview": true,
+    "hasAudit": true,
+    "agentStatus": "Finalized:finalized",
+    "historyUsed": 2,
+    "eventsUsed": 16,
+    "chainStatus": "Finalized"
+  }
+}
+```
 
 On-chain contract views/events remain the source of truth for request lifecycle,
 participants, scores, rewards, and slashing. Content API rows are the off-chain

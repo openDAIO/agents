@@ -223,7 +223,8 @@ export async function runReview(
 
   const t0 = Date.now();
   const llm = await chat(messages, { responseFormatJson: true });
-  log(`review: LLM ok (${Date.now() - t0}ms, ${llm.totalTokens ?? "?"} tokens)`);
+  const llmLatencyMs = Date.now() - t0;
+  log(`review: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens)`);
   const parsed = parseReview(extractJson(llm.content), {
     requestId: requestId.toString(),
     reviewer: wallet.address,
@@ -248,6 +249,18 @@ export async function runReview(
   if (stored.hash !== reportHash) {
     throw new Error(`report hash mismatch between client (${reportHash}) and server (${stored.hash})`);
   }
+  await deps.recordStatus?.(requestId, "ReviewCommit", "llm_completed", "review reasoning summary generated", {
+    proposalScore: parsed.proposalScore,
+    recommendation: parsed.report.recommendation,
+    confidence: parsed.report.confidence,
+    reportHash,
+    reportURI: stored.uri,
+    summary: parsed.report.summary,
+    promptTokens: llm.promptTokens,
+    completionTokens: llm.completionTokens,
+    totalTokens: llm.totalTokens,
+    llmLatencyMs,
+  });
   if (!(await hasReviewCommitWindow(deps, requestId, startBlock, options))) {
     return { committed: false, reason: "too_late_for_commit", reportHash, reportURI: stored.uri };
   }

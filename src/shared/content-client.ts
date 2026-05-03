@@ -96,6 +96,41 @@ export interface AgentReasonsRecord {
   };
 }
 
+export interface AgentQaContextUsed {
+  hasDocument: boolean;
+  hasReview: boolean;
+  hasAudit: boolean;
+  agentStatus: string | null;
+  historyUsed: number;
+  eventsUsed: number;
+  chainStatus: string | null;
+}
+
+export interface AgentQaRecord {
+  id?: number;
+  requestId: string;
+  agent: string;
+  sessionId: string;
+  question?: string;
+  answer: string;
+  confidence: number;
+  contextUsed: AgentQaContextUsed;
+  model: string;
+  usage: {
+    promptTokens: number | null;
+    completionTokens: number | null;
+    totalTokens: number | null;
+  };
+  createdAt: number;
+}
+
+export interface AgentQaHistoryRecord {
+  requestId: string;
+  agent: string;
+  sessionId: string;
+  history: AgentQaRecord[];
+}
+
 export interface USDAIORequestIntentRecord {
   requester: string;
   id: string;
@@ -335,5 +370,40 @@ export class ContentServiceClient {
     const res = await fetch(this.url(`/requests/${requestId.toString()}/agents/${encodeURIComponent(agent)}/reasons`));
     if (!res.ok) throw new Error(`getAgentReasons: ${res.status} ${await res.text()}`);
     return (await res.json()) as AgentReasonsRecord;
+  }
+
+  async askAgent(input: {
+    requestId: string | bigint | number;
+    agent: string;
+    question: string;
+    sessionId?: string;
+  }): Promise<AgentQaRecord> {
+    const res = await fetch(
+      this.url(`/requests/${input.requestId.toString()}/agents/${encodeURIComponent(input.agent)}/ask`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: input.question, ...(input.sessionId ? { sessionId: input.sessionId } : {}) }),
+      },
+    );
+    if (!res.ok) throw new Error(`askAgent: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentQaRecord;
+  }
+
+  async getAgentQaHistory(input: {
+    requestId: string | bigint | number;
+    agent: string;
+    sessionId?: string;
+    limit?: number;
+  }): Promise<AgentQaHistoryRecord> {
+    const params = new URLSearchParams();
+    if (input.sessionId) params.set("sessionId", input.sessionId);
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(
+      this.url(`/requests/${input.requestId.toString()}/agents/${encodeURIComponent(input.agent)}/qa-history${suffix}`),
+    );
+    if (!res.ok) throw new Error(`getAgentQaHistory: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentQaHistoryRecord;
   }
 }

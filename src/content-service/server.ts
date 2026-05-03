@@ -17,6 +17,8 @@ import {
   waitForTransactionWithRetries,
   withRpcReadRetries,
 } from "../shared/rpc.js";
+import { chat, extractJson } from "../reviewer-agent/llm/client.js";
+import { budgetProposal } from "../reviewer-agent/llm/prepareInput.js";
 
 export interface ServerOptions {
   dbPath: string;
@@ -54,6 +56,14 @@ function boolEnv(name: string, fallback: boolean): boolean {
   const value = process.env[name];
   if (value === undefined || value.trim() === "") return fallback;
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function integerEnv(name: string, fallback: number, min: number, max: number): number {
+  const value = process.env[name];
+  if (value === undefined || value.trim() === "") return fallback;
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) return fallback;
+  return parsed;
 }
 
 function corsConfigFromEnv(): CorsConfig {
@@ -135,6 +145,21 @@ const AgentStatusBody = z.object({
   detail: z.string().max(1000).optional(),
   payload: z.record(z.unknown()).optional().default({}),
   signature: HexSignature.optional(),
+});
+
+const AgentAskBody = z.object({
+  question: z.string().min(1).max(8000),
+  sessionId: z.string().min(1).max(120).default("default"),
+});
+
+const AgentQaHistoryQuery = z.object({
+  sessionId: z.string().min(1).max(120).default("default"),
+  limit: z.preprocess((value) => (value === undefined ? 20 : Number(value)), z.number().int().min(1).max(100)),
+});
+
+const AgentQaModelResponse = z.object({
+  answer: z.string().min(1),
+  confidence: z.number().int().min(0).max(10000).default(0),
 });
 
 const ReviewArtifactBody = z.union([
@@ -261,6 +286,48 @@ function serializeAgentStatus(row: ReturnType<ContentDB["getAgentStatus"]>) {
   };
 }
 
+function parseStoredJson(json: string): unknown {
+  try {
+    return JSON.parse(json) as unknown;
+  } catch (_err) {
+    return { _invalidJson: true };
+  }
+}
+
+function serializeAgentContextEvent(row: ReturnType<ContentDB["listAgentContextEvents"]>[number]) {
+  return {
+    id: row.id,
+    requestId: row.requestId,
+    agent: row.agent,
+    eventType: row.eventType,
+    phase: row.phase,
+    status: row.status,
+    detail: row.detail,
+    payload: parseStoredJson(row.payloadJson),
+    createdAt: row.createdAt,
+  };
+}
+
+function serializeAgentQaHistory(row: ReturnType<ContentDB["listAgentQaHistory"]>[number]) {
+  return {
+    id: row.id,
+    requestId: row.requestId,
+    agent: row.agent,
+    sessionId: row.sessionId,
+    question: row.question,
+    answer: row.answer,
+    confidence: row.confidence,
+    contextUsed: parseStoredJson(row.contextSummaryJson),
+    model: row.model,
+    usage: {
+      promptTokens: row.promptTokens,
+      completionTokens: row.completionTokens,
+      totalTokens: row.totalTokens,
+    },
+    createdAt: row.createdAt,
+  };
+}
+
 function serializeRequestDocument(db: ContentDB, requestId: string) {
   const row = db.getRequestDocument(requestId);
   if (!row) return undefined;
@@ -351,6 +418,45 @@ function findAuditArtifact(db: ContentDB, requestId: string, agent: string) {
     }
   }
   return undefined;
+}
+
+function buildAgentReasons(db: ContentDB, requestId: string, agent: string) {
+  const normalizedAgent = getAddress(agent);
+  const reviewRow = findReviewArtifact(db, requestId, normalizedAgent);
+  const auditRow = findAuditArtifact(db, requestId, normalizedAgent);
+  const reviewArtifact = reviewRow ? ReviewArtifact.parse(JSON.parse(reviewRow.json)) : undefined;
+  const auditArtifact = auditRow ? AuditArtifact.parse(JSON.parse(auditRow.json)) : undefined;
+
+  return {
+    requestId,
+    agent: normalizedAgent,
+    rawThinking: RAW_THINKING_NOTICE,
+    review: reviewArtifact
+      ? {
+          reportHash: reviewRow!.hash,
+          proposalScore: reviewArtifact.proposalScore,
+          summary: reviewArtifact.report.summary,
+          recommendation: reviewArtifact.report.recommendation,
+          confidence: reviewArtifact.report.confidence,
+          rubricAssessments: reviewArtifact.report.rubricAssessments,
+          strengths: reviewArtifact.report.strengths,
+          weaknesses: reviewArtifact.report.weaknesses,
+          risks: reviewArtifact.report.risks,
+          rawFinalArtifact: reviewArtifact,
+        }
+      : null,
+    audit: auditArtifact
+      ? {
+          auditHash: auditRow!.hash,
+          targetEvaluations: auditArtifact.targets.map((targetReviewer, i) => ({
+            targetReviewer,
+            score: auditArtifact.scores[i],
+            rationale: auditArtifact.rationales[i] ?? "",
+          })),
+          rawFinalArtifact: auditArtifact,
+        }
+      : null,
+  };
 }
 
 function formatError(err: unknown): string {
@@ -560,6 +666,25 @@ function serializeRequestLifecycle(requestId: string, lifecycle: readonly unknow
   };
 }
 
+const AGENT_QA_SYSTEM = `You answer as a specific DAIO reviewer agent for one request. Use the provided structured context, including current phase, status, stored review/audit artifacts, stored reasoning summaries, and recent Q&A history. Answer the user's question directly and accurately. If context is missing or the agent has not reached a phase yet, say that clearly. Do not invent private information. Never reveal private keys, VRF secrets, commit/reveal seeds, or raw hidden model reasoning. Raw hidden thinking is not available; use only final structured rationales, stored summaries, and observable state. Return ONLY valid JSON with fields: answer (string) and confidence (integer 0..10000).`;
+
+function buildAgentQaMessages(input: {
+  question: string;
+  context: Record<string, unknown>;
+}): Array<{ role: "system" | "user"; content: string }> {
+  return [
+    { role: "system", content: AGENT_QA_SYSTEM },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: "daio.agent.qa.input.v1",
+        question: input.question,
+        context: input.context,
+      }),
+    },
+  ];
+}
+
 export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: ContentDB } {
   const db = new ContentDB(opts.dbPath);
   const app = Fastify({ logger: opts.logger ?? false, bodyLimit: 25 * 1024 * 1024 });
@@ -568,6 +693,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   const rpcUrl = opts.chain?.rpcUrl;
   const rpcUrls = opts.chain?.rpcUrls;
   const requireAgentSignatures = opts.requireAgentSignatures ?? true;
+  const qaHistoryWindow = integerEnv("CONTENT_AGENT_QA_HISTORY_WINDOW", 3, 0, 50);
   let relayerProvider: Provider | undefined;
   let relayerSigner: NonceManager | undefined;
 
@@ -898,6 +1024,22 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       reviewer: getAddress(artifact.reviewer),
       hash,
     });
+    db.appendAgentContextEvent({
+      requestId: artifact.requestId,
+      agentKey: addressKey(artifact.reviewer),
+      agent: getAddress(artifact.reviewer),
+      eventType: "review_artifact",
+      phase: "ReviewCommit",
+      status: "artifact_stored",
+      detail: "review artifact stored",
+      payloadJson: JSON.stringify({
+        reportHash: hash,
+        proposalScore: artifact.proposalScore,
+        recommendation: artifact.report.recommendation,
+        confidence: artifact.report.confidence,
+        summary: artifact.report.summary,
+      }),
+    });
     return { uri: `content://reports/${hash}`, hash, artifact };
   });
 
@@ -936,6 +1078,21 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       auditorKey: addressKey(artifact.auditor),
       auditor: getAddress(artifact.auditor),
       hash,
+    });
+    db.appendAgentContextEvent({
+      requestId: artifact.requestId,
+      agentKey: addressKey(artifact.auditor),
+      agent: getAddress(artifact.auditor),
+      eventType: "audit_artifact",
+      phase: "AuditCommit",
+      status: "artifact_stored",
+      detail: "audit artifact stored",
+      payloadJson: JSON.stringify({
+        auditHash: hash,
+        targetCount: artifact.targets.length,
+        targets: artifact.targets,
+        scores: artifact.scores,
+      }),
     });
     return { uri: `content://audits/${hash}`, hash, artifact };
   });
@@ -1202,47 +1359,184 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     };
   });
 
+  app.post<{ Params: { requestId: string; agent: string } }>("/requests/:requestId/agents/:agent/ask", async (req, reply) => {
+    if (!/^\d+$/.test(req.params.requestId) || !HexAddress.safeParse(req.params.agent).success) {
+      reply.code(400);
+      return { error: "invalid_params" };
+    }
+    const parsed = AgentAskBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400);
+      return { error: "invalid_agent_question", issues: parsed.error.issues };
+    }
+
+    const agent = getAddress(req.params.agent);
+    const agentKey = addressKey(agent);
+    const doc = serializeRequestDocument(db, req.params.requestId);
+    const agentStatus = serializeAgentStatus(db.getAgentStatus(req.params.requestId, agentKey));
+    const reasons = buildAgentReasons(db, req.params.requestId, agent);
+    const events = db.listAgentContextEvents(req.params.requestId, agentKey, 50).map((row) =>
+      serializeAgentContextEvent(row),
+    );
+    const history = db
+      .listAgentQaHistory(req.params.requestId, agentKey, parsed.data.sessionId, qaHistoryWindow)
+      .map((row) => serializeAgentQaHistory(row));
+
+    let chainStatus: ReturnType<typeof serializeRequestLifecycle> | null = null;
+    let chainStatusError: string | null = null;
+    try {
+      const deployment = loadDeploymentSnapshot(deploymentPath);
+      const handles = loadContracts(deployment, chainProvider());
+      const lifecycle = await withRpcReadRetries(() =>
+        handles.core.getRequestLifecycle(BigInt(req.params.requestId)),
+      );
+      chainStatus = serializeRequestLifecycle(req.params.requestId, lifecycle as readonly unknown[]);
+    } catch (err) {
+      chainStatusError = formatError(err);
+    }
+
+    if (!doc && !agentStatus && !reasons.review && !reasons.audit && events.length === 0 && !chainStatus) {
+      reply.code(404);
+      return { error: "not_found" };
+    }
+
+    const contextUsed = {
+      hasDocument: Boolean(doc),
+      hasReview: Boolean(reasons.review),
+      hasAudit: Boolean(reasons.audit),
+      agentStatus: agentStatus ? `${agentStatus.phase}:${agentStatus.status}` : null,
+      historyUsed: history.length,
+      eventsUsed: events.length,
+      chainStatus: chainStatus?.statusName ?? null,
+    };
+    const qaContext = {
+      request: {
+        requestId: req.params.requestId,
+        chainStatus,
+        chainStatusError,
+      },
+      agent: {
+        address: agent,
+        latestStatus: agentStatus,
+      },
+      document: doc
+        ? {
+            updatedAt: doc.updatedAt,
+            verified: doc.verified,
+            proposal: {
+              uri: doc.proposal.uri,
+              id: doc.proposal.id,
+              hash: doc.proposal.hash,
+              mimeType: doc.proposal.mimeType,
+              text: budgetProposal(doc.proposal.text),
+            },
+          }
+        : null,
+      reasons,
+      recentEvents: events,
+      recentQaHistory: history.map((row) => ({
+        question: row.question,
+        answer: row.answer,
+        confidence: row.confidence,
+        contextUsed: row.contextUsed,
+        createdAt: row.createdAt,
+      })),
+      rawThinking: RAW_THINKING_NOTICE,
+    };
+
+    let llm;
+    let qa;
+    try {
+      llm = await chat(buildAgentQaMessages({ question: parsed.data.question, context: qaContext }), {
+        responseFormatJson: true,
+      });
+      qa = AgentQaModelResponse.parse(extractJson(llm.content));
+    } catch (err) {
+      reply.code(503);
+      return { error: "agent_qa_unavailable", detail: formatError(err) };
+    }
+
+    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const createdAt = Math.floor(Date.now() / 1000);
+    const stored = db.insertAgentQaHistory({
+      requestId: req.params.requestId,
+      agentKey,
+      agent,
+      sessionId: parsed.data.sessionId,
+      question: parsed.data.question,
+      answer: qa.answer,
+      confidence: qa.confidence,
+      contextSummaryJson: JSON.stringify(contextUsed),
+      model,
+      promptTokens: llm.promptTokens ?? null,
+      completionTokens: llm.completionTokens ?? null,
+      totalTokens: llm.totalTokens ?? null,
+      createdAt,
+    });
+    db.appendAgentContextEvent({
+      requestId: req.params.requestId,
+      agentKey,
+      agent,
+      eventType: "qa_answer",
+      phase: agentStatus?.phase ?? null,
+      status: "answered",
+      detail: parsed.data.question.slice(0, 200),
+      payloadJson: JSON.stringify({
+        sessionId: parsed.data.sessionId,
+        qaHistoryId: stored.id,
+        confidence: qa.confidence,
+        historyUsed: history.length,
+      }),
+    });
+
+    return {
+      requestId: req.params.requestId,
+      agent,
+      sessionId: parsed.data.sessionId,
+      answer: qa.answer,
+      confidence: qa.confidence,
+      contextUsed,
+      model,
+      usage: {
+        promptTokens: llm.promptTokens ?? 0,
+        completionTokens: llm.completionTokens ?? 0,
+        totalTokens: llm.totalTokens ?? 0,
+      },
+      createdAt: stored.createdAt,
+    };
+  });
+
+  app.get<{ Params: { requestId: string; agent: string }; Querystring: { sessionId?: string; limit?: string | number } }>(
+    "/requests/:requestId/agents/:agent/qa-history",
+    async (req, reply) => {
+      if (!/^\d+$/.test(req.params.requestId) || !HexAddress.safeParse(req.params.agent).success) {
+        reply.code(400);
+        return { error: "invalid_params" };
+      }
+      const parsed = AgentQaHistoryQuery.safeParse(req.query ?? {});
+      if (!parsed.success) {
+        reply.code(400);
+        return { error: "invalid_qa_history_query", issues: parsed.error.issues };
+      }
+      const agent = getAddress(req.params.agent);
+      const history = db
+        .listAgentQaHistory(req.params.requestId, addressKey(agent), parsed.data.sessionId, parsed.data.limit)
+        .map((row) => serializeAgentQaHistory(row));
+      return {
+        requestId: req.params.requestId,
+        agent,
+        sessionId: parsed.data.sessionId,
+        history,
+      };
+    },
+  );
+
   app.get<{ Params: { requestId: string; agent: string } }>("/requests/:requestId/agents/:agent/reasons", async (req, reply) => {
     if (!/^\d+$/.test(req.params.requestId) || !HexAddress.safeParse(req.params.agent).success) {
       reply.code(400);
       return { error: "invalid_params" };
     }
-    const agent = getAddress(req.params.agent);
-    const reviewRow = findReviewArtifact(db, req.params.requestId, agent);
-    const auditRow = findAuditArtifact(db, req.params.requestId, agent);
-    const reviewArtifact = reviewRow ? ReviewArtifact.parse(JSON.parse(reviewRow.json)) : undefined;
-    const auditArtifact = auditRow ? AuditArtifact.parse(JSON.parse(auditRow.json)) : undefined;
-
-    return {
-      requestId: req.params.requestId,
-      agent,
-      rawThinking: RAW_THINKING_NOTICE,
-      review: reviewArtifact
-        ? {
-            reportHash: reviewRow!.hash,
-            proposalScore: reviewArtifact.proposalScore,
-            summary: reviewArtifact.report.summary,
-            recommendation: reviewArtifact.report.recommendation,
-            confidence: reviewArtifact.report.confidence,
-            rubricAssessments: reviewArtifact.report.rubricAssessments,
-            strengths: reviewArtifact.report.strengths,
-            weaknesses: reviewArtifact.report.weaknesses,
-            risks: reviewArtifact.report.risks,
-            rawFinalArtifact: reviewArtifact,
-          }
-        : null,
-      audit: auditArtifact
-        ? {
-            auditHash: auditRow!.hash,
-            targetEvaluations: auditArtifact.targets.map((targetReviewer, i) => ({
-              targetReviewer,
-              score: auditArtifact.scores[i],
-              rationale: auditArtifact.rationales[i] ?? "",
-            })),
-            rawFinalArtifact: auditArtifact,
-          }
-        : null,
-    };
+    return buildAgentReasons(db, req.params.requestId, req.params.agent);
   });
 
   return { app, db };

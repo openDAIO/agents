@@ -220,7 +220,8 @@ export async function runAudit(
 
   const t0 = Date.now();
   const llm = await chat(messages, { responseFormatJson: true });
-  log(`audit: LLM ok (${Date.now() - t0}ms, ${llm.totalTokens ?? "?"} tokens)`);
+  const llmLatencyMs = Date.now() - t0;
+  log(`audit: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens)`);
   const parsed = parseAudit(extractJson(llm.content), {
     requestId: requestId.toString(),
     auditor: wallet.address,
@@ -250,6 +251,18 @@ export async function runAudit(
   if (stored.hash !== auditHash) {
     throw new Error(`audit hash mismatch between client (${auditHash}) and server (${stored.hash})`);
   }
+  await deps.recordStatus?.(requestId, "AuditCommit", "llm_completed", "audit reasoning summary generated", {
+    auditHash,
+    auditURI: stored.uri,
+    targetCount: targetsArr.length,
+    targets: targetsArr,
+    scores: scoresArr,
+    rationales: rationalesArr,
+    promptTokens: llm.promptTokens,
+    completionTokens: llm.completionTokens,
+    totalTokens: llm.totalTokens,
+    llmLatencyMs,
+  });
   if (!(await hasAuditCommitWindow(deps, requestId, startBlock, options))) {
     return { committed: false, reason: "too_late_for_commit", auditHash, auditURI: stored.uri };
   }

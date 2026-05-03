@@ -52,6 +52,24 @@ export interface AuditEnvelope {
 
 const SYSTEM_BASE = `You are a DAIO AI reviewer. You evaluate scholarly papers, DAO proposals, legal drafts, and policy documents. Output ONLY valid JSON matching the requested schema. Do not include any prose outside the JSON object. Score scale is 0..10000 (uint16, 10000 = best). Be terse, neutral, and grounded in the artifact text.`;
 
+const PERSONA_GUARD = `Your persona shapes WHICH dimensions you weight and HOW strict you are, not the output format. The schema, field names, address echoes, score scale (0..10000), and target ordering are absolute and must not change. Do not mention your persona in the output.`;
+
+function readEnvPersona(taskKey: "review" | "audit"): string | undefined {
+  const taskSpecificKey = taskKey === "review" ? "AGENT_REVIEW_STYLE" : "AGENT_AUDIT_STYLE";
+  const taskSpecific = process.env[taskSpecificKey]?.trim();
+  const general = process.env.AGENT_PERSONA?.trim();
+  const parts = [general, taskSpecific].filter((s): s is string => Boolean(s && s.length));
+  return parts.length ? parts.join("\n") : undefined;
+}
+
+function buildSystemPrompt(taskInstruction: string, taskKey: "review" | "audit"): string {
+  const persona = readEnvPersona(taskKey);
+  const sections = [SYSTEM_BASE];
+  if (persona) sections.push(`Persona (independent reviewer character):\n${persona}\n\n${PERSONA_GUARD}`);
+  sections.push(taskInstruction);
+  return sections.join("\n\n");
+}
+
 const REVIEW_INSTRUCTION = `For task=review, you must output an object that conforms to schema "daio.review.output.v1". Fields:
 - schema: "daio.review.output.v1"
 - requestId: string of digits, must equal input.request.requestId
@@ -89,7 +107,7 @@ export function buildReviewMessages(envelope: ReviewEnvelope): ChatMessage[] {
     },
   };
   return [
-    { role: "system", content: `${SYSTEM_BASE}\n\n${REVIEW_INSTRUCTION}` },
+    { role: "system", content: buildSystemPrompt(REVIEW_INSTRUCTION, "review") },
     { role: "user", content: JSON.stringify(safe) },
   ];
 }
@@ -110,7 +128,7 @@ export function buildAuditMessages(envelope: AuditEnvelope): ChatMessage[] {
     },
   };
   return [
-    { role: "system", content: `${SYSTEM_BASE}\n\n${AUDIT_INSTRUCTION}` },
+    { role: "system", content: buildSystemPrompt(AUDIT_INSTRUCTION, "audit") },
     { role: "user", content: JSON.stringify(safe) },
   ];
 }

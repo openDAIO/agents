@@ -25,7 +25,12 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   if (!baseUrl) throw new Error("LLM_BASE_URL not configured");
   const timeoutMs = options.timeoutMs ?? Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
   const maxTokens = options.maxTokens ?? Number(process.env.LLM_MAX_TOKENS ?? 2_048);
-  const temperature = options.temperature ?? 0;
+  const envTemperature =
+    process.env.LLM_TEMPERATURE !== undefined && process.env.LLM_TEMPERATURE !== ""
+      ? Number(process.env.LLM_TEMPERATURE)
+      : undefined;
+  const temperature =
+    options.temperature ?? (Number.isFinite(envTemperature) ? (envTemperature as number) : 0);
 
   const body: Record<string, unknown> = {
     model,

@@ -173,6 +173,7 @@ async function maybeStartQueued(handles: ReturnType<typeof loadContracts>): Prom
 
 async function waitFinalized(input: {
   handles: ReturnType<typeof loadContracts>;
+  startHandles?: ReturnType<typeof loadContracts>;
   requestId: bigint;
   manualStart: boolean;
   timeoutMs: number;
@@ -189,7 +190,7 @@ async function waitFinalized(input: {
       throw new Error(`request ended as ${statusName}`);
     }
     if (status === RequestStatus.Queued && input.manualStart) {
-      const txHash = await maybeStartQueued(input.handles);
+      const txHash = await maybeStartQueued(input.startHandles ?? input.handles);
       if (txHash) process.stdout.write(`[live-e2e] manual startNextRequest tx=${txHash}\n`);
     }
     await delay(input.pollMs);
@@ -228,6 +229,10 @@ async function main(): Promise<void> {
   const requester = ctx.wallet;
   const content = new ContentServiceClient(contentUrl);
   const handles = loadContracts(deployment, requester);
+  const startHandles =
+    values["manual-start"] && process.env.DAIO_KEEPER_PRIVATE_KEY
+      ? loadContracts(deployment, makeChainContext(rpcUrl, process.env.DAIO_KEEPER_PRIVATE_KEY, process.env.RPC_URLS).wallet)
+      : handles;
   const id = values.id ?? `live-${Date.now()}-${safeId(path.basename(pdfPath, path.extname(pdfPath)))}`;
   const domainMask = values["domain-mask"] ?? "1";
   const tier = Number.parseInt(values.tier ?? "0", 10);
@@ -264,6 +269,7 @@ async function main(): Promise<void> {
 
   const lifecycle = await waitFinalized({
     handles,
+    startHandles,
     requestId: submitted.requestId,
     manualStart: Boolean(values["manual-start"]),
     timeoutMs,

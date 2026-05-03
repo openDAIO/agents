@@ -6,7 +6,7 @@
     "stakeVault": "0xcD72B9D839Bc4058774AA16a4139339fA15BEc3e",
     "reviewerRegistry": "0x29CC861e715DeAC7D7C83A691EDf682D5c88dd5F",
     "assignmentManager": "0x838b8aeDd90e231e8355eFb186494671bf9ff16C",
-    "consensusScoring": "0xEf348E9658087F7F459dE35207EF02bEb6923aaE",
+    "consensusScoring": "0xe271d90C72D9a8D931f337C144C6C4e204F994ed",
     "settlement": "0x6026EAff802C542e0530F234dbCB1738CAb2b6f1",
     "reputationLedger": "0x6099D8C70B4F0F43BdC8b8D1C5Aa58C1FFfab265",
     "roundLedger": "0xC02ec80De42917A25f279BF1c715c59459C1CD86",
@@ -34,5 +34,8 @@
     "uniswapV4PositionManager": "0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4",
     "uniswapUniversalRouter": "0x3A9D48AB9751398BbFa63ad67599Bb04e4BdF98b",
     "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-  }
+  },
+  "previousConsensusScoring": [
+    "0xEf348E9658087F7F459dE35207EF02bEb6923aaE"
+  ]
 }

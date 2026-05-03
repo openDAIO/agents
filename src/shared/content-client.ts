@@ -131,6 +131,106 @@ export interface AgentQaHistoryRecord {
   history: AgentQaRecord[];
 }
 
+export type AgentParticipation = "reviewer_and_auditor" | "reviewer_only" | "auditor_only" | "skipped" | "observer";
+
+export interface AgentScoreReport {
+  schema: "daio.agent.score_report.v1";
+  request: {
+    requestId: string;
+    chainStatus: string;
+    finalScore: number;
+    lowConfidence: boolean;
+    retryCount: string;
+  };
+  agent: {
+    address: string;
+    latestStatus: string | null;
+    participation: AgentParticipation;
+  };
+  scoreGiven: null | {
+    proposalScore: number;
+    recommendation: string;
+    confidence: number;
+    reportHash: string;
+  };
+  auditGiven: null | {
+    auditHash: string;
+    targetCount: number;
+    targetEvaluations: Array<{ targetReviewer: string; score: number; rationale: string }>;
+  };
+  decisionSummary: string;
+  rationale: {
+    whyThisScore: string;
+    mainStrengths: string[];
+    mainWeaknesses: string[];
+    riskFactors: string[];
+    confidenceExplanation: string;
+  };
+  evidence: string[];
+  caveats: string[];
+}
+
+export interface AgentScoreReportRecord {
+  requestId: string;
+  agent: string;
+  cached: boolean;
+  report: AgentScoreReport;
+  model: string;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+  createdAt: number;
+}
+
+export interface RequestFinalReport {
+  schema: "daio.request.final_report.v1";
+  request: {
+    requestId: string;
+    chainStatus: string;
+    finalScore: number;
+    lowConfidence: boolean;
+    retryCount: string;
+  };
+  agentReports: Array<{
+    agent: string;
+    participation: AgentParticipation;
+    proposalScore: number | null;
+    recommendation: string | null;
+    confidence: number | null;
+  }>;
+  consensus: {
+    summary: string;
+    agreementLevel: "high" | "moderate" | "low" | "mixed";
+    scoreSpread: string;
+    notableDisagreements: string[];
+  };
+  finalAssessment: {
+    executiveSummary: string;
+    scoreRationale: string;
+    mainStrengths: string[];
+    mainWeaknesses: string[];
+    auditFindings: string[];
+    operationalNotes: string[];
+  };
+  caveats: string[];
+}
+
+export interface RequestFinalReportRecord {
+  requestId: string;
+  cached: boolean;
+  agentCount: number;
+  report: RequestFinalReport;
+  model: string;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+  createdAt: number;
+}
+
 export interface USDAIORequestIntentRecord {
   requester: string;
   id: string;
@@ -405,5 +505,23 @@ export class ContentServiceClient {
     );
     if (!res.ok) throw new Error(`getAgentQaHistory: ${res.status} ${await res.text()}`);
     return (await res.json()) as AgentQaHistoryRecord;
+  }
+
+  async getAgentScoreReport(input: {
+    requestId: string | bigint | number;
+    agent: string;
+  }): Promise<AgentScoreReportRecord> {
+    const res = await fetch(
+      this.url(`/requests/${input.requestId.toString()}/agents/${encodeURIComponent(input.agent)}/score-report`),
+      { method: "POST" },
+    );
+    if (!res.ok) throw new Error(`getAgentScoreReport: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AgentScoreReportRecord;
+  }
+
+  async getRequestFinalReport(requestId: string | bigint | number): Promise<RequestFinalReportRecord> {
+    const res = await fetch(this.url(`/requests/${requestId.toString()}/final-report`), { method: "POST" });
+    if (!res.ok) throw new Error(`getRequestFinalReport: ${res.status} ${await res.text()}`);
+    return (await res.json()) as RequestFinalReportRecord;
   }
 }

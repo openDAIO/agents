@@ -75,6 +75,30 @@ export interface AgentQaHistoryRow {
   createdAt: number;
 }
 
+export interface AgentScoreReportRow {
+  requestId: string;
+  agentKey: string;
+  agent: string;
+  reportJson: string;
+  contextSummaryJson: string;
+  model: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  createdAt: number;
+}
+
+export interface RequestFinalReportRow {
+  requestId: string;
+  reportJson: string;
+  agentCount: number;
+  model: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  createdAt: number;
+}
+
 export class ContentDB {
   private readonly db: Database.Database;
 
@@ -178,6 +202,29 @@ export class ContentDB {
       );
       CREATE INDEX IF NOT EXISTS agent_qa_history_lookup
         ON agent_qa_history (request_id, agent_key, session_id, created_at DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS agent_score_reports (
+        request_id TEXT NOT NULL,
+        agent_key TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        context_summary_json TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (request_id, agent_key)
+      );
+      CREATE TABLE IF NOT EXISTS request_final_reports (
+        request_id TEXT PRIMARY KEY,
+        report_json TEXT NOT NULL,
+        agent_count INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        created_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -601,6 +648,149 @@ export class ContentDB {
       )
       .all(requestId, agentKey, sessionId, limit) as AgentQaHistoryRow[];
     return rows.reverse();
+  }
+
+  getAgentScoreReport(requestId: string, agentKey: string): AgentScoreReportRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT
+           request_id AS requestId,
+           agent_key AS agentKey,
+           agent,
+           report_json AS reportJson,
+           context_summary_json AS contextSummaryJson,
+           model,
+           prompt_tokens AS promptTokens,
+           completion_tokens AS completionTokens,
+           total_tokens AS totalTokens,
+           created_at AS createdAt
+         FROM agent_score_reports
+         WHERE request_id = ? AND agent_key = ?`,
+      )
+      .get(requestId, agentKey) as AgentScoreReportRow | undefined;
+  }
+
+  upsertAgentScoreReport(row: {
+    requestId: string;
+    agentKey: string;
+    agent: string;
+    reportJson: string;
+    contextSummaryJson: string;
+    model: string;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    totalTokens?: number | null;
+    createdAt: number;
+  }): AgentScoreReportRow {
+    this.db
+      .prepare(
+        `INSERT INTO agent_score_reports (
+           request_id,
+           agent_key,
+           agent,
+           report_json,
+           context_summary_json,
+           model,
+           prompt_tokens,
+           completion_tokens,
+           total_tokens,
+           created_at
+         ) VALUES (
+           @requestId,
+           @agentKey,
+           @agent,
+           @reportJson,
+           @contextSummaryJson,
+           @model,
+           @promptTokens,
+           @completionTokens,
+           @totalTokens,
+           @createdAt
+         )
+         ON CONFLICT(request_id, agent_key) DO UPDATE SET
+           agent=@agent,
+           report_json=@reportJson,
+           context_summary_json=@contextSummaryJson,
+           model=@model,
+           prompt_tokens=@promptTokens,
+           completion_tokens=@completionTokens,
+           total_tokens=@totalTokens,
+           created_at=@createdAt`,
+      )
+      .run({
+        ...row,
+        promptTokens: row.promptTokens ?? null,
+        completionTokens: row.completionTokens ?? null,
+        totalTokens: row.totalTokens ?? null,
+      });
+    return this.getAgentScoreReport(row.requestId, row.agentKey)!;
+  }
+
+  getRequestFinalReport(requestId: string): RequestFinalReportRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT
+           request_id AS requestId,
+           report_json AS reportJson,
+           agent_count AS agentCount,
+           model,
+           prompt_tokens AS promptTokens,
+           completion_tokens AS completionTokens,
+           total_tokens AS totalTokens,
+           created_at AS createdAt
+         FROM request_final_reports
+         WHERE request_id = ?`,
+      )
+      .get(requestId) as RequestFinalReportRow | undefined;
+  }
+
+  upsertRequestFinalReport(row: {
+    requestId: string;
+    reportJson: string;
+    agentCount: number;
+    model: string;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    totalTokens?: number | null;
+    createdAt: number;
+  }): RequestFinalReportRow {
+    this.db
+      .prepare(
+        `INSERT INTO request_final_reports (
+           request_id,
+           report_json,
+           agent_count,
+           model,
+           prompt_tokens,
+           completion_tokens,
+           total_tokens,
+           created_at
+         ) VALUES (
+           @requestId,
+           @reportJson,
+           @agentCount,
+           @model,
+           @promptTokens,
+           @completionTokens,
+           @totalTokens,
+           @createdAt
+         )
+         ON CONFLICT(request_id) DO UPDATE SET
+           report_json=@reportJson,
+           agent_count=@agentCount,
+           model=@model,
+           prompt_tokens=@promptTokens,
+           completion_tokens=@completionTokens,
+           total_tokens=@totalTokens,
+           created_at=@createdAt`,
+      )
+      .run({
+        ...row,
+        promptTokens: row.promptTokens ?? null,
+        completionTokens: row.completionTokens ?? null,
+        totalTokens: row.totalTokens ?? null,
+      });
+    return this.getRequestFinalReport(row.requestId)!;
   }
 
   close(): void {

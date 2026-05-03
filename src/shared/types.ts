@@ -53,6 +53,7 @@ export interface DeploymentSnapshot {
     erc8004Adapter?: string;
     autoConvertHook?: string;
   };
+  previousConsensusScoring?: string[];
   signers?: {
     owner: string;
     treasury: string;

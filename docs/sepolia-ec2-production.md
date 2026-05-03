@@ -99,7 +99,10 @@ chmod 700 .data .state
 
 The Sepolia deployment snapshot is already committed at
 `.deployments/sepolia.json`. Do not replace it unless you are intentionally
-moving to a new contract deployment.
+moving to a new contract deployment. The current snapshot uses
+`ConsensusScoring` `0xe271d90C72D9a8D931f337C144C6C4e204F994ed`; the previous
+deployment `0xEf348E9658087F7F459dE35207EF02bEb6923aaE` is retained only in
+`previousConsensusScoring` for operator history.
 
 ## 3. Copy Secret Env Files
 
@@ -182,6 +185,10 @@ compatibility, and retryable provider failures such as `408`, `429`, and
 transient network errors are retried/logged instead of crashing the agent
 process. Public free-tier RPCs can still add latency under load; paid or
 dedicated Sepolia RPCs are preferred for sustained testing.
+
+If you keep the informational `DAIO_CONSENSUS_SCORING_ADDRESS` env variable in
+operator files, it must match the deployment snapshot:
+`0xe271d90C72D9a8D931f337C144C6C4e204F994ed`.
 
 When a direct on-chain request enters an active phase before its document is
 registered in content-service, agents keep the request tracked and report
@@ -406,6 +413,8 @@ signed with
 | `GET` | `/requests/:requestId/agents/:agent/reasons` | read final structured review/audit rationales for one agent |
 | `POST` | `/requests/:requestId/agents/:agent/ask` | ask an agent-scoped question using current request, chain, artifact, event, and Q&A context |
 | `GET` | `/requests/:requestId/agents/:agent/qa-history` | read stored Q&A rows for one request, agent, and session |
+| `POST` | `/requests/:requestId/agents/:agent/score-report` | generate or read a cached finalized score report for one agent |
+| `POST` | `/requests/:requestId/final-report` | generate or read a cached synthesized finalized request report |
 
 The content service writes to `.data/content.sqlite`. It does not expose an
 arbitrary filesystem read/write API.
@@ -420,6 +429,11 @@ raw hidden model reasoning, private keys, seeds, or local `.state` material.
 They answer with currently persisted structured context: request documents,
 chain lifecycle, agent status/events, final review/audit artifacts when present,
 and recent Q&A history for the selected `sessionId`.
+Finalized report endpoints use the same safe context family, require the
+contract lifecycle to be `Finalized`, and cache generated JSON in SQLite. Score
+and audit attribution in those reports follows the finalized on-chain accepted
+review/audit participant lists, so late off-chain artifacts that missed contract
+acceptance are described as caveats instead of counted scores.
 
 Example from a live Sepolia run finalized on 2026-05-03:
 
@@ -444,6 +458,47 @@ The response used the finalized request context:
     "historyUsed": 2,
     "eventsUsed": 16,
     "chainStatus": "Finalized"
+  }
+}
+```
+
+Finalized report examples from live Sepolia request `18`:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:18002/requests/18/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/score-report
+
+curl -sS -X POST \
+  http://127.0.0.1:18002/requests/18/agents/0x08913F98a37FCC24CB825fB6db7599086A5f8f56/score-report
+
+curl -sS -X POST http://127.0.0.1:18002/requests/18/final-report
+```
+
+Observed excerpts:
+
+```json
+{
+  "r1ScoreReport": {
+    "cached": false,
+    "participation": "reviewer_and_auditor",
+    "proposalScore": 6200,
+    "auditTargetCount": 2
+  },
+  "r4ScoreReport": {
+    "cached": false,
+    "participation": "skipped",
+    "scoreGiven": null,
+    "auditGiven": null
+  },
+  "finalReport": {
+    "cached": false,
+    "agentCount": 5,
+    "finalScore": 6200,
+    "scoreSpread": "Proposal scores ranged from 6200 to 6200 across 3 scoring agents."
+  },
+  "repeatCalls": {
+    "scoreReportCached": true,
+    "finalReportCached": true
   }
 }
 ```

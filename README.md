@@ -486,7 +486,19 @@ round aggregates of score `6200` for review, audit consensus, and reputation.
 The same run exercised the agent Q&A APIs during `ReviewCommit`, after review
 artifact storage, and after finalization. See
 [docs/frontend-reference.md](docs/frontend-reference.md#post-requestsrequestidagentsagentask)
-for the request/response spec and real response excerpts.
+for the Q&A request/response spec and real response excerpts. The finalized
+score-report and final-report APIs are documented next to it in the same
+frontend reference.
+
+Live Sepolia validation on 2026-05-03 after the ConsensusScoring update
+finalized relayed request 18 with `contracts/BlockFlow.pdf`. The request ended
+`Finalized`, `retryCount=0`, `lowConfidence=false`, final score `6200`,
+confidence `10000`, and audit coverage `10000`. The run exercised
+`/ask`, `/qa-history`, `/reasons`, per-agent `/score-report`, and
+`/final-report`. The finalized report tracked all five agent status rows but
+counted only the three on-chain accepted reviewers/auditors as scoring agents;
+late off-chain artifacts from non-accepted agents were reported as `skipped`
+with `scoreGiven=null`.
 
 The `contracts` submodule also includes deployment and validation helpers for
 operators. `contracts/scripts/deploy-via-deployer.js` deploys a new DAIO system
@@ -496,7 +508,10 @@ Sepolia addresses on a local fork using generated reviewer wallet keys as both
 transaction keys and VRF keys, relayed USDAIO requests, real FRAIN VRF proofs,
 and round-ledger finalization. The Docker serving path still uses
 `.deployments/sepolia.json`; after any new contract deployment, update that
-snapshot before starting agents.
+snapshot before starting agents. The current Sepolia snapshot uses
+`ConsensusScoring` `0xe271d90C72D9a8D931f337C144C6C4e204F994ed` and records the
+previous `0xEf348E9658087F7F459dE35207EF02bEb6923aaE` under
+`previousConsensusScoring`.
 
 For an EC2 production-style Sepolia boot with Docker Compose, use
 [docs/sepolia-ec2-production.md](docs/sepolia-ec2-production.md). After cloning
@@ -535,7 +550,10 @@ curl http://127.0.0.1:18002/proposals/paper-001
 curl http://127.0.0.1:18002/reports/0x643abeef31189c116d28ed73e4d9162355b4ecddd715a389b512fb4f31779238
 curl -H 'Content-Type: application/json' \
   -d '{"question":"Summarize your current request context."}' \
-  http://127.0.0.1:18002/requests/13/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/ask
+  http://127.0.0.1:18002/requests/18/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/ask
+curl -X POST \
+  http://127.0.0.1:18002/requests/18/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/score-report
+curl -X POST http://127.0.0.1:18002/requests/18/final-report
 ```
 
 ## Implementation Notes
@@ -554,11 +572,17 @@ The orchestrator's prescreen routine uses the same DAIO VRF message builder as t
 
 For the current five-agent, quorum-three E2E, `reviewDiff=8000`, `auditDiff=10000`, and `auditTargetLimit=2` are the reliable validation defaults. Lower-probability stress runs exercise review VRF availability behavior, but they can legitimately miss quorum under real sortition and should not be treated as guaranteed finalization tests.
 
+The current `ConsensusScoring` module also treats the "no incoming audits"
+case explicitly: when peers fail to audit a reviewer, that reviewer can still
+receive contribution weight from normalized audit reliability if they completed
+their own audit obligations. A reviewer with neither incoming audits nor audit
+work remains at zero contribution.
+
 ### Content service as the canonical store
 
 The content-service holds two kinds of artifact: `proposals` (the converted Markdown document under review, addressed by id) and `reports` (review artifacts, addressed by hash). Third-party reviewers can fetch the canonical request document through `GET /requests/:requestId/markdown`; the returned hash is the same Markdown `keccak256` stored on-chain as `proposalHash`. Its `POST /reports` endpoint canonicalizes the artifact (sorted keys + UTF-8) and recomputes `keccak256` server-side, so a report URI is structurally `content://reports/0x<hash>` where the hash matches what the on-chain `ReviewRevealed` event will carry. Audit-time hash verification against `reportHash` is therefore exact.
 
-Agent-written observability data is signed by the agent wallet when `CONTENT_REQUIRE_AGENT_SIGNATURES=true` (the production default). `POST /reports`, `POST /audits`, and `PUT /agent-status` reject unsigned or mismatched writes so another HTTP caller cannot impersonate a reviewer in the status/reason API. Agent Q&A is read-only/public in the current profile and uses the persisted document, chain lifecycle, status events, final artifacts, and recent Q&A history; raw hidden chain-of-thought remains unavailable.
+Agent-written observability data is signed by the agent wallet when `CONTENT_REQUIRE_AGENT_SIGNATURES=true` (the production default). `POST /reports`, `POST /audits`, and `PUT /agent-status` reject unsigned or mismatched writes so another HTTP caller cannot impersonate a reviewer in the status/reason API. Agent Q&A and finalized report generation are read-only/public in the current profile and use the persisted document, chain lifecycle, status events, final artifacts, and recent Q&A history; raw hidden chain-of-thought remains unavailable.
 
 For requester UX, the content-service also exposes a relayed USDAIO flow:
 

@@ -162,6 +162,209 @@ const AgentQaModelResponse = z.object({
   confidence: z.number().int().min(0).max(10000).default(0),
 });
 
+const Score = z.number().int().min(0).max(10000);
+const AgentParticipation = z.enum(["reviewer_and_auditor", "reviewer_only", "auditor_only", "skipped", "observer"]);
+function stringList(maxItems: number, maxLength: number) {
+  return z.preprocess((value) => {
+    if (value === undefined || value === null) return [];
+    if (Array.isArray(value)) return value.map((item) => String(item)).filter((item) => item.trim() !== "");
+    if (typeof value === "string") return value.trim() === "" ? [] : [value];
+    if (typeof value === "object") {
+      return Object.entries(value as Record<string, unknown>)
+        .map(([key, item]) => `${key}: ${String(item)}`)
+        .filter((item) => item.trim() !== "");
+    }
+    return [String(value)];
+  }, z.array(z.string().min(1).max(maxLength)).max(maxItems).default([]));
+}
+
+function stringFromObject(value: Record<string, unknown>, names: readonly string[], fallback: string): string {
+  for (const name of names) {
+    const item = value[name];
+    if (typeof item === "string" && item.trim() !== "") return item;
+  }
+  return fallback;
+}
+
+function agreementLevel(value: unknown): z.infer<typeof RequestFinalAgreementLevel> {
+  const text = typeof value === "string" ? value.toLowerCase() : "";
+  if (text.includes("high") || text.includes("strong")) return "high";
+  if (text.includes("moderate") || text.includes("medium")) return "moderate";
+  if (text.includes("low") || text.includes("weak")) return "low";
+  return "mixed";
+}
+
+const ScoreGiven = z
+  .object({
+    proposalScore: Score,
+    recommendation: z.string().min(1).max(120),
+    confidence: Score,
+    reportHash: HexBytes32,
+  })
+  .nullable();
+const AuditGiven = z
+  .object({
+    auditHash: HexBytes32,
+    targetCount: z.number().int().min(0).max(100),
+    targetEvaluations: z.array(
+      z.object({
+        targetReviewer: HexAddress,
+        score: Score,
+        rationale: z.string().min(1).max(2000),
+      }),
+    ),
+  })
+  .nullable();
+const AgentScoreRationale = z.preprocess(
+  (value) => {
+    if (typeof value === "string") {
+      return {
+        whyThisScore: value,
+        mainStrengths: [],
+        mainWeaknesses: [],
+        riskFactors: [],
+        confidenceExplanation: value,
+      };
+    }
+    return value;
+  },
+  z.object({
+    whyThisScore: z.string().min(1).max(4000),
+    mainStrengths: stringList(12, 800),
+    mainWeaknesses: stringList(12, 800),
+    riskFactors: stringList(12, 800),
+    confidenceExplanation: z.string().min(1).max(2000),
+  }),
+);
+const RequestFinalAgreementLevel = z.enum(["high", "moderate", "low", "mixed"]);
+const RequestFinalConsensus = z.preprocess(
+  (value) => {
+    if (typeof value === "string") {
+      return {
+        summary: value,
+        agreementLevel: "mixed",
+        scoreSpread: "Score spread was not specified by the model.",
+        notableDisagreements: [],
+      };
+    }
+    if (value && typeof value === "object") {
+      const obj = value as Record<string, unknown>;
+      return {
+        ...obj,
+        summary: stringFromObject(
+          obj,
+          ["summary", "consensusSummary", "assessment", "analysis", "description"],
+          "Consensus summary was not specified by the model.",
+        ),
+        agreementLevel: agreementLevel(obj.agreementLevel ?? obj.agreement ?? obj.level),
+        scoreSpread: stringFromObject(
+          obj,
+          ["scoreSpread", "spread", "scoreDistribution", "scoreVariance"],
+          "Score spread was not specified by the model.",
+        ),
+        notableDisagreements: obj.notableDisagreements ?? obj.disagreements ?? [],
+      };
+    }
+    return value;
+  },
+  z.object({
+    summary: z.string().min(1).max(4000),
+    agreementLevel: RequestFinalAgreementLevel,
+    scoreSpread: z.string().min(1).max(1000),
+    notableDisagreements: stringList(20, 1000),
+  }),
+);
+const RequestFinalAssessment = z.preprocess(
+  (value) => {
+    if (typeof value === "string") {
+      return {
+        executiveSummary: value,
+        scoreRationale: value,
+        mainStrengths: [],
+        mainWeaknesses: [],
+        auditFindings: [],
+        operationalNotes: [],
+      };
+    }
+    if (value && typeof value === "object") {
+      const obj = value as Record<string, unknown>;
+      return {
+        ...obj,
+        executiveSummary: stringFromObject(
+          obj,
+          ["executiveSummary", "summary", "finalSummary", "assessment"],
+          "Executive summary was not specified by the model.",
+        ),
+        scoreRationale: stringFromObject(
+          obj,
+          ["scoreRationale", "rationale", "finalScoreRationale", "whyThisScore"],
+          "Score rationale was not specified by the model.",
+        ),
+        mainStrengths: obj.mainStrengths ?? obj.strengths ?? [],
+        mainWeaknesses: obj.mainWeaknesses ?? obj.weaknesses ?? [],
+        auditFindings: obj.auditFindings ?? obj.findings ?? [],
+        operationalNotes: obj.operationalNotes ?? obj.notes ?? [],
+      };
+    }
+    return value;
+  },
+  z.object({
+    executiveSummary: z.string().min(1).max(4000),
+    scoreRationale: z.string().min(1).max(4000),
+    mainStrengths: stringList(12, 800),
+    mainWeaknesses: stringList(12, 800),
+    auditFindings: stringList(20, 1000),
+    operationalNotes: stringList(20, 1000),
+  }),
+);
+
+const AgentScoreReportModelResponse = z.object({
+  schema: z.literal("daio.agent.score_report.v1"),
+  request: z.object({
+    requestId: z.string().regex(/^\d+$/),
+    chainStatus: z.string().min(1).max(80),
+    finalScore: Score,
+    lowConfidence: z.boolean(),
+    retryCount: z.string().regex(/^\d+$/),
+  }),
+  agent: z.object({
+    address: HexAddress,
+    latestStatus: z.string().min(1).max(200).nullable(),
+    participation: AgentParticipation,
+  }),
+  scoreGiven: ScoreGiven,
+  auditGiven: AuditGiven,
+  decisionSummary: z.string().min(1).max(4000),
+  rationale: AgentScoreRationale,
+  evidence: stringList(20, 1000),
+  caveats: stringList(20, 1000),
+});
+type AgentScoreReport = z.infer<typeof AgentScoreReportModelResponse>;
+
+const RequestFinalReportModelResponse = z.object({
+  schema: z.literal("daio.request.final_report.v1"),
+  request: z.object({
+    requestId: z.string().regex(/^\d+$/),
+    chainStatus: z.string().min(1).max(80),
+    finalScore: Score,
+    lowConfidence: z.boolean(),
+    retryCount: z.string().regex(/^\d+$/),
+  }),
+  agentReports: z.array(
+    z.object({
+      agent: HexAddress,
+      participation: AgentParticipation,
+      proposalScore: Score.nullable(),
+      recommendation: z.string().min(1).max(120).nullable(),
+      confidence: Score.nullable(),
+    }),
+  ),
+  consensus: RequestFinalConsensus,
+  finalAssessment: RequestFinalAssessment,
+  caveats: stringList(20, 1000),
+});
+type RequestFinalReport = z.infer<typeof RequestFinalReportModelResponse>;
+
 const ReviewArtifactBody = z.union([
   ReviewArtifact,
   z.object({
@@ -667,6 +870,23 @@ function serializeRequestLifecycle(requestId: string, lifecycle: readonly unknow
 }
 
 const AGENT_QA_SYSTEM = `You answer as a specific DAIO reviewer agent for one request. Use the provided structured context, including current phase, status, stored review/audit artifacts, stored reasoning summaries, and recent Q&A history. Answer the user's question directly and accurately. If context is missing or the agent has not reached a phase yet, say that clearly. Do not invent private information. Never reveal private keys, VRF secrets, commit/reveal seeds, or raw hidden model reasoning. Raw hidden thinking is not available; use only final structured rationales, stored summaries, and observable state. Return ONLY valid JSON with fields: answer (string) and confidence (integer 0..10000).`;
+const AGENT_SCORE_REPORT_SYSTEM = `You write a finalized DAIO request score report from the perspective of one reviewer agent. Use only the provided structured context: finalized chain status, stored document, review artifact, audit artifact, agent status/events, and public observability data. Explain why the agent gave its score. Copy expectedReportFacts exactly for request, agent, scoreGiven, and auditGiven. scoreGiven and auditGiven represent on-chain accepted participation only; if an off-chain artifact exists but the agent was not an on-chain participant, explain that caveat and do not invent accepted participation. participation must be one of reviewer_and_auditor, reviewer_only, auditor_only, skipped, observer. Never reveal private keys, VRF secrets, commit/reveal seeds, local state, or raw hidden model reasoning. Return ONLY valid JSON matching schema daio.agent.score_report.v1 with fields: schema, request, agent, scoreGiven, auditGiven, decisionSummary, rationale, evidence, caveats.`;
+const REQUEST_FINAL_REPORT_SYSTEM = `You write a finalized DAIO request-level report by synthesizing all provided agent score reports. Use only the provided structured reports and finalized chain/round data. Copy expectedReportFacts exactly for request and agentReports. Explain consensus, score rationale, strengths, weaknesses, audit findings, operational notes, and caveats. consensus.agreementLevel must be one of high, moderate, low, mixed. Never reveal private keys, VRF secrets, commit/reveal seeds, local state, or raw hidden model reasoning. Return ONLY valid JSON matching schema daio.request.final_report.v1 with fields: schema, request, agentReports, consensus, finalAssessment, caveats.`;
+
+const PROTOCOL_CONTEXT = {
+  scoreScale: "0..10000",
+  consensusScoring: {
+    rounds: [
+      "round 0: raw review median over revealed proposal scores",
+      "round 1: audit-backed weighted median using contribution weights",
+      "round 2: reputation-weighted final median; this is the finalized proposal score",
+    ],
+    contributionRule:
+      "When a reviewer has at least one incoming audit, contribution is min(normalized report quality, normalized audit reliability).",
+    noIncomingAuditFallback:
+      "When a reviewer has zero incoming audits because peers missed audit obligations, contribution falls back to normalized audit reliability so completed audit work is still credited. A reviewer with zero incoming audits and no completed audit work still receives zero weight.",
+  },
+} as const;
 
 function buildAgentQaMessages(input: {
   question: string;
@@ -683,6 +903,175 @@ function buildAgentQaMessages(input: {
       }),
     },
   ];
+}
+
+function buildAgentScoreReportMessages(input: {
+  context: Record<string, unknown>;
+}): Array<{ role: "system" | "user"; content: string }> {
+  return [
+    { role: "system", content: AGENT_SCORE_REPORT_SYSTEM },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: "daio.agent.score_report.input.v1",
+        task: "Create the finalized score report for this agent and request.",
+        context: input.context,
+      }),
+    },
+  ];
+}
+
+function buildRequestFinalReportMessages(input: {
+  context: Record<string, unknown>;
+}): Array<{ role: "system" | "user"; content: string }> {
+  return [
+    { role: "system", content: REQUEST_FINAL_REPORT_SYSTEM },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: "daio.request.final_report.input.v1",
+        task: "Create the final synthesized report for this finalized request.",
+        context: input.context,
+      }),
+    },
+  ];
+}
+
+function usageFromLlm(llm: { promptTokens?: number | null; completionTokens?: number | null; totalTokens?: number | null }) {
+  return {
+    promptTokens: llm.promptTokens ?? 0,
+    completionTokens: llm.completionTokens ?? 0,
+    totalTokens: llm.totalTokens ?? 0,
+  };
+}
+
+function deriveParticipation(input: {
+  reviewParticipant: boolean;
+  auditParticipant: boolean;
+}): z.infer<typeof AgentParticipation> {
+  if (input.reviewParticipant && input.auditParticipant) return "reviewer_and_auditor";
+  if (input.reviewParticipant) return "reviewer_only";
+  if (input.auditParticipant) return "auditor_only";
+  return "skipped";
+}
+
+function reportRequestFacts(input: {
+  requestId: string;
+  chainStatus: ReturnType<typeof serializeRequestLifecycle>;
+  finalScore: number;
+}) {
+  return {
+    requestId: input.requestId,
+    chainStatus: input.chainStatus.statusName,
+    finalScore: input.finalScore,
+    lowConfidence: input.chainStatus.lowConfidence,
+    retryCount: input.chainStatus.retryCount,
+  };
+}
+
+function agentReportFacts(input: {
+  agent: string;
+  latestStatus: string | null;
+  reviewParticipant: boolean;
+  auditParticipant: boolean;
+}) {
+  return {
+    address: getAddress(input.agent),
+    latestStatus: input.latestStatus,
+    participation: deriveParticipation(input),
+  };
+}
+
+function scoreGivenFacts(
+  reasons: ReturnType<typeof buildAgentReasons>,
+  reviewParticipant: boolean,
+): z.infer<typeof ScoreGiven> {
+  if (!reviewParticipant || !reasons.review) return null;
+  return {
+    proposalScore: reasons.review.proposalScore,
+    recommendation: reasons.review.recommendation,
+    confidence: reasons.review.confidence,
+    reportHash: reasons.review.reportHash,
+  };
+}
+
+function auditGivenFacts(
+  reasons: ReturnType<typeof buildAgentReasons>,
+  auditParticipant: boolean,
+): z.infer<typeof AuditGiven> {
+  if (!auditParticipant || !reasons.audit) return null;
+  return {
+    auditHash: reasons.audit.auditHash,
+    targetCount: reasons.audit.targetEvaluations.length,
+    targetEvaluations: reasons.audit.targetEvaluations.map((evaluation) => ({
+      targetReviewer: evaluation.targetReviewer,
+      score: evaluation.score ?? 0,
+      rationale: evaluation.rationale,
+    })),
+  };
+}
+
+function normalizeAgentScoreReport(
+  report: AgentScoreReport,
+  facts: {
+    request: ReturnType<typeof reportRequestFacts>;
+    agent: ReturnType<typeof agentReportFacts>;
+    scoreGiven: z.infer<typeof ScoreGiven>;
+    auditGiven: z.infer<typeof AuditGiven>;
+  },
+): AgentScoreReport {
+  return AgentScoreReportModelResponse.parse({
+    ...report,
+    schema: "daio.agent.score_report.v1",
+    request: facts.request,
+    agent: facts.agent,
+    scoreGiven: facts.scoreGiven,
+    auditGiven: facts.auditGiven,
+  });
+}
+
+function finalAgentSummary(report: AgentScoreReport) {
+  return {
+    agent: report.agent.address,
+    participation: report.agent.participation,
+    proposalScore: report.scoreGiven?.proposalScore ?? null,
+    recommendation: report.scoreGiven?.recommendation ?? null,
+    confidence: report.scoreGiven?.confidence ?? null,
+  };
+}
+
+function normalizeRequestFinalReport(
+  report: RequestFinalReport,
+  facts: {
+    request: ReturnType<typeof reportRequestFacts>;
+    agentReports: ReturnType<typeof finalAgentSummary>[];
+  },
+): RequestFinalReport {
+  const normalized = RequestFinalReportModelResponse.parse({
+    ...report,
+    schema: "daio.request.final_report.v1",
+    request: facts.request,
+    agentReports: facts.agentReports,
+  });
+  if (normalized.consensus.summary === "Consensus summary was not specified by the model.") {
+    normalized.consensus.summary = normalized.finalAssessment.executiveSummary;
+  }
+  if (normalized.consensus.scoreSpread === "Score spread was not specified by the model.") {
+    const scores = facts.agentReports
+      .map((agentReport) => agentReport.proposalScore)
+      .filter((score): score is number => typeof score === "number");
+    normalized.consensus.scoreSpread =
+      scores.length > 0
+        ? `Proposal scores ranged from ${Math.min(...scores)} to ${Math.max(...scores)} across ${scores.length} scoring agents.`
+        : "No proposal scores were submitted by the recorded agents.";
+  }
+  if (normalized.finalAssessment.executiveSummary === "Executive summary was not specified by the model.") {
+    normalized.finalAssessment.executiveSummary = normalized.consensus.summary;
+  }
+  if (normalized.finalAssessment.scoreRationale === "Score rationale was not specified by the model.") {
+    normalized.finalAssessment.scoreRationale = `${normalized.consensus.summary} ${normalized.consensus.scoreSpread}`;
+  }
+  return normalized;
 }
 
 export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: ContentDB } {
@@ -710,6 +1099,397 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     const provider = chainProvider();
     relayerSigner ??= new NonceManager(new Wallet(key, provider));
     return relayerSigner;
+  }
+
+  async function readChainStatus(requestId: string): Promise<ReturnType<typeof serializeRequestLifecycle>> {
+    const deployment = loadDeploymentSnapshot(deploymentPath);
+    const handles = loadContracts(deployment, chainProvider());
+    const lifecycle = await withRpcReadRetries(() => handles.core.getRequestLifecycle(BigInt(requestId)));
+    return serializeRequestLifecycle(requestId, lifecycle as readonly unknown[]);
+  }
+
+  async function readFinalizedRequestSnapshot(requestId: string): Promise<
+    | {
+        ok: true;
+        chainStatus: ReturnType<typeof serializeRequestLifecycle>;
+        finalScore: number;
+        roundAggregates: Array<{
+          round: "review" | "audit_consensus" | "reputation_final";
+          score: string;
+          totalWeight: string;
+          confidence: string;
+          coverage: string;
+          lowConfidence: boolean;
+          closed: boolean;
+          aborted: boolean;
+        }>;
+        reviewParticipants: string[];
+        auditParticipants: string[];
+      }
+    | { ok: false; chainStatus: ReturnType<typeof serializeRequestLifecycle> }
+  > {
+    const deployment = loadDeploymentSnapshot(deploymentPath);
+    const handles = loadContracts(deployment, chainProvider());
+    const lifecycle = await withRpcReadRetries(() => handles.core.getRequestLifecycle(BigInt(requestId)));
+    const chainStatus = serializeRequestLifecycle(requestId, lifecycle as readonly unknown[]);
+    if (chainStatus.status !== RequestStatus.Finalized) {
+      return { ok: false, chainStatus };
+    }
+
+    const roundNames = ["review", "audit_consensus", "reputation_final"] as const;
+    const attempt = BigInt(chainStatus.retryCount);
+    const roundAggregates = [];
+    for (let round = 0; round < roundNames.length; round++) {
+      const aggregate = (await withRpcReadRetries(() =>
+        handles.roundLedger.getRoundAggregate(BigInt(requestId), attempt, round),
+      )) as readonly unknown[];
+      roundAggregates.push({
+        round: roundNames[round]!,
+        score: String(aggregate[0]),
+        totalWeight: String(aggregate[1]),
+        confidence: String(aggregate[2]),
+        coverage: String(aggregate[3]),
+        lowConfidence: Boolean(aggregate[4]),
+        closed: Boolean(aggregate[5]),
+        aborted: Boolean(aggregate[6]),
+      });
+    }
+    const reviewParticipants = ((await withRpcReadRetries(() =>
+      handles.commitReveal.getReviewParticipants(BigInt(requestId), attempt),
+    )) as readonly string[]).map((address) => getAddress(address));
+    const auditParticipants = ((await withRpcReadRetries(() =>
+      handles.commitReveal.getAuditParticipants(BigInt(requestId), attempt),
+    )) as readonly string[]).map((address) => getAddress(address));
+    return {
+      ok: true,
+      chainStatus,
+      finalScore: Number(roundAggregates[2]?.score ?? roundAggregates[0]?.score ?? 0),
+      roundAggregates,
+      reviewParticipants,
+      auditParticipants,
+    };
+  }
+
+  async function buildAgentContext(input: {
+    requestId: string;
+    agent: string;
+    sessionId?: string;
+    historyLimit?: number;
+    chainStatus?: ReturnType<typeof serializeRequestLifecycle> | null;
+  }) {
+    const agent = getAddress(input.agent);
+    const agentKey = addressKey(agent);
+    const doc = serializeRequestDocument(db, input.requestId);
+    const agentStatus = serializeAgentStatus(db.getAgentStatus(input.requestId, agentKey));
+    const reasons = buildAgentReasons(db, input.requestId, agent);
+    const events = db.listAgentContextEvents(input.requestId, agentKey, 50).map((row) =>
+      serializeAgentContextEvent(row),
+    );
+    const history =
+      input.historyLimit && input.historyLimit > 0
+        ? db
+            .listAgentQaHistory(input.requestId, agentKey, input.sessionId ?? "default", input.historyLimit)
+            .map((row) => serializeAgentQaHistory(row))
+        : [];
+
+    let chainStatus = input.chainStatus ?? null;
+    let chainStatusError: string | null = null;
+    if (!chainStatus) {
+      try {
+        chainStatus = await readChainStatus(input.requestId);
+      } catch (err) {
+        chainStatusError = formatError(err);
+      }
+    }
+
+    const contextUsed = {
+      hasDocument: Boolean(doc),
+      hasReview: Boolean(reasons.review),
+      hasAudit: Boolean(reasons.audit),
+      agentStatus: agentStatus ? `${agentStatus.phase}:${agentStatus.status}` : null,
+      historyUsed: history.length,
+      eventsUsed: events.length,
+      chainStatus: chainStatus?.statusName ?? null,
+    };
+    const context = {
+      request: {
+        requestId: input.requestId,
+        chainStatus,
+        chainStatusError,
+      },
+      protocol: PROTOCOL_CONTEXT,
+      agent: {
+        address: agent,
+        latestStatus: agentStatus,
+      },
+      document: doc
+        ? {
+            updatedAt: doc.updatedAt,
+            verified: doc.verified,
+            proposal: {
+              uri: doc.proposal.uri,
+              id: doc.proposal.id,
+              hash: doc.proposal.hash,
+              mimeType: doc.proposal.mimeType,
+              text: budgetProposal(doc.proposal.text),
+            },
+          }
+        : null,
+      reasons,
+      recentEvents: events,
+      recentQaHistory: history.map((row) => ({
+        question: row.question,
+        answer: row.answer,
+        confidence: row.confidence,
+        contextUsed: row.contextUsed,
+        createdAt: row.createdAt,
+      })),
+      rawThinking: RAW_THINKING_NOTICE,
+    };
+
+    return {
+      requestId: input.requestId,
+      agent,
+      agentKey,
+      doc,
+      agentStatus,
+      reasons,
+      events,
+      history,
+      chainStatus,
+      chainStatusError,
+      contextUsed,
+      context,
+    };
+  }
+
+  async function runAgentContextLlm<T extends z.ZodTypeAny>(
+    messages: Array<{ role: "system" | "user"; content: string }>,
+    schema: T,
+  ): Promise<{
+    data: z.output<T>;
+    llm: Awaited<ReturnType<typeof chat>>;
+  }> {
+    const llm = await chat(messages, { responseFormatJson: true });
+    return { llm, data: schema.parse(extractJson(llm.content)) };
+  }
+
+  function serializeAgentScoreReport(row: NonNullable<ReturnType<ContentDB["getAgentScoreReport"]>>, cached: boolean) {
+    return {
+      requestId: row.requestId,
+      agent: getAddress(row.agent),
+      cached,
+      report: AgentScoreReportModelResponse.parse(JSON.parse(row.reportJson)),
+      model: row.model,
+      usage: {
+        promptTokens: row.promptTokens ?? 0,
+        completionTokens: row.completionTokens ?? 0,
+        totalTokens: row.totalTokens ?? 0,
+      },
+      createdAt: row.createdAt,
+    };
+  }
+
+  function serializeRequestFinalReport(row: NonNullable<ReturnType<ContentDB["getRequestFinalReport"]>>, cached: boolean) {
+    return {
+      requestId: row.requestId,
+      cached,
+      agentCount: row.agentCount,
+      report: RequestFinalReportModelResponse.parse(JSON.parse(row.reportJson)),
+      model: row.model,
+      usage: {
+        promptTokens: row.promptTokens ?? 0,
+        completionTokens: row.completionTokens ?? 0,
+        totalTokens: row.totalTokens ?? 0,
+      },
+      createdAt: row.createdAt,
+    };
+  }
+
+  async function getOrCreateAgentScoreReport(input: {
+    requestId: string;
+    agent: string;
+    finalized: Extract<Awaited<ReturnType<typeof readFinalizedRequestSnapshot>>, { ok: true }>;
+  }): Promise<{ row: NonNullable<ReturnType<ContentDB["getAgentScoreReport"]>>; cached: boolean }> {
+    const agent = getAddress(input.agent);
+    const agentKey = addressKey(agent);
+    const cached = db.getAgentScoreReport(input.requestId, agentKey);
+    if (cached) return { row: cached, cached: true };
+
+    const agentContext = await buildAgentContext({
+      requestId: input.requestId,
+      agent,
+      sessionId: "score-report",
+      historyLimit: 0,
+      chainStatus: input.finalized.chainStatus,
+    });
+    if (!agentContext.agentStatus && !agentContext.reasons.review && !agentContext.reasons.audit && agentContext.events.length === 0) {
+      throw new Error("not_found");
+    }
+
+    const reviewParticipant = input.finalized.reviewParticipants.some((participant) => addressKey(participant) === agentKey);
+    const auditParticipant = input.finalized.auditParticipants.some((participant) => addressKey(participant) === agentKey);
+    const facts = {
+      request: reportRequestFacts({
+        requestId: input.requestId,
+        chainStatus: input.finalized.chainStatus,
+        finalScore: input.finalized.finalScore,
+      }),
+      agent: agentReportFacts({
+        agent,
+        latestStatus: agentContext.contextUsed.agentStatus,
+        reviewParticipant,
+        auditParticipant,
+      }),
+      scoreGiven: scoreGivenFacts(agentContext.reasons, reviewParticipant),
+      auditGiven: auditGivenFacts(agentContext.reasons, auditParticipant),
+    };
+    const context = {
+      ...agentContext.context,
+      finalizedRequest: {
+        ...facts.request,
+        roundAggregates: input.finalized.roundAggregates,
+        reviewParticipants: input.finalized.reviewParticipants,
+        auditParticipants: input.finalized.auditParticipants,
+      },
+      onChainParticipation: {
+        reviewParticipant,
+        auditParticipant,
+        acceptedReviewParticipants: input.finalized.reviewParticipants,
+        acceptedAuditParticipants: input.finalized.auditParticipants,
+      },
+      protocol: PROTOCOL_CONTEXT,
+      expectedReportFacts: facts,
+    };
+    const generated = await runAgentContextLlm(
+      buildAgentScoreReportMessages({ context }),
+      AgentScoreReportModelResponse,
+    );
+    const report = normalizeAgentScoreReport(generated.data, facts);
+    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const createdAt = Math.floor(Date.now() / 1000);
+    const row = db.upsertAgentScoreReport({
+      requestId: input.requestId,
+      agentKey,
+      agent,
+      reportJson: JSON.stringify(report),
+      contextSummaryJson: JSON.stringify(agentContext.contextUsed),
+      model,
+      promptTokens: generated.llm.promptTokens ?? null,
+      completionTokens: generated.llm.completionTokens ?? null,
+      totalTokens: generated.llm.totalTokens ?? null,
+      createdAt,
+    });
+    db.appendAgentContextEvent({
+      requestId: input.requestId,
+      agentKey,
+      agent,
+      eventType: "score_report_generated",
+      phase: agentContext.agentStatus?.phase ?? "Finalized",
+      status: "generated",
+      detail: "finalized score report generated",
+      payloadJson: JSON.stringify({
+        participation: report.agent.participation,
+        proposalScore: report.scoreGiven?.proposalScore ?? null,
+        finalScore: report.request.finalScore,
+      }),
+    });
+    return { row, cached: false };
+  }
+
+  async function getOrCreateRequestFinalReport(input: {
+    requestId: string;
+    finalized: Extract<Awaited<ReturnType<typeof readFinalizedRequestSnapshot>>, { ok: true }>;
+  }): Promise<{ row: NonNullable<ReturnType<ContentDB["getRequestFinalReport"]>>; cached: boolean }> {
+    const cached = db.getRequestFinalReport(input.requestId);
+    if (cached) return { row: cached, cached: true };
+
+    const agentStatuses = db.listAgentStatuses(input.requestId);
+    if (agentStatuses.length === 0) {
+      throw new Error("not_found");
+    }
+
+    const agentReportRows = [];
+    for (const status of agentStatuses) {
+      const report = await getOrCreateAgentScoreReport({
+        requestId: input.requestId,
+        agent: status.agent,
+        finalized: input.finalized,
+      });
+      agentReportRows.push(report.row);
+    }
+    const agentReports = agentReportRows.map((row) => AgentScoreReportModelResponse.parse(JSON.parse(row.reportJson)));
+    const requestFacts = reportRequestFacts({
+      requestId: input.requestId,
+      chainStatus: input.finalized.chainStatus,
+      finalScore: input.finalized.finalScore,
+    });
+    const agentReportFactsList = agentReports.map((report) => finalAgentSummary(report));
+    const doc = serializeRequestDocument(db, input.requestId);
+    const generated = await runAgentContextLlm(
+      buildRequestFinalReportMessages({
+        context: {
+          request: {
+            ...requestFacts,
+            chainStatus: input.finalized.chainStatus,
+            roundAggregates: input.finalized.roundAggregates,
+            reviewParticipants: input.finalized.reviewParticipants,
+            auditParticipants: input.finalized.auditParticipants,
+          },
+          protocol: PROTOCOL_CONTEXT,
+          document: doc
+            ? {
+                verified: doc.verified,
+                proposal: {
+                  uri: doc.proposal.uri,
+                  id: doc.proposal.id,
+                  hash: doc.proposal.hash,
+                  mimeType: doc.proposal.mimeType,
+                },
+              }
+            : null,
+          agentReports,
+          expectedReportFacts: {
+            request: requestFacts,
+            agentReports: agentReportFactsList,
+          },
+          rawThinking: RAW_THINKING_NOTICE,
+        },
+      }),
+      RequestFinalReportModelResponse,
+    );
+    const report = normalizeRequestFinalReport(generated.data, {
+      request: requestFacts,
+      agentReports: agentReportFactsList,
+    });
+    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const createdAt = Math.floor(Date.now() / 1000);
+    const row = db.upsertRequestFinalReport({
+      requestId: input.requestId,
+      reportJson: JSON.stringify(report),
+      agentCount: agentStatuses.length,
+      model,
+      promptTokens: generated.llm.promptTokens ?? null,
+      completionTokens: generated.llm.completionTokens ?? null,
+      totalTokens: generated.llm.totalTokens ?? null,
+      createdAt,
+    });
+    for (const status of agentStatuses) {
+      db.appendAgentContextEvent({
+        requestId: input.requestId,
+        agentKey: status.agentKey,
+        agent: status.agent,
+        eventType: "final_report_generated",
+        phase: "Finalized",
+        status: "generated",
+        detail: "request final report generated",
+        payloadJson: JSON.stringify({
+          agentCount: agentStatuses.length,
+          finalScore: report.request.finalScore,
+        }),
+      });
+    }
+    return { row, cached: false };
   }
 
   async function buildUSDAIORequestIntent(body: z.infer<typeof RequestIntentBody>) {
@@ -1370,87 +2150,31 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       return { error: "invalid_agent_question", issues: parsed.error.issues };
     }
 
-    const agent = getAddress(req.params.agent);
-    const agentKey = addressKey(agent);
-    const doc = serializeRequestDocument(db, req.params.requestId);
-    const agentStatus = serializeAgentStatus(db.getAgentStatus(req.params.requestId, agentKey));
-    const reasons = buildAgentReasons(db, req.params.requestId, agent);
-    const events = db.listAgentContextEvents(req.params.requestId, agentKey, 50).map((row) =>
-      serializeAgentContextEvent(row),
-    );
-    const history = db
-      .listAgentQaHistory(req.params.requestId, agentKey, parsed.data.sessionId, qaHistoryWindow)
-      .map((row) => serializeAgentQaHistory(row));
+    const agentContext = await buildAgentContext({
+      requestId: req.params.requestId,
+      agent: req.params.agent,
+      sessionId: parsed.data.sessionId,
+      historyLimit: qaHistoryWindow,
+    });
 
-    let chainStatus: ReturnType<typeof serializeRequestLifecycle> | null = null;
-    let chainStatusError: string | null = null;
-    try {
-      const deployment = loadDeploymentSnapshot(deploymentPath);
-      const handles = loadContracts(deployment, chainProvider());
-      const lifecycle = await withRpcReadRetries(() =>
-        handles.core.getRequestLifecycle(BigInt(req.params.requestId)),
-      );
-      chainStatus = serializeRequestLifecycle(req.params.requestId, lifecycle as readonly unknown[]);
-    } catch (err) {
-      chainStatusError = formatError(err);
-    }
-
-    if (!doc && !agentStatus && !reasons.review && !reasons.audit && events.length === 0 && !chainStatus) {
+    if (
+      !agentContext.doc &&
+      !agentContext.agentStatus &&
+      !agentContext.reasons.review &&
+      !agentContext.reasons.audit &&
+      agentContext.events.length === 0 &&
+      !agentContext.chainStatus
+    ) {
       reply.code(404);
       return { error: "not_found" };
     }
 
-    const contextUsed = {
-      hasDocument: Boolean(doc),
-      hasReview: Boolean(reasons.review),
-      hasAudit: Boolean(reasons.audit),
-      agentStatus: agentStatus ? `${agentStatus.phase}:${agentStatus.status}` : null,
-      historyUsed: history.length,
-      eventsUsed: events.length,
-      chainStatus: chainStatus?.statusName ?? null,
-    };
-    const qaContext = {
-      request: {
-        requestId: req.params.requestId,
-        chainStatus,
-        chainStatusError,
-      },
-      agent: {
-        address: agent,
-        latestStatus: agentStatus,
-      },
-      document: doc
-        ? {
-            updatedAt: doc.updatedAt,
-            verified: doc.verified,
-            proposal: {
-              uri: doc.proposal.uri,
-              id: doc.proposal.id,
-              hash: doc.proposal.hash,
-              mimeType: doc.proposal.mimeType,
-              text: budgetProposal(doc.proposal.text),
-            },
-          }
-        : null,
-      reasons,
-      recentEvents: events,
-      recentQaHistory: history.map((row) => ({
-        question: row.question,
-        answer: row.answer,
-        confidence: row.confidence,
-        contextUsed: row.contextUsed,
-        createdAt: row.createdAt,
-      })),
-      rawThinking: RAW_THINKING_NOTICE,
-    };
-
-    let llm;
-    let qa;
+    let generated;
     try {
-      llm = await chat(buildAgentQaMessages({ question: parsed.data.question, context: qaContext }), {
-        responseFormatJson: true,
-      });
-      qa = AgentQaModelResponse.parse(extractJson(llm.content));
+      generated = await runAgentContextLlm(
+        buildAgentQaMessages({ question: parsed.data.question, context: agentContext.context }),
+        AgentQaModelResponse,
+      );
     } catch (err) {
       reply.code(503);
       return { error: "agent_qa_unavailable", detail: formatError(err) };
@@ -1460,50 +2184,115 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     const createdAt = Math.floor(Date.now() / 1000);
     const stored = db.insertAgentQaHistory({
       requestId: req.params.requestId,
-      agentKey,
-      agent,
+      agentKey: agentContext.agentKey,
+      agent: agentContext.agent,
       sessionId: parsed.data.sessionId,
       question: parsed.data.question,
-      answer: qa.answer,
-      confidence: qa.confidence,
-      contextSummaryJson: JSON.stringify(contextUsed),
+      answer: generated.data.answer,
+      confidence: generated.data.confidence,
+      contextSummaryJson: JSON.stringify(agentContext.contextUsed),
       model,
-      promptTokens: llm.promptTokens ?? null,
-      completionTokens: llm.completionTokens ?? null,
-      totalTokens: llm.totalTokens ?? null,
+      promptTokens: generated.llm.promptTokens ?? null,
+      completionTokens: generated.llm.completionTokens ?? null,
+      totalTokens: generated.llm.totalTokens ?? null,
       createdAt,
     });
     db.appendAgentContextEvent({
       requestId: req.params.requestId,
-      agentKey,
-      agent,
+      agentKey: agentContext.agentKey,
+      agent: agentContext.agent,
       eventType: "qa_answer",
-      phase: agentStatus?.phase ?? null,
+      phase: agentContext.agentStatus?.phase ?? null,
       status: "answered",
       detail: parsed.data.question.slice(0, 200),
       payloadJson: JSON.stringify({
         sessionId: parsed.data.sessionId,
         qaHistoryId: stored.id,
-        confidence: qa.confidence,
-        historyUsed: history.length,
+        confidence: generated.data.confidence,
+        historyUsed: agentContext.history.length,
       }),
     });
 
     return {
       requestId: req.params.requestId,
-      agent,
+      agent: agentContext.agent,
       sessionId: parsed.data.sessionId,
-      answer: qa.answer,
-      confidence: qa.confidence,
-      contextUsed,
+      answer: generated.data.answer,
+      confidence: generated.data.confidence,
+      contextUsed: agentContext.contextUsed,
       model,
-      usage: {
-        promptTokens: llm.promptTokens ?? 0,
-        completionTokens: llm.completionTokens ?? 0,
-        totalTokens: llm.totalTokens ?? 0,
-      },
+      usage: usageFromLlm(generated.llm),
       createdAt: stored.createdAt,
     };
+  });
+
+  app.post<{ Params: { requestId: string; agent: string } }>(
+    "/requests/:requestId/agents/:agent/score-report",
+    async (req, reply) => {
+      if (!/^\d+$/.test(req.params.requestId) || !HexAddress.safeParse(req.params.agent).success) {
+        reply.code(400);
+        return { error: "invalid_params" };
+      }
+
+      let finalized: Awaited<ReturnType<typeof readFinalizedRequestSnapshot>>;
+      try {
+        finalized = await readFinalizedRequestSnapshot(req.params.requestId);
+      } catch (err) {
+        reply.code(503);
+        return { error: "chain_status_unavailable", detail: formatError(err) };
+      }
+      if (!finalized.ok) {
+        reply.code(409);
+        return { error: "request_not_finalized", chainStatus: finalized.chainStatus };
+      }
+
+      try {
+        const result = await getOrCreateAgentScoreReport({
+          requestId: req.params.requestId,
+          agent: req.params.agent,
+          finalized,
+        });
+        return serializeAgentScoreReport(result.row, result.cached);
+      } catch (err) {
+        if (formatError(err) === "not_found") {
+          reply.code(404);
+          return { error: "not_found" };
+        }
+        reply.code(503);
+        return { error: "score_report_unavailable", detail: formatError(err) };
+      }
+    },
+  );
+
+  app.post<{ Params: { requestId: string } }>("/requests/:requestId/final-report", async (req, reply) => {
+    if (!/^\d+$/.test(req.params.requestId)) {
+      reply.code(400);
+      return { error: "invalid_params" };
+    }
+
+    let finalized: Awaited<ReturnType<typeof readFinalizedRequestSnapshot>>;
+    try {
+      finalized = await readFinalizedRequestSnapshot(req.params.requestId);
+    } catch (err) {
+      reply.code(503);
+      return { error: "chain_status_unavailable", detail: formatError(err) };
+    }
+    if (!finalized.ok) {
+      reply.code(409);
+      return { error: "request_not_finalized", chainStatus: finalized.chainStatus };
+    }
+
+    try {
+      const result = await getOrCreateRequestFinalReport({ requestId: req.params.requestId, finalized });
+      return serializeRequestFinalReport(result.row, result.cached);
+    } catch (err) {
+      if (formatError(err) === "not_found") {
+        reply.code(404);
+        return { error: "not_found" };
+      }
+      reply.code(503);
+      return { error: "final_report_unavailable", detail: formatError(err) };
+    }
   });
 
   app.get<{ Params: { requestId: string; agent: string }; Querystring: { sessionId?: string; limit?: string | number } }>(

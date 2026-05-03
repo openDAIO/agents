@@ -146,6 +146,8 @@ Endpoint summary:
 | `GET` | `/requests/:requestId/agents/:agent/reasons` | Read one agent's persisted final review/audit rationales. |
 | `POST` | `/requests/:requestId/agents/:agent/ask` | Ask an agent-scoped question using request, chain, artifact, event, and Q&A context. |
 | `GET` | `/requests/:requestId/agents/:agent/qa-history` | Read stored Q&A history for one request, agent, and session. |
+| `POST` | `/requests/:requestId/agents/:agent/score-report` | Generate or read a cached finalized score report for one agent. |
+| `POST` | `/requests/:requestId/final-report` | Generate or read a cached synthesized finalized request report. |
 | `POST` | `/proposals` | Store proposal Markdown directly; mostly internal/debug. |
 | `GET` | `/proposals/:id` | Read a stored proposal. |
 | `GET` | `/proposals/:id/markdown` | Read stored proposal Markdown as JSON or raw Markdown. |
@@ -738,6 +740,273 @@ with four questions in `sessionId=live-e2e` stored four rows, while the final
 answer used `historyUsed=3`. A separate `sessionId=live-e2e-other` started with
 `historyUsed=0`.
 
+### `POST /requests/:requestId/agents/:agent/score-report`
+
+Generates, stores, and returns a finalized score report for one agent. The
+server first verifies `DAIOCore.getRequestLifecycle(requestId)` from the
+configured chain RPC. If the request is not `Finalized`, it returns `409`. If a
+cached report already exists for `(requestId, agent)`, it returns that report
+without another LLM call.
+
+The report uses the same structured context family as `/ask`, but it is not
+stored in Q&A history. It is stored in `agent_score_reports`, and a
+`score_report_generated` event is appended to the agent context event log.
+The endpoint may mention off-chain artifacts as caveats, but `scoreGiven`,
+`auditGiven`, and `participation` are derived from on-chain accepted
+review/audit participants for the finalized attempt. If an agent produced a
+local review artifact after quorum moved on and the contract did not accept the
+commit/reveal, `scoreGiven` is `null` and participation is `skipped`.
+
+Request body: empty.
+
+Response:
+
+```json
+{
+  "requestId": "18",
+  "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+  "cached": false,
+  "report": {
+    "schema": "daio.agent.score_report.v1",
+    "request": {
+      "requestId": "18",
+      "chainStatus": "Finalized",
+      "finalScore": 6200,
+      "lowConfidence": false,
+      "retryCount": "0"
+    },
+    "agent": {
+      "address": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+      "latestStatus": "Finalized:finalized",
+      "participation": "reviewer_and_auditor"
+    },
+    "scoreGiven": {
+      "proposalScore": 6200,
+      "recommendation": "weak_accept",
+      "confidence": 7200,
+      "reportHash": "0xad3987d8b07298aada45b8209c2c58f3df5a9c6e09fafcdd96fd6deea9c946c1"
+    },
+    "auditGiven": {
+      "auditHash": "0x...",
+      "targetCount": 2,
+      "targetEvaluations": []
+    },
+    "decisionSummary": "...",
+    "rationale": {
+      "whyThisScore": "...",
+      "mainStrengths": [],
+      "mainWeaknesses": [],
+      "riskFactors": [],
+      "confidenceExplanation": "..."
+    },
+    "evidence": [],
+    "caveats": []
+  },
+  "model": "gpt-oss-120b",
+  "usage": {
+    "promptTokens": 0,
+    "completionTokens": 0,
+    "totalTokens": 0
+  },
+  "createdAt": 1777810044
+}
+```
+
+`participation` is one of `reviewer_and_auditor`, `reviewer_only`,
+`auditor_only`, `skipped`, or `observer`. If the agent was not accepted on-chain
+for review or audit in the finalized attempt, `scoreGiven` and/or `auditGiven`
+are `null` even when an off-chain artifact exists; the report should explain the
+skipped/observer state instead of inventing accepted participation.
+
+Live Sepolia example:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:18002/requests/18/agents/0x66ff396457F3df77c6d520f0f3BBb05e4794E057/score-report
+```
+
+Response excerpt from request `18`:
+
+```json
+{
+  "cached": false,
+  "requestId": "18",
+  "report": {
+    "request": { "chainStatus": "Finalized", "finalScore": 6200 },
+    "agent": { "participation": "reviewer_and_auditor" },
+    "scoreGiven": {
+      "proposalScore": 6200,
+      "recommendation": "weak_accept",
+      "confidence": 7200
+    },
+    "auditGiven": { "targetCount": 2 }
+  }
+}
+```
+
+Skipped-agent excerpt from the same finalized request:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:18002/requests/18/agents/0x08913F98a37FCC24CB825fB6db7599086A5f8f56/score-report
+```
+
+```json
+{
+  "cached": false,
+  "requestId": "18",
+  "report": {
+    "agent": { "participation": "skipped" },
+    "scoreGiven": null,
+    "auditGiven": null,
+    "caveats": [
+      "The agent's off-chain review score (6200) is not counted because the contract did not accept this agent as a finalized review participant."
+    ]
+  }
+}
+```
+
+Error responses:
+
+| Status | Error | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_params` | Bad request id or bad agent address. |
+| `404` | `not_found` | No agent-specific status, artifact, or event context exists. |
+| `409` | `request_not_finalized` | The contract lifecycle is not `Finalized`. |
+| `503` | `chain_status_unavailable` | Chain lifecycle or round aggregate reads failed. |
+| `503` | `score_report_unavailable` | LLM generation or schema validation failed. |
+
+### `POST /requests/:requestId/final-report`
+
+Generates, stores, and returns a request-level final report. The server verifies
+the request is finalized, uses all agents present in `agent_status` for that
+request, generates any missing per-agent score reports, and then synthesizes a
+single JSON report. The `agentCount` is the number of tracked status agents, but
+proposal score fields inside `agentReports` are populated only for on-chain
+accepted review participants. Cached final reports are returned without another
+LLM call.
+
+Request body: empty.
+
+Response:
+
+```json
+{
+  "requestId": "18",
+  "cached": false,
+  "agentCount": 5,
+  "report": {
+    "schema": "daio.request.final_report.v1",
+    "request": {
+      "requestId": "18",
+      "chainStatus": "Finalized",
+      "finalScore": 6200,
+      "lowConfidence": false,
+      "retryCount": "0"
+    },
+    "agentReports": [
+      {
+        "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+        "participation": "reviewer_and_auditor",
+        "proposalScore": 6200,
+        "recommendation": "weak_accept",
+        "confidence": 7200
+      },
+      {
+        "agent": "0x08913F98a37FCC24CB825fB6db7599086A5f8f56",
+        "participation": "skipped",
+        "proposalScore": null,
+        "recommendation": null,
+        "confidence": null
+      }
+    ],
+    "consensus": {
+      "summary": "...",
+      "agreementLevel": "high",
+      "scoreSpread": "...",
+      "notableDisagreements": []
+    },
+    "finalAssessment": {
+      "executiveSummary": "...",
+      "scoreRationale": "...",
+      "mainStrengths": [],
+      "mainWeaknesses": [],
+      "auditFindings": [],
+      "operationalNotes": []
+    },
+    "caveats": []
+  },
+  "model": "gpt-oss-120b",
+  "usage": {
+    "promptTokens": 0,
+    "completionTokens": 0,
+    "totalTokens": 0
+  },
+  "createdAt": 1777810044
+}
+```
+
+Live Sepolia example:
+
+```bash
+curl -sS -X POST http://127.0.0.1:18002/requests/18/final-report
+```
+
+Response excerpt:
+
+```json
+{
+  "cached": false,
+  "requestId": "18",
+  "agentCount": 5,
+  "report": {
+    "request": { "chainStatus": "Finalized", "finalScore": 6200 },
+    "consensus": {
+      "agreementLevel": "high",
+      "scoreSpread": "Proposal scores ranged from 6200 to 6200 across 3 scoring agents."
+    },
+    "agentReports": [
+      {
+        "agent": "0x66ff396457F3df77c6d520f0f3BBb05e4794E057",
+        "participation": "reviewer_and_auditor",
+        "proposalScore": 6200
+      },
+      {
+        "agent": "0x08913F98a37FCC24CB825fB6db7599086A5f8f56",
+        "participation": "skipped",
+        "proposalScore": null
+      }
+    ]
+  }
+}
+```
+
+Immediate repeat calls return cached JSON:
+
+```json
+{
+  "cached": true,
+  "requestId": "18",
+  "agentCount": 5,
+  "report": {
+    "request": { "finalScore": 6200 },
+    "consensus": {
+      "scoreSpread": "Proposal scores ranged from 6200 to 6200 across 3 scoring agents."
+    }
+  }
+}
+```
+
+Error responses:
+
+| Status | Error | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_params` | Bad request id. |
+| `404` | `not_found` | No agent statuses exist for this finalized request. |
+| `409` | `request_not_finalized` | The contract lifecycle is not `Finalized`. |
+| `503` | `chain_status_unavailable` | Chain lifecycle or round aggregate reads failed. |
+| `503` | `final_report_unavailable` | Agent report generation, final LLM generation, or schema validation failed. |
+
 When `CONTENT_REQUIRE_AGENT_SIGNATURES=true`, status and reason data is written
 only by requests signed with the reviewer/auditor wallet. The content API still
 serves these as off-chain observability records. Frontends that need settlement
@@ -762,6 +1031,8 @@ These are mostly agent/internal, but they can be useful for debugging or explore
 | `PUT` | `/agent-status` | Agent-only status writer; with signature enforcement, body includes `signature`. Frontends should normally read status endpoints instead. |
 | `POST` | `/requests/:requestId/agents/:agent/ask` | Public Q&A reader backed by the LLM and persisted request/agent context. |
 | `GET` | `/requests/:requestId/agents/:agent/qa-history` | Public Q&A history reader for one session. |
+| `POST` | `/requests/:requestId/agents/:agent/score-report` | Public cached finalized score report generator/reader for one agent. |
+| `POST` | `/requests/:requestId/final-report` | Public cached finalized request report generator/reader. |
 
 Proposal response shape for `POST /proposals` and `GET /proposals/:id`:
 
@@ -838,7 +1109,7 @@ verifies the wallet signature before persisting.
 
 ## Contract Views
 
-Use the deployment snapshot, usually `./.deployments/sepolia.json`, for contract addresses. The frontend should construct ethers/viem contracts with the ABI artifacts under `contracts/artifacts`.
+Use the deployment snapshot, usually `./.deployments/sepolia.json`, for contract addresses. The frontend should construct ethers/viem contracts with the ABI artifacts under `contracts/artifacts`. The current Sepolia snapshot points `ConsensusScoring` at `0xe271d90C72D9a8D931f337C144C6C4e204F994ed`; older integrations that cached `0xEf348E9658087F7F459dE35207EF02bEb6923aaE` should refresh from the snapshot.
 
 ### `USDAIOToken`
 
@@ -918,8 +1189,12 @@ Interpretation notes:
 - Contract views/events are the settlement source of truth for lifecycle status,
   participant acceptance, finalized scores, rewards, and slashing.
 - Content API records are off-chain convenience data for documents, final
-  rationales, current agent observability, and agent-scoped Q&A. They can lag
-  chain events during processing.
+  rationales, current agent observability, agent-scoped Q&A, and cached final
+  report JSON. They can lag chain events during processing.
+- Current `ConsensusScoring` credits a reviewer with normalized audit
+  reliability when their report has zero incoming audits, so honest audit work
+  is not discarded just because peers missed their audit obligations. Reviewers
+  with no incoming audits and no completed audit work still receive zero weight.
 - `GET /requests/:requestId/markdown` is the canonical off-chain document body
   for a request; its `proposal.hash` equals the on-chain `proposalHash`.
 - The reasons endpoint intentionally reports `rawThinking.available=false`.

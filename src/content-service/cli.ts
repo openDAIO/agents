@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { buildServer } from "./server.js";
-import { installRpcProcessGuards } from "../shared/rpc.js";
+import { installRpcProcessGuards, txFinalityConfirmationsFromEnv } from "../shared/rpc.js";
 
 const port = Number(process.env.CONTENT_SERVICE_PORT ?? 18002);
 const host = process.env.CONTENT_SERVICE_HOST ?? "127.0.0.1";
@@ -9,7 +9,10 @@ const deploymentPath = process.env.CONTENT_DEPLOYMENT_PATH ?? process.env.DAIO_D
 const rpcUrl = process.env.CONTENT_CHAIN_RPC_URL ?? process.env.RPC_URL;
 const rpcUrls = process.env.CONTENT_CHAIN_RPC_URLS ?? process.env.RPC_URLS;
 const relayerPrivateKey = process.env.CONTENT_RELAYER_PRIVATE_KEY ?? process.env.RELAYER_PRIVATE_KEY;
-const relayerConfirmations = Number(process.env.CONTENT_RELAYER_CONFIRMATIONS ?? "1");
+const relayerConfirmations =
+  process.env.CONTENT_RELAYER_CONFIRMATIONS === undefined || process.env.CONTENT_RELAYER_CONFIRMATIONS.trim() === ""
+    ? txFinalityConfirmationsFromEnv()
+    : Number(process.env.CONTENT_RELAYER_CONFIRMATIONS);
 const requireAgentSignatures = !["0", "false", "no", "off"].includes(
   (process.env.CONTENT_REQUIRE_AGENT_SIGNATURES ?? "true").trim().toLowerCase(),
 );
@@ -22,7 +25,9 @@ const { app, db } = buildServer({
   chain: { deploymentPath, rpcUrl, rpcUrls },
   relayer: {
     privateKey: relayerPrivateKey,
-    confirmations: Number.isFinite(relayerConfirmations) && relayerConfirmations >= 0 ? relayerConfirmations : 1,
+    confirmations: Number.isFinite(relayerConfirmations) && relayerConfirmations >= 0
+      ? relayerConfirmations
+      : txFinalityConfirmationsFromEnv(),
   },
   requireAgentSignatures,
 });

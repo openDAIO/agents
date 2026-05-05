@@ -1,5 +1,8 @@
 import { FallbackProvider, JsonRpcProvider, type Provider, type TransactionReceipt } from "ethers";
 
+const DEFAULT_TX_FINALITY_CONFIRMATIONS = 1;
+const DEFAULT_TX_FINALITY_WAIT_TIMEOUT_MS = 300_000;
+
 export interface RpcFailoverOptions {
   stallTimeoutMs?: number;
   quorum?: number;
@@ -32,9 +35,38 @@ function parseIntegerEnv(env: NodeJS.ProcessEnv, name: string): number | undefin
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function parseNonNegativeIntegerEnv(env: NodeJS.ProcessEnv, names: readonly string[], fallback: number): number {
+  for (const name of names) {
+    const raw = env[name];
+    if (!raw || raw.trim() === "") continue;
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0 && String(parsed) === raw.trim()) {
+      return parsed;
+    }
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return fallback;
+}
+
 function positiveInteger(value: number | undefined, fallback: number, min = 1): number {
   if (value === undefined || !Number.isFinite(value) || value < min) return fallback;
   return Math.floor(value);
+}
+
+export function txFinalityConfirmationsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return parseNonNegativeIntegerEnv(
+    env,
+    ["DAIO_TX_FINALITY_CONFIRMATIONS", "DAIO_CHAIN_FINALITY_SLOTS"],
+    DEFAULT_TX_FINALITY_CONFIRMATIONS,
+  );
+}
+
+export function txFinalityWaitTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return parseNonNegativeIntegerEnv(
+    env,
+    ["DAIO_TX_FINALITY_WAIT_TIMEOUT_MS"],
+    DEFAULT_TX_FINALITY_WAIT_TIMEOUT_MS,
+  );
 }
 
 export function rpcFailoverOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): RpcFailoverOptions {
@@ -172,7 +204,7 @@ export interface WaitableTransaction {
 
 export async function waitForTransactionWithRetries(
   tx: WaitableTransaction,
-  confirmations = 1,
+  confirmations = txFinalityConfirmationsFromEnv(),
   options: RpcFailoverOptions = rpcFailoverOptionsFromEnv(),
 ): Promise<TransactionReceipt | null> {
   const attempts = positiveInteger(options.txWaitRetries ?? options.readRetries, 5);
@@ -181,6 +213,28 @@ export async function waitForTransactionWithRetries(
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       return await tx.wait(confirmations);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableRpcError(err) || attempt === attempts - 1) break;
+      await delay(baseMs * 2 ** attempt);
+    }
+  }
+  throw lastErr;
+}
+
+export async function waitForTransactionHashWithRetries(
+  provider: Provider,
+  txHash: string,
+  confirmations = txFinalityConfirmationsFromEnv(),
+  timeoutMs = txFinalityWaitTimeoutMsFromEnv(),
+  options: RpcFailoverOptions = rpcFailoverOptionsFromEnv(),
+): Promise<TransactionReceipt | null> {
+  const attempts = positiveInteger(options.txWaitRetries ?? options.readRetries, 5);
+  const baseMs = positiveInteger(options.txWaitRetryBaseMs ?? options.readRetryBaseMs, 1_000, 0);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await provider.waitForTransaction(txHash, confirmations, timeoutMs);
     } catch (err) {
       lastErr = err;
       if (!isRetryableRpcError(err) || attempt === attempts - 1) break;

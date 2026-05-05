@@ -9,7 +9,11 @@ import { runAudit, runAuditReveal, type AuditFlowDeps } from "./auditFlow.js";
 import type { StateStore } from "./state.js";
 import type { Provider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
-import { waitForTransactionWithRetries, withRpcReadRetries } from "../../shared/rpc.js";
+import {
+  txFinalityConfirmationsFromEnv,
+  waitForTransactionWithRetries,
+  withRpcReadRetries,
+} from "../../shared/rpc.js";
 import { gasLimitWithHeadroom } from "./gas.js";
 import { readPhaseTiming } from "./phaseTiming.js";
 import {
@@ -29,6 +33,7 @@ export interface AgentConfig {
   eventPollIntervalMs?: number;
   eventLookbackBlocks?: number;
   eventReorgDepthBlocks?: number;
+  eventFinalityConfirmations?: number;
   startRequestsMaxPerTick?: number;
   startRequestsMinIntervalMs?: number;
   startRequestsJitterMs?: number;
@@ -136,6 +141,7 @@ export class ReviewerAgent {
       },
       lookbackBlocks: cfg.eventLookbackBlocks,
       reorgDepthBlocks: cfg.eventReorgDepthBlocks,
+      finalityConfirmations: cfg.eventFinalityConfirmations,
     });
     this.agentTxSigner = new NonceManager(wallet);
     const keeperWallet = cfg.keeperWallet;
@@ -226,7 +232,9 @@ export class ReviewerAgent {
     await this.logKeeperSigner();
     const eventPollIntervalMs = Math.max(100, this.cfg.eventPollIntervalMs ?? 500);
     await this.events.start(undefined, eventPollIntervalMs);
-    this.log(`started; watching events pollIntervalMs=${eventPollIntervalMs}`);
+    this.log(
+      `started; watching events pollIntervalMs=${eventPollIntervalMs} finalityConfirmations=${this.cfg.eventFinalityConfirmations ?? txFinalityConfirmationsFromEnv()}`,
+    );
     this.scheduleActiveRefill("startup");
     this.scheduleKeeperReconcile();
   }
@@ -662,7 +670,7 @@ export class ReviewerAgent {
 
     try {
       if (this.shouldCheckLiveStatus(change.status)) {
-        const liveStatus = await this.currentRequestStatus(change.requestId).catch((err) => {
+        const liveStatus = await this.currentRequestStatus(change.requestId, change.blockNumber).catch((err) => {
           this.log(`could not read live status for request ${change.requestId}: ${formatError(err)}`);
           return undefined;
         });
@@ -812,9 +820,12 @@ export class ReviewerAgent {
     }
   }
 
-  private async currentRequestStatus(requestId: bigint): Promise<RequestStatus> {
-    const lifecycle = await withRpcReadRetries(
-      () => this.handles.core.getRequestLifecycle(requestId) as Promise<readonly unknown[]>,
+  private async currentRequestStatus(requestId: bigint, blockTag?: number): Promise<RequestStatus> {
+    const core = this.handles.core as unknown as {
+      getRequestLifecycle(id: bigint, overrides?: { blockTag: number }): Promise<readonly unknown[]>;
+    };
+    const lifecycle = await withRpcReadRetries(() =>
+      blockTag === undefined ? core.getRequestLifecycle(requestId) : core.getRequestLifecycle(requestId, { blockTag }),
     );
     return Number(lifecycle[1] as bigint | number) as RequestStatus;
   }

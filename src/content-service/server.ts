@@ -14,10 +14,12 @@ import {
   makeRpcProvider,
   parseRpcUrls,
   rpcFailoverOptionsFromEnv,
+  txFinalityConfirmationsFromEnv,
+  waitForTransactionHashWithRetries,
   waitForTransactionWithRetries,
   withRpcReadRetries,
 } from "../shared/rpc.js";
-import { chat, extractJson } from "../reviewer-agent/llm/client.js";
+import { buildPromptCacheMessages, chat, extractJson, type ChatMessage } from "../reviewer-agent/llm/client.js";
 import { budgetProposal } from "../reviewer-agent/llm/prepareInput.js";
 
 export interface ServerOptions {
@@ -704,8 +706,8 @@ async function verifyRequestTransaction(input: {
   const provider = makeRpcProvider(rpcUrls, rpcFailoverOptionsFromEnv());
   const paymentRouterAddress = getAddress(deployment.contracts.paymentRouter);
   const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
-  const receipt = await withRpcReadRetries(() => provider.getTransactionReceipt(input.txHash));
-  if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_or_pending" };
+  const receipt = await waitForTransactionHashWithRetries(provider, input.txHash);
+  if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_pending_or_unfinalized" };
   if (receipt.status !== 1) return { ok: false as const, code: 400, error: "tx_failed" };
 
   const tx = await withRpcReadRetries(() => provider.getTransaction(input.txHash));
@@ -833,8 +835,8 @@ async function findRequestIdsFromPaymentTx(input: {
   const provider = makeRpcProvider(rpcUrls, rpcFailoverOptionsFromEnv());
   const paymentRouterAddress = getAddress(deployment.contracts.paymentRouter);
   const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);
-  const receipt = await withRpcReadRetries(() => provider.getTransactionReceipt(input.txHash));
-  if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_or_pending" };
+  const receipt = await waitForTransactionHashWithRetries(provider, input.txHash);
+  if (!receipt) return { ok: false as const, code: 404, error: "tx_not_found_pending_or_unfinalized" };
   if (receipt.status !== 1) return { ok: false as const, code: 400, error: "tx_failed" };
 
   const requester = input.requester ? getAddress(input.requester) : undefined;
@@ -891,50 +893,41 @@ const PROTOCOL_CONTEXT = {
 function buildAgentQaMessages(input: {
   question: string;
   context: Record<string, unknown>;
-}): Array<{ role: "system" | "user"; content: string }> {
-  return [
-    { role: "system", content: AGENT_QA_SYSTEM },
-    {
-      role: "user",
-      content: JSON.stringify({
-        schema: "daio.agent.qa.input.v1",
-        question: input.question,
-        context: input.context,
-      }),
-    },
-  ];
+}): ChatMessage[] {
+  return buildPromptCacheMessages(
+    AGENT_QA_SYSTEM,
+    JSON.stringify({
+      schema: "daio.agent.qa.input.v1",
+      question: input.question,
+      context: input.context,
+    }),
+  );
 }
 
 function buildAgentScoreReportMessages(input: {
   context: Record<string, unknown>;
-}): Array<{ role: "system" | "user"; content: string }> {
-  return [
-    { role: "system", content: AGENT_SCORE_REPORT_SYSTEM },
-    {
-      role: "user",
-      content: JSON.stringify({
-        schema: "daio.agent.score_report.input.v1",
-        task: "Create the finalized score report for this agent and request.",
-        context: input.context,
-      }),
-    },
-  ];
+}): ChatMessage[] {
+  return buildPromptCacheMessages(
+    AGENT_SCORE_REPORT_SYSTEM,
+    JSON.stringify({
+      schema: "daio.agent.score_report.input.v1",
+      task: "Create the finalized score report for this agent and request.",
+      context: input.context,
+    }),
+  );
 }
 
 function buildRequestFinalReportMessages(input: {
   context: Record<string, unknown>;
-}): Array<{ role: "system" | "user"; content: string }> {
-  return [
-    { role: "system", content: REQUEST_FINAL_REPORT_SYSTEM },
-    {
-      role: "user",
-      content: JSON.stringify({
-        schema: "daio.request.final_report.input.v1",
-        task: "Create the final synthesized report for this finalized request.",
-        context: input.context,
-      }),
-    },
-  ];
+}): ChatMessage[] {
+  return buildPromptCacheMessages(
+    REQUEST_FINAL_REPORT_SYSTEM,
+    JSON.stringify({
+      schema: "daio.request.final_report.input.v1",
+      task: "Create the final synthesized report for this finalized request.",
+      context: input.context,
+    }),
+  );
 }
 
 function usageFromLlm(llm: { promptTokens?: number | null; completionTokens?: number | null; totalTokens?: number | null }) {
@@ -1264,7 +1257,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
   }
 
   async function runAgentContextLlm<T extends z.ZodTypeAny>(
-    messages: Array<{ role: "system" | "user"; content: string }>,
+    messages: ChatMessage[],
     schema: T,
   ): Promise<{
     data: z.output<T>;
@@ -1580,7 +1573,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       signer.reset();
       tx = await send();
     }
-    const receipt = await waitForTransactionWithRetries(tx, opts.relayer?.confirmations ?? 1);
+    const receipt = await waitForTransactionWithRetries(tx, opts.relayer?.confirmations ?? txFinalityConfirmationsFromEnv());
     if (!receipt || receipt.status !== 1) throw new Error(`relayed request transaction failed: ${tx.hash}`);
 
     const iface = new Interface(Artifacts.PaymentRouter().abi as never[]);

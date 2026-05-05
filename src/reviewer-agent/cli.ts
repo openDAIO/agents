@@ -11,7 +11,7 @@ import { StateStore } from "./runtime/state.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { DOMAIN_RESEARCH } from "../shared/types.js";
 import { makeFixtureVrfProvider, makeSecp256k1VrfProvider } from "./chain/vrfProof.js";
-import { installRpcProcessGuards } from "../shared/rpc.js";
+import { installRpcProcessGuards, txFinalityConfirmationsFromEnv } from "../shared/rpc.js";
 
 async function main() {
   const { values } = parseArgs({
@@ -30,6 +30,8 @@ async function main() {
       "event-poll-interval-ms": { type: "string" },
       "event-lookback-blocks": { type: "string" },
       "event-reorg-depth-blocks": { type: "string" },
+      "finality-factor": { type: "string" },
+      "tx-finality-confirmations": { type: "string" },
       "review-election-difficulty": { type: "string" },
       "audit-election-difficulty": { type: "string" },
       "audit-target-limit": { type: "string" },
@@ -210,7 +212,11 @@ async function main() {
       );
 
   const cfg: AgentConfig = {
-    finalityFactor: 2n,
+    finalityFactor: bigintSetting(
+      values["finality-factor"] as string | undefined,
+      "DAIO_CHAIN_FINALITY_SLOTS",
+      BigInt(txFinalityConfirmationsFromEnv()),
+    ),
     reviewElectionDifficulty: bigintSetting(
       values["review-election-difficulty"] as string | undefined,
       "DAIO_REVIEW_ELECTION_DIFFICULTY",
@@ -243,6 +249,12 @@ async function main() {
       values["event-reorg-depth-blocks"] as string | undefined,
       "DAIO_EVENT_REORG_DEPTH_BLOCKS",
       12,
+      0,
+    ),
+    eventFinalityConfirmations: integerSetting(
+      values["tx-finality-confirmations"] as string | undefined,
+      "DAIO_TX_FINALITY_CONFIRMATIONS",
+      txFinalityConfirmationsFromEnv(),
       0,
     ),
     keeperEnabled,

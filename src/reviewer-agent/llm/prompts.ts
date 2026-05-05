@@ -1,5 +1,5 @@
 import { budgetProposal, budgetTargetReport } from "./prepareInput.js";
-import type { ChatMessage } from "./client.js";
+import { buildPromptCacheMessages, type ChatMessage } from "./client.js";
 
 export interface ReviewEnvelope {
   schema: "daio.llm.input.v1";
@@ -106,10 +106,7 @@ export function buildReviewMessages(envelope: ReviewEnvelope): ChatMessage[] {
       },
     },
   };
-  return [
-    { role: "system", content: buildSystemPrompt(REVIEW_INSTRUCTION, "review") },
-    { role: "user", content: JSON.stringify(safe) },
-  ];
+  return buildPromptCacheMessages(buildSystemPrompt(REVIEW_INSTRUCTION, "review"), JSON.stringify(safe));
 }
 
 export function buildAuditMessages(envelope: AuditEnvelope): ChatMessage[] {
@@ -127,8 +124,5 @@ export function buildAuditMessages(envelope: AuditEnvelope): ChatMessage[] {
       })),
     },
   };
-  return [
-    { role: "system", content: buildSystemPrompt(AUDIT_INSTRUCTION, "audit") },
-    { role: "user", content: JSON.stringify(safe) },
-  ];
+  return buildPromptCacheMessages(buildSystemPrompt(AUDIT_INSTRUCTION, "audit"), JSON.stringify(safe));
 }

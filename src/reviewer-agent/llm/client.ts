@@ -1,5 +1,10 @@
+import crypto from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
+
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user";
   content: string;
 }
 
@@ -10,6 +15,9 @@ export interface ChatOptions {
   maxTokens?: number;
   temperature?: number;
   responseFormatJson?: boolean;
+  responseCache?: boolean;
+  responseCacheTtlSeconds?: number;
+  responseCacheMaxEntries?: number;
 }
 
 export interface ChatResult {
@@ -17,12 +25,224 @@ export interface ChatResult {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cached?: boolean;
+}
+
+interface ResponseCacheRow {
+  content: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  createdAtMs: number;
+}
+
+const DEFAULT_RESPONSE_CACHE_TTL_SECONDS = 0;
+const DEFAULT_RESPONSE_CACHE_MAX_ENTRIES = 4096;
+let responseCacheDb: Database.Database | undefined;
+let responseCacheDbPathValue: string | undefined;
+
+export function buildPromptCacheMessages(systemContent: string, userContent: string): ChatMessage[] {
+  return [
+    { role: "system", content: systemContent },
+    { role: "user", content: userContent },
+  ];
+}
+
+function assertPromptCacheMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length !== 2 || messages[0]?.role !== "system" || messages[1]?.role !== "user") {
+    throw new Error("LLM prompt-cache format requires exactly two messages: system prefix followed by user input");
+  }
+  return messages;
+}
+
+function parseNonNegativeInteger(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || String(parsed) !== raw.trim()) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function responseCacheTtlSeconds(options: ChatOptions): number {
+  if (options.responseCacheTtlSeconds !== undefined) {
+    if (!Number.isInteger(options.responseCacheTtlSeconds) || options.responseCacheTtlSeconds < 0) {
+      throw new Error("responseCacheTtlSeconds must be a non-negative integer");
+    }
+    return options.responseCacheTtlSeconds;
+  }
+  return parseNonNegativeInteger(
+    process.env.LLM_RESPONSE_CACHE_TTL_SECONDS,
+    DEFAULT_RESPONSE_CACHE_TTL_SECONDS,
+    "LLM_RESPONSE_CACHE_TTL_SECONDS",
+  );
+}
+
+function responseCacheMaxEntries(options: ChatOptions): number {
+  if (options.responseCacheMaxEntries !== undefined) {
+    if (!Number.isInteger(options.responseCacheMaxEntries) || options.responseCacheMaxEntries < 0) {
+      throw new Error("responseCacheMaxEntries must be a non-negative integer");
+    }
+    return options.responseCacheMaxEntries;
+  }
+  return parseNonNegativeInteger(
+    process.env.LLM_RESPONSE_CACHE_MAX_ENTRIES,
+    DEFAULT_RESPONSE_CACHE_MAX_ENTRIES,
+    "LLM_RESPONSE_CACHE_MAX_ENTRIES",
+  );
+}
+
+function responseCacheDbPath(): string {
+  const explicit = process.env.LLM_RESPONSE_CACHE_DB_PATH?.trim();
+  if (explicit) return explicit;
+  const agentStateDir = process.env.AGENT_STATE_DIR?.trim();
+  if (agentStateDir) return path.join(agentStateDir, "llm-response-cache.sqlite");
+  const contentDbPath = process.env.CONTENT_DB_PATH?.trim();
+  if (contentDbPath) return path.join(path.dirname(contentDbPath), "llm-response-cache.sqlite");
+  return path.join(process.cwd(), ".data", "llm-response-cache.sqlite");
+}
+
+function getResponseCacheDb(): Database.Database {
+  const dbPath = responseCacheDbPath();
+  if (responseCacheDb && responseCacheDbPathValue === dbPath) return responseCacheDb;
+  if (responseCacheDb) responseCacheDb.close();
+
+  if (dbPath !== ":memory:") {
+    mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+  const db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
+  db.pragma("busy_timeout = 5000");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_response_cache (
+      cache_key TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      total_tokens INTEGER,
+      created_at_ms INTEGER NOT NULL,
+      accessed_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_response_cache_accessed_at
+      ON llm_response_cache(accessed_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_llm_response_cache_created_at
+      ON llm_response_cache(created_at_ms);
+  `);
+  responseCacheDb = db;
+  responseCacheDbPathValue = dbPath;
+  return db;
+}
+
+function isCacheExpired(createdAtMs: number, now: number, ttlSeconds: number): boolean {
+  return ttlSeconds > 0 && now - createdAtMs >= ttlSeconds * 1000;
+}
+
+function getCachedResponse(key: string, ttlSeconds: number): ChatResult | undefined {
+  const db = getResponseCacheDb();
+  const now = Date.now();
+  const row = db
+    .prepare(
+      `SELECT
+         content,
+         prompt_tokens AS promptTokens,
+         completion_tokens AS completionTokens,
+         total_tokens AS totalTokens,
+         created_at_ms AS createdAtMs
+       FROM llm_response_cache
+       WHERE cache_key = ?`,
+    )
+    .get(key) as ResponseCacheRow | undefined;
+  if (!row) return undefined;
+  if (isCacheExpired(row.createdAtMs, now, ttlSeconds)) {
+    db.prepare("DELETE FROM llm_response_cache WHERE cache_key = ?").run(key);
+    return undefined;
+  }
+  db.prepare("UPDATE llm_response_cache SET accessed_at_ms = ? WHERE cache_key = ?").run(now, key);
+  return {
+    content: row.content,
+    promptTokens: row.promptTokens ?? undefined,
+    completionTokens: row.completionTokens ?? undefined,
+    totalTokens: row.totalTokens ?? undefined,
+    cached: true,
+  };
+}
+
+function pruneResponseCache(maxEntries: number, ttlSeconds: number): void {
+  const db = getResponseCacheDb();
+  if (maxEntries <= 0) {
+    db.prepare("DELETE FROM llm_response_cache").run();
+    return;
+  }
+
+  const now = Date.now();
+  if (ttlSeconds > 0) {
+    db.prepare("DELETE FROM llm_response_cache WHERE created_at_ms <= ?").run(now - ttlSeconds * 1000);
+  }
+
+  const countRow = db.prepare("SELECT COUNT(*) AS count FROM llm_response_cache").get() as { count: number };
+  const excess = countRow.count - maxEntries;
+  if (excess <= 0) return;
+  db.prepare(
+    `DELETE FROM llm_response_cache
+     WHERE cache_key IN (
+       SELECT cache_key
+       FROM llm_response_cache
+       ORDER BY accessed_at_ms ASC
+       LIMIT ?
+     )`,
+  ).run(excess);
+}
+
+function setCachedResponse(key: string, result: Omit<ChatResult, "cached">, maxEntries: number, ttlSeconds: number): void {
+  if (maxEntries <= 0) return;
+  const db = getResponseCacheDb();
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO llm_response_cache (
+       cache_key,
+       content,
+       prompt_tokens,
+       completion_tokens,
+       total_tokens,
+       created_at_ms,
+       accessed_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(cache_key) DO UPDATE SET
+       content = excluded.content,
+       prompt_tokens = excluded.prompt_tokens,
+       completion_tokens = excluded.completion_tokens,
+       total_tokens = excluded.total_tokens,
+       created_at_ms = excluded.created_at_ms,
+       accessed_at_ms = excluded.accessed_at_ms`,
+  ).run(
+    key,
+    result.content,
+    result.promptTokens ?? null,
+    result.completionTokens ?? null,
+    result.totalTokens ?? null,
+    now,
+    now,
+  );
+  pruneResponseCache(maxEntries, ttlSeconds);
+}
+
+function responseCacheKey(input: {
+  baseUrl: string;
+  body: Record<string, unknown>;
+}): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ schema: "daio.llm.response-cache.v1", baseUrl: input.baseUrl, body: input.body }))
+    .digest("hex");
 }
 
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
   const baseUrl = options.baseUrl ?? process.env.LLM_BASE_URL;
   const model = options.model ?? process.env.LLM_MODEL ?? "gpt-oss-120b";
   if (!baseUrl) throw new Error("LLM_BASE_URL not configured");
+  const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
+  const promptCacheMessages = assertPromptCacheMessages(messages);
   const timeoutMs = options.timeoutMs ?? Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
   const maxTokens = options.maxTokens ?? Number(process.env.LLM_MAX_TOKENS ?? 2_048);
   const envTemperature =
@@ -34,7 +254,7 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
 
   const body: Record<string, unknown> = {
     model,
-    messages,
+    messages: promptCacheMessages,
     max_tokens: maxTokens,
     temperature,
   };
@@ -46,11 +266,20 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   const reasoningEffort = process.env.LLM_REASONING_EFFORT ?? "low";
   if (reasoningEffort) body.reasoning_effort = reasoningEffort;
 
+  const cacheEnabled = options.responseCache !== false;
+  const cacheTtlSeconds = responseCacheTtlSeconds(options);
+  const cacheMaxEntries = responseCacheMaxEntries(options);
+  const cacheKey = responseCacheKey({ baseUrl: normalizedBaseUrl, body });
+  if (cacheEnabled && cacheMaxEntries > 0) {
+    const cached = getCachedResponse(cacheKey, cacheTtlSeconds);
+    if (cached) return cached;
+  }
+
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   let res: Response;
   try {
-    res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    res = await fetch(`${normalizedBaseUrl}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -71,12 +300,14 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   if (typeof content !== "string" || content.length === 0) {
     throw new Error(`llm chat returned empty content: ${JSON.stringify(json).slice(0, 500)}`);
   }
-  return {
+  const result = {
     content,
     promptTokens: json.usage?.prompt_tokens,
     completionTokens: json.usage?.completion_tokens,
     totalTokens: json.usage?.total_tokens,
   };
+  if (cacheEnabled) setCachedResponse(cacheKey, result, cacheMaxEntries, cacheTtlSeconds);
+  return result;
 }
 
 export function extractJson(raw: string): unknown {

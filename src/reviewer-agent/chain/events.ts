@@ -1,7 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { Contract, EventLog, Provider } from "ethers";
 import { RequestStatus } from "../../shared/types.js";
-import { rpcFailoverOptionsFromEnv, withRpcReadRetries, type RpcFailoverOptions } from "../../shared/rpc.js";
+import {
+  rpcFailoverOptionsFromEnv,
+  txFinalityConfirmationsFromEnv,
+  withRpcReadRetries,
+  type RpcFailoverOptions,
+} from "../../shared/rpc.js";
 
 export interface PhaseChange {
   requestId: bigint;
@@ -37,6 +42,7 @@ export interface CoreEventStreamOptions {
   cursorStore?: EventCursorStore;
   lookbackBlocks?: number;
   reorgDepthBlocks?: number;
+  finalityConfirmations?: number;
   maxSeenLogs?: number;
   retryOptions?: RpcFailoverOptions;
 }
@@ -100,9 +106,15 @@ export class CoreEventStream extends EventEmitter {
 
   private async poll(): Promise<void> {
     const head = await this.rpcRead(() => this.provider.getBlockNumber());
-    if (head <= this.lastBlock) return;
+    const confirmations = positiveInteger(
+      this.options.finalityConfirmations,
+      txFinalityConfirmationsFromEnv(),
+      0,
+    );
+    const finalizedHead = confirmations <= 1 ? head : Math.max(0, head - confirmations + 1);
+    if (finalizedHead <= this.lastBlock) return;
     const from = this.lastBlock + 1;
-    const to = head;
+    const to = finalizedHead;
     // ethers v6 filters are dynamic ABI accessors; cast through unknown for typing.
     const f = (this.core as unknown as { filters: Record<string, () => unknown> }).filters;
     const [statusLogs, revealLogs, finalLogs] = await this.rpcRead(() =>

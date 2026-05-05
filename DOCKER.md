@@ -346,7 +346,9 @@ Content API fields:
 | `CONTENT_SERVICE_PORT` | yes | host port, default `18002` |
 | `CONTENT_DB_PATH` | informational | compose stores DB at `/app/data/content.sqlite` mapped from `.data` |
 | `CONTENT_RELAYER_PRIVATE_KEY` | optional | enables relayed request creation |
-| `CONTENT_RELAYER_CONFIRMATIONS` | optional | confirmation wait count after relayer tx |
+| `CONTENT_RELAYER_CONFIRMATIONS` | optional | confirmation wait count after relayer tx, default `1` |
+| `DAIO_TX_FINALITY_CONFIRMATIONS` | optional | tx/event finality confirmations before dependent reads/actions, default `1` |
+| `DAIO_TX_FINALITY_WAIT_TIMEOUT_MS` | optional | max wait for externally supplied tx hashes to reach finality, default `300000` |
 | `CONTENT_REQUIRE_AGENT_SIGNATURES` | yes | keep `true`; requires reviewer wallet signatures on agent-written artifacts/status |
 
 MarkItDown fields:
@@ -391,6 +393,10 @@ Per-agent chain/LLM fields:
 | `LLM_MAX_TOKENS` | yes | response token budget |
 | `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
 | `LLM_REASONING_EFFORT` | optional | forwarded when the endpoint supports it |
+| `LLM_RESPONSE_CACHE_TTL_SECONDS` | optional | response cache TTL in seconds; default `0` means no TTL expiry |
+| `LLM_RESPONSE_CACHE_MAX_ENTRIES` | optional | response cache size cap; default `4096`, evicts least-recently accessed entries |
+| `LLM_RESPONSE_CACHE_DB_PATH` | optional | SQLite response cache path; agents default under `AGENT_STATE_DIR`, content-service defaults under `/app/data` |
+| `DAIO_TX_FINALITY_CONFIRMATIONS` | optional | tx/event finality confirmations before LLM/cache-dependent work, default `1` |
 
 Per-agent secret and identity fields:
 
@@ -592,7 +598,10 @@ docker compose run --rm --entrypoint node agent-1 -e '
 const base = process.env.LLM_BASE_URL.replace(/\/$/, "");
 const body = {
   model: process.env.LLM_MODEL,
-  messages: [{ role: "user", content: "Return JSON: {\"ok\":true}" }],
+  messages: [
+    { role: "system", content: "Return only JSON." },
+    { role: "user", content: "Return JSON: {\"ok\":true}" }
+  ],
   max_tokens: 64,
   temperature: 0,
   response_format: { type: "json_object" }

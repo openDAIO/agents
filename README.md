@@ -332,7 +332,7 @@ DAIO_TX_FINALITY_WAIT_TIMEOUT_MS=300000
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5.4-mini-2026-03-17
+OPENAI_MODEL=gpt-5.5-2026-04-23
 # Optional proxy/gateway override. Defaults to https://api.openai.com/v1 when OPENAI_API_KEY is set.
 # OPENAI_BASE_URL=https://api.openai.com/v1
 # Optional override. By default the runtime derives a stable key from the shared prompt prefix.
@@ -342,7 +342,8 @@ LLM_BASE_URL=
 LLM_MODEL=
 LLM_TIMEOUT_MS=120000
 LLM_MAX_TOKENS=8192
-LLM_REASONING_EFFORT=low
+# Leave blank with OpenAI GPT API to use the model default reasoning level.
+LLM_REASONING_EFFORT=
 LLM_PROPOSAL_CHAR_BUDGET=350000
 LLM_RESPONSE_CACHE_TTL_SECONDS=0
 LLM_RESPONSE_CACHE_MAX_ENTRIES=4096
@@ -578,8 +579,9 @@ When `OPENAI_API_KEY` is set, the agent client uses the OpenAI API at
 prefers `OPENAI_MODEL`. If no OpenAI key is configured, it falls back to
 `LLM_BASE_URL` and `LLM_MODEL` for local or compatible endpoints. The client
 requests JSON mode, uses `max_completion_tokens` for OpenAI and `max_tokens` for
-compatible endpoints, and keeps `reasoning_effort=low` by default so final JSON
-has room in the completion budget. For OpenAI calls, the client also sends a
+compatible endpoints, and omits `reasoning_effort` on OpenAI unless explicitly
+configured so the model default reasoning level applies. Compatible local
+endpoints keep the historical `low` fallback when unset. For OpenAI calls, the client also sends a
 stable `prompt_cache_key` derived from the shared system prompt prefix and uses
 `OPENAI_PROMPT_CACHE_RETENTION` when set; the bundled env examples set it to
 `24h`. OpenAI cache hits are surfaced as `promptCachedTokens` in immediate usage

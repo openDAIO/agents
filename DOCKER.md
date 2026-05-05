@@ -394,7 +394,7 @@ Per-agent chain/LLM fields:
 | `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
 | `LLM_MAX_TOKENS` | yes | response token budget |
 | `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
-| `LLM_REASONING_EFFORT` | optional | forwarded when the endpoint supports it |
+| `LLM_REASONING_EFFORT` | optional | forwarded when set; leave blank with OpenAI GPT API to use the model default |
 | `LLM_RESPONSE_CACHE_TTL_SECONDS` | optional | response cache TTL in seconds; default `0` means no TTL expiry |
 | `LLM_RESPONSE_CACHE_MAX_ENTRIES` | optional | response cache size cap; default `4096`, evicts least-recently accessed entries |
 | `LLM_RESPONSE_CACHE_DB_PATH` | optional | SQLite response cache path; agents default under `AGENT_STATE_DIR`, content-service defaults under `/app/data` |

@@ -381,6 +381,13 @@ function configuredPromptCacheRetention(options: ChatOptions): string | undefine
   return value;
 }
 
+function configuredReasoningEffort(options: ChatOptions, useOpenAiChatCompletions: boolean): string | null | undefined {
+  if (options.reasoningEffort !== undefined) return options.reasoningEffort;
+  const envReasoningEffort = firstConfiguredEnv("LLM_REASONING_EFFORT", "OPENAI_REASONING_EFFORT");
+  if (envReasoningEffort !== undefined) return envReasoningEffort;
+  return useOpenAiChatCompletions ? undefined : "low";
+}
+
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
   const baseUrl = configuredBaseUrl(options);
   const model = configuredModelName(options);
@@ -409,10 +416,9 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   if (options.responseFormatJson !== false) {
     body.response_format = { type: "json_object" };
   }
-  // Keep reasoning output compact so final JSON has room in the completion budget.
-  // Retry callers may set an empty override to omit this field for incompatible servers.
-  const reasoningEffort =
-    options.reasoningEffort !== undefined ? options.reasoningEffort : process.env.LLM_REASONING_EFFORT ?? "low";
+  // OpenAI GPT/reasoning models use their default reasoning level when this is
+  // omitted; compatible local endpoints keep the historical low-effort default.
+  const reasoningEffort = configuredReasoningEffort(options, useOpenAiChatCompletions);
   if (typeof reasoningEffort === "string" && reasoningEffort.trim() !== "") {
     body.reasoning_effort = reasoningEffort;
   }

@@ -118,6 +118,7 @@ export interface AgentQaRecord {
   model: string;
   usage: {
     promptTokens: number | null;
+    promptCachedTokens?: number | null;
     completionTokens: number | null;
     totalTokens: number | null;
   };
@@ -178,6 +179,7 @@ export interface AgentScoreReportRecord {
   model: string;
   usage: {
     promptTokens: number;
+    promptCachedTokens?: number;
     completionTokens: number;
     totalTokens: number;
   };
@@ -225,6 +227,7 @@ export interface RequestFinalReportRecord {
   model: string;
   usage: {
     promptTokens: number;
+    promptCachedTokens?: number;
     completionTokens: number;
     totalTokens: number;
   };

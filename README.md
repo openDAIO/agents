@@ -331,11 +331,19 @@ DAIO_TX_FINALITY_CONFIRMATIONS=1
 DAIO_TX_FINALITY_WAIT_TIMEOUT_MS=300000
 DAIO_DEPLOYMENT_FILE=sepolia.json
 
-LLM_BASE_URL=http://100.94.8.47:8000/v1
-LLM_MODEL=gpt-oss-120b
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.5-2026-04-23
+# Optional proxy/gateway override. Defaults to https://api.openai.com/v1 when OPENAI_API_KEY is set.
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# Optional override. By default the runtime derives a stable key from the shared prompt prefix.
+# OPENAI_PROMPT_CACHE_KEY=
+OPENAI_PROMPT_CACHE_RETENTION=24h
+LLM_BASE_URL=
+LLM_MODEL=
 LLM_TIMEOUT_MS=120000
 LLM_MAX_TOKENS=8192
-LLM_REASONING_EFFORT=low
+# Leave blank with OpenAI GPT API to use the model default reasoning level.
+LLM_REASONING_EFFORT=
 LLM_PROPOSAL_CHAR_BUDGET=350000
 LLM_RESPONSE_CACHE_TTL_SECONDS=0
 LLM_RESPONSE_CACHE_MAX_ENTRIES=4096
@@ -564,9 +572,20 @@ curl -X POST http://127.0.0.1:18002/requests/18/final-report
 
 ## Implementation Notes
 
-### LLM (`gpt-oss-120b`, vLLM, OpenAI-compatible)
+### LLM (OpenAI GPT API, OpenAI-compatible fallback)
 
-`gpt-oss` models emit `reasoning_content` (chain of thought) before `content` in the same response. With `reasoning_effort=medium` (the model default) and a tight `max_tokens`, the budget is exhausted by the CoT and `content` comes back `null` with `finish_reason=length`. The agent client therefore sets `reasoning_effort=low` and `max_tokens=8192` by default. With these two, a 50K-token review prompt completes in ≈ 30 s and an audit prompt in ≈ 85 s on the configured endpoint.
+When `OPENAI_API_KEY` is set, the agent client uses the OpenAI API at
+`https://api.openai.com/v1/chat/completions`, sends Bearer authentication, and
+prefers `OPENAI_MODEL`. If no OpenAI key is configured, it falls back to
+`LLM_BASE_URL` and `LLM_MODEL` for local or compatible endpoints. The client
+requests JSON mode, uses `max_completion_tokens` for OpenAI and `max_tokens` for
+compatible endpoints, and omits `reasoning_effort` on OpenAI unless explicitly
+configured so the model default reasoning level applies. Compatible local
+endpoints keep the historical `low` fallback when unset. For OpenAI calls, the client also sends a
+stable `prompt_cache_key` derived from the shared system prompt prefix and uses
+`OPENAI_PROMPT_CACHE_RETENTION` when set; the bundled env examples set it to
+`24h`. OpenAI cache hits are surfaced as `promptCachedTokens` in immediate usage
+objects and in agent LLM completion status payloads.
 
 ### VRF and sortition
 
@@ -628,7 +647,9 @@ State (`src/reviewer-agent/runtime/state.ts`) writes per-request JSON files to a
 - The Sepolia fork E2E mutates fork-local state to register local test reviewers and set a deterministic Fast-tier E2E config. It does not send transactions to Sepolia and does not replace deployed contract code.
 - `phaseStartBlock` prediction in the prescreen is best-effort; if the actual block diverges, agents fall back to runtime review sortition checks. The E2E prescreen chooses five agents for quorum 3 under the current full-audit profile; audit target sortition is disabled.
 - The `markitdown` PDF → markdown conversion can drop spaces between words in dense academic PDFs (BRAIN paper exhibits this). The LLM tolerates it but a higher-fidelity converter would improve report quality.
-- `gpt-oss-120b` JSON output occasionally produces extra whitespace; the client trims and accepts ```json fences as a safety net even though `response_format=json_object` is requested. In rare low-token responses the model can emit `reasoning_content` without final JSON `content`; use the documented token budget and `reasoning_effort=low`.
+- Some compatible JSON-mode models occasionally produce extra whitespace or
+  markdown fences; the client trims and accepts ```json fences as a safety net
+  even though `response_format=json_object` is requested.
 
 ## References
 

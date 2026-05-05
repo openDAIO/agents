@@ -274,7 +274,9 @@ export async function runAudit(
     log: (msg) => log(`audit: ${msg}`),
   });
   const llmLatencyMs = Date.now() - t0;
-  log(`audit: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, attempts=${llmAttempts})`);
+  log(
+    `audit: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, cachedPrompt=${llm.promptCachedTokens ?? 0}, attempts=${llmAttempts})`,
+  );
   const afterLlmSkipReason = await auditCommitSkipReason(
     deps,
     requestId,
@@ -315,6 +317,7 @@ export async function runAudit(
     scores: scoresArr,
     rationales: rationalesArr,
     promptTokens: llm.promptTokens,
+    promptCachedTokens: llm.promptCachedTokens,
     completionTokens: llm.completionTokens,
     totalTokens: llm.totalTokens,
     llmLatencyMs,

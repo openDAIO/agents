@@ -23,6 +23,7 @@ import {
   buildPromptCacheMessages,
   chat,
   chatJsonWithRetry,
+  configuredModelName,
   type ChatMessage,
 } from "../reviewer-agent/llm/client.js";
 import { budgetProposal } from "../reviewer-agent/llm/prepareInput.js";
@@ -1368,7 +1369,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       AgentScoreReportModelResponse,
     );
     const report = normalizeAgentScoreReport(generated.data, facts);
-    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const model = configuredModelName();
     const createdAt = Math.floor(Date.now() / 1000);
     const row = db.upsertAgentScoreReport({
       requestId: input.requestId,
@@ -1464,7 +1465,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       request: requestFacts,
       agentReports: agentReportFactsList,
     });
-    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const model = configuredModelName();
     const createdAt = Math.floor(Date.now() / 1000);
     const row = db.upsertRequestFinalReport({
       requestId: input.requestId,
@@ -2182,7 +2183,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       return { error: "agent_qa_unavailable", detail: formatError(err) };
     }
 
-    const model = process.env.LLM_MODEL ?? "gpt-oss-120b";
+    const model = configuredModelName();
     const createdAt = Math.floor(Date.now() / 1000);
     const stored = db.insertAgentQaHistory({
       requestId: req.params.requestId,

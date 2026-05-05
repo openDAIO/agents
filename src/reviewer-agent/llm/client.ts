@@ -58,6 +58,8 @@ const DEFAULT_RESPONSE_CACHE_MAX_ENTRIES = 4096;
 const DEFAULT_LLM_RETRY_ATTEMPTS = 3;
 const DEFAULT_LLM_RETRY_BASE_MS = 1_000;
 const DEFAULT_LLM_RETRY_MAX_MS = 8_000;
+const DEFAULT_LOCAL_LLM_MODEL = "gpt-oss-120b";
+const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 let responseCacheDb: Database.Database | undefined;
 let responseCacheDbPathValue: string | undefined;
 
@@ -269,7 +271,7 @@ function formatError(err: unknown): string {
 function retryableChatError(err: unknown): boolean {
   const message = formatError(err);
   return (
-    !message.includes("LLM_BASE_URL not configured") &&
+    !message.includes("LLM_BASE_URL or OPENAI_API_KEY not configured") &&
     !message.includes("prompt-cache format requires exactly two messages")
   );
 }
@@ -297,11 +299,53 @@ function retryMessages(messages: ChatMessage[], reason: string): ChatMessage[] {
   );
 }
 
+function firstConfiguredEnv(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function isOpenAiApiBaseUrl(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname === "api.openai.com";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function configuredBaseUrl(options: ChatOptions): string {
+  if (options.baseUrl?.trim()) return options.baseUrl.trim();
+  const openAiBaseUrl = firstConfiguredEnv("OPENAI_BASE_URL");
+  if (openAiBaseUrl) return openAiBaseUrl;
+  if (firstConfiguredEnv("OPENAI_API_KEY")) return OPENAI_API_BASE_URL;
+  const llmBaseUrl = firstConfiguredEnv("LLM_BASE_URL");
+  if (llmBaseUrl) return llmBaseUrl;
+  throw new Error("LLM_BASE_URL or OPENAI_API_KEY not configured");
+}
+
+export function configuredModelName(options: Pick<ChatOptions, "model"> = {}): string {
+  if (options.model?.trim()) return options.model.trim();
+  return firstConfiguredEnv("OPENAI_MODEL", "LLM_MODEL") ?? DEFAULT_LOCAL_LLM_MODEL;
+}
+
+function chatHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const apiKey = firstConfiguredEnv("OPENAI_API_KEY", "LLM_API_KEY");
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  const organization = firstConfiguredEnv("OPENAI_ORG_ID");
+  if (organization) headers["OpenAI-Organization"] = organization;
+  const project = firstConfiguredEnv("OPENAI_PROJECT_ID");
+  if (project) headers["OpenAI-Project"] = project;
+  return headers;
+}
+
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
-  const baseUrl = options.baseUrl ?? process.env.LLM_BASE_URL;
-  const model = options.model ?? process.env.LLM_MODEL ?? "gpt-oss-120b";
-  if (!baseUrl) throw new Error("LLM_BASE_URL not configured");
+  const baseUrl = configuredBaseUrl(options);
+  const model = configuredModelName(options);
   const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
+  const useOpenAiChatCompletions = isOpenAiApiBaseUrl(normalizedBaseUrl);
   const promptCacheMessages = assertPromptCacheMessages(messages);
   const timeoutMs = options.timeoutMs ?? Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
   const maxTokens = options.maxTokens ?? Number(process.env.LLM_MAX_TOKENS ?? 2_048);
@@ -315,15 +359,18 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   const body: Record<string, unknown> = {
     model,
     messages: promptCacheMessages,
-    max_tokens: maxTokens,
-    temperature,
   };
+  body[useOpenAiChatCompletions ? "max_completion_tokens" : "max_tokens"] = maxTokens;
+  // Newer OpenAI GPT/reasoning snapshots reject non-default temperature values;
+  // keep temperature for compatible local endpoints where agents use it for variance.
+  if (!useOpenAiChatCompletions) {
+    body.temperature = temperature;
+  }
   if (options.responseFormatJson !== false) {
     body.response_format = { type: "json_object" };
   }
-  // gpt-oss models emit reasoning_content before content; "low" effort keeps the
-  // CoT short so the JSON output fits within max_tokens. Retry callers may set an
-  // empty override to omit the field when a server returns reasoning_content only.
+  // Keep reasoning output compact so final JSON has room in the completion budget.
+  // Retry callers may set an empty override to omit this field for incompatible servers.
   const reasoningEffort =
     options.reasoningEffort !== undefined ? options.reasoningEffort : process.env.LLM_REASONING_EFFORT ?? "low";
   if (typeof reasoningEffort === "string" && reasoningEffort.trim() !== "") {
@@ -352,7 +399,7 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   try {
     res = await fetch(`${normalizedBaseUrl}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: chatHeaders(),
       body: JSON.stringify(body),
       signal: ac.signal,
     });

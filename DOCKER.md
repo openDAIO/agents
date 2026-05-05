@@ -80,9 +80,9 @@ Sepolia RPC:
 
 LLM endpoint:
 
-- An OpenAI-compatible endpoint reachable from the EC2 instance.
-- Allow the EC2 Elastic IP on the LLM firewall.
-- Confirm the endpoint supports the configured model and token budget.
+- An OpenAI API key, or an OpenAI-compatible endpoint reachable from the EC2 instance.
+- For compatible endpoints, allow the EC2 Elastic IP on the LLM firewall.
+- Confirm the configured model supports JSON mode and the requested token budget.
 
 Wallets:
 
@@ -387,8 +387,8 @@ Per-agent chain/LLM fields:
 | `RPC_FAILOVER_EVENT_QUORUM` | optional | event polling quorum, default `1` |
 | `DAIO_DEPLOYMENT_FILE` | yes | normally `sepolia.json` |
 | `CONTENT_SERVICE_URL` | yes | overridden to `http://content-service:18002` by bundled compose |
-| `LLM_BASE_URL` | yes | OpenAI-compatible base URL chosen by this operator |
-| `LLM_MODEL` | yes | model served by the LLM endpoint |
+| `OPENAI_API_KEY` or `LLM_BASE_URL` | yes | OpenAI API key, or an OpenAI-compatible base URL chosen by this operator |
+| `OPENAI_MODEL` or `LLM_MODEL` | yes | GPT/OpenAI-compatible model name |
 | `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
 | `LLM_MAX_TOKENS` | yes | response token budget |
 | `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |
@@ -524,8 +524,8 @@ is not a trust boundary between mutually distrustful operators: a host or Docker
 administrator can read every container environment and mounted state directory.
 For real independent operators, run one agent per operator-controlled host or
 account, each with its own `.env`, `.state`, tx key, VRF key, and state key. They
-should also choose their own LLM endpoint policy instead of assuming the shared
-`LLM_BASE_URL` in this convenience compose file is neutral. They may share a
+should also choose their own LLM provider policy instead of assuming the shared
+OpenAI key or `LLM_BASE_URL` in this convenience compose file is neutral. They may share a
 public content API, or each operator may use its own content service as long as
 the published `content://...` artifacts are reachable by auditors.
 The current `content://` resolver is bound to the agent's configured
@@ -595,20 +595,24 @@ LLM smoke test through an agent image:
 
 ```sh
 docker compose run --rm --entrypoint node agent-1 -e '
-const base = process.env.LLM_BASE_URL.replace(/\/$/, "");
+const base = (process.env.OPENAI_BASE_URL || (process.env.OPENAI_API_KEY ? "https://api.openai.com/v1" : process.env.LLM_BASE_URL)).replace(/\/$/, "");
+const openai = new URL(base).hostname === "api.openai.com";
 const body = {
-  model: process.env.LLM_MODEL,
+  model: process.env.OPENAI_MODEL || process.env.LLM_MODEL,
   messages: [
     { role: "system", content: "Return only JSON." },
     { role: "user", content: "Return JSON: {\"ok\":true}" }
   ],
-  max_tokens: 64,
-  temperature: 0,
   response_format: { type: "json_object" }
 };
+body[openai ? "max_completion_tokens" : "max_tokens"] = 64;
+if (!openai) body.temperature = 0;
 fetch(`${base}/chat/completions`, {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: {
+    "Content-Type": "application/json",
+    ...(process.env.OPENAI_API_KEY ? { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } : {})
+  },
   body: JSON.stringify(body)
 })
   .then(async (res) => {
@@ -950,8 +954,8 @@ External services:
 
 - Sepolia RPC reachable from EC2.
 - RPC provider API key and IP allowlist configured.
-- LLM endpoint reachable from EC2.
-- EC2 Elastic IP allowed by the LLM endpoint firewall.
+- OpenAI API reachable from EC2, or compatible LLM endpoint reachable from EC2.
+- EC2 Elastic IP allowed by the compatible LLM endpoint firewall when applicable.
 - Outbound access to GitHub, npm, Docker registries, and package indexes works.
 
 Repository:
@@ -976,7 +980,7 @@ Environment:
 - `DAIO_DEPLOYMENT_FILE=sepolia.json` set, or `DAIO_DEPLOYMENT_JSON_B64` set.
 - `CONTENT_RELAYER_PRIVATE_KEY` set if relayed request creation is enabled.
 - `CONTENT_REQUIRE_AGENT_SIGNATURES=true`.
-- Each `.env.agent_N` has `RPC_URL`, `LLM_BASE_URL`, `LLM_MODEL`, timeout, max tokens, and char budget set.
+- Each `.env.agent_N` has `RPC_URL`, `OPENAI_API_KEY` or `LLM_BASE_URL`, `OPENAI_MODEL` or `LLM_MODEL`, timeout, max tokens, and char budget set.
 - Each `.env.agent_N` has `RPC_URLS` set to that agent operator's allowed RPC fallback list.
 - Each `.env.agent_N` has a distinct `AGENT_STATE_KEY`.
 - Each `.env.agent_N` has its own `AGENT_PRIVATE_KEY`.

@@ -82,6 +82,25 @@ require_http_url() {
   [[ "$value" =~ ^https?:// ]] || die "$file $key must start with http:// or https://"
 }
 
+require_llm_config() {
+  local file="$1"
+  local llm_base_url openai_key llm_model openai_model
+  llm_base_url="$(optional_env "$file" "LLM_BASE_URL")"
+  openai_key="$(optional_env "$file" "OPENAI_API_KEY")"
+  llm_model="$(optional_env "$file" "LLM_MODEL")"
+  openai_model="$(optional_env "$file" "OPENAI_MODEL")"
+
+  if [ -n "$llm_base_url" ]; then
+    require_http_url "$file" "LLM_BASE_URL"
+  elif [ -z "$openai_key" ]; then
+    die "$file must set LLM_BASE_URL or OPENAI_API_KEY"
+  fi
+
+  if [ -z "$llm_model" ] && [ -z "$openai_model" ]; then
+    die "$file must set LLM_MODEL or OPENAI_MODEL"
+  fi
+}
+
 require_bool_env() {
   local file="$1"
   local key="$2"
@@ -142,8 +161,7 @@ for i in 1 2 3 4 5; do
   file="${AGENT_ENV_PREFIX}${i}"
   require_file "$file"
   require_http_url "$file" "RPC_URL"
-  require_http_url "$file" "LLM_BASE_URL"
-  require_env "$file" "LLM_MODEL"
+  require_llm_config "$file"
   require_hex32 "$file" "AGENT_PRIVATE_KEY"
   require_hex32 "$file" "AGENT_VRF_PRIVATE_KEY"
   require_hex32 "$file" "AGENT_STATE_KEY"

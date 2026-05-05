@@ -52,7 +52,9 @@ export interface AuditEnvelope {
 
 const SYSTEM_BASE = `You are a DAIO AI reviewer. You evaluate scholarly papers, DAO proposals, legal drafts, and policy documents. Output ONLY valid JSON matching the requested schema. Do not include any prose outside the JSON object. Score scale is 0..10000 (uint16, 10000 = best). Be terse, neutral, and grounded in the artifact text.`;
 
-const PERSONA_GUARD = `Your persona shapes WHICH dimensions you weight and HOW strict you are, not the output format. The schema, field names, address echoes, score scale (0..10000), and target ordering are absolute and must not change. Do not mention your persona in the output.`;
+const PROMPT_CACHE_LAYOUT = `Prompt-cache layout: this system message intentionally carries the long shared artifact context before per-agent variables. Treat the JSON block below as "shared". The user message supplies "input". Both are authoritative.`;
+
+const PERSONA_GUARD = `If input.persona is present, it shapes WHICH dimensions you weight and HOW strict you are, not the output format. The schema, field names, address echoes, score scale (0..10000), and target ordering are absolute and must not change. Do not mention the persona in the output.`;
 
 function readEnvPersona(taskKey: "review" | "audit"): string | undefined {
   const taskSpecificKey = taskKey === "review" ? "AGENT_REVIEW_STYLE" : "AGENT_AUDIT_STYLE";
@@ -62,17 +64,48 @@ function readEnvPersona(taskKey: "review" | "audit"): string | undefined {
   return parts.length ? parts.join("\n") : undefined;
 }
 
-function buildSystemPrompt(taskInstruction: string, taskKey: "review" | "audit"): string {
-  const persona = readEnvPersona(taskKey);
-  const sections = [SYSTEM_BASE];
-  if (persona) sections.push(`Persona (independent reviewer character):\n${persona}\n\n${PERSONA_GUARD}`);
+function buildSharedContext(envelope: ReviewEnvelope | AuditEnvelope): Record<string, unknown> {
+  return {
+    schema: "daio.llm.shared_context.v1",
+    content: {
+      proposal: {
+        // Put the long common text before request-specific ids so provider-side
+        // prefix caches can reuse the expensive artifact tokens across agents.
+        text: budgetProposal(envelope.content.proposal.text),
+        mimeType: envelope.content.proposal.mimeType,
+      },
+      rubric: {
+        text: envelope.content.rubric.text,
+        hash: envelope.content.rubric.hash,
+      },
+    },
+    request: {
+      requestId: envelope.request.requestId,
+      proposalURI: envelope.request.proposalURI,
+      proposalHash: envelope.request.proposalHash,
+      rubricHash: envelope.request.rubricHash,
+      domainMask: envelope.request.domainMask,
+      tier: envelope.request.tier,
+    },
+    chain: envelope.chain,
+    constraints: envelope.constraints,
+  };
+}
+
+function buildSystemPrompt(taskInstruction: string, sharedContext: Record<string, unknown>): string {
+  const sections = [
+    SYSTEM_BASE,
+    PROMPT_CACHE_LAYOUT,
+    JSON.stringify(sharedContext),
+    PERSONA_GUARD,
+  ];
   sections.push(taskInstruction);
   return sections.join("\n\n");
 }
 
 const REVIEW_INSTRUCTION = `For task=review, you must output an object that conforms to schema "daio.review.output.v1". Fields:
 - schema: "daio.review.output.v1"
-- requestId: string of digits, must equal input.request.requestId
+- requestId: string of digits, must equal shared.request.requestId
 - reviewer: 0x-prefixed address, must equal input.reviewer.wallet
 - proposalScore: integer 0..10000 reflecting your overall judgement of the artifact
 - report.summary: 1–4 sentence neutral summary
@@ -86,9 +119,9 @@ Return ONLY the JSON object. Do not include markdown fences.`;
 
 const AUDIT_INSTRUCTION = `For task=audit, you must output an object that conforms to schema "daio.audit.output.v1". Fields:
 - schema: "daio.audit.output.v1"
-- requestId: string of digits, must equal input.request.requestId
+- requestId: string of digits, must equal shared.request.requestId
 - auditor: 0x-prefixed address, must equal input.auditor.wallet
-- targetEvaluations: array of objects, ONE PER TARGET in input.content.targets, IN THE EXACT ORDER GIVEN. Each entry:
+- targetEvaluations: array of objects, ONE PER TARGET in input.targets, IN THE EXACT ORDER GIVEN. Each entry:
   - targetReviewer: 0x-prefixed address, copy from input
   - score: integer 0..10000, your evaluation of how well that reviewer's report covers the artifact (NOT agreement with their proposalScore)
   - rationale: 1–2 sentences
@@ -96,33 +129,31 @@ const AUDIT_INSTRUCTION = `For task=audit, you must output an object that confor
 Return ONLY the JSON object. Do not include markdown fences.`;
 
 export function buildReviewMessages(envelope: ReviewEnvelope): ChatMessage[] {
-  const safe = {
-    ...envelope,
-    content: {
-      ...envelope.content,
-      proposal: {
-        ...envelope.content.proposal,
-        text: budgetProposal(envelope.content.proposal.text),
-      },
+  const input = {
+    schema: "daio.llm.review_input.v1",
+    task: "review",
+    request: {
+      status: envelope.request.status,
     },
+    reviewer: envelope.reviewer,
+    persona: readEnvPersona("review") ?? null,
   };
-  return buildPromptCacheMessages(buildSystemPrompt(REVIEW_INSTRUCTION, "review"), JSON.stringify(safe));
+  return buildPromptCacheMessages(buildSystemPrompt(REVIEW_INSTRUCTION, buildSharedContext(envelope)), JSON.stringify(input));
 }
 
 export function buildAuditMessages(envelope: AuditEnvelope): ChatMessage[] {
-  const safe = {
-    ...envelope,
-    content: {
-      ...envelope.content,
-      proposal: {
-        ...envelope.content.proposal,
-        text: budgetProposal(envelope.content.proposal.text),
-      },
-      targets: envelope.content.targets.map((t) => ({
-        ...t,
-        report: budgetTargetReport(t.report),
-      })),
+  const input = {
+    schema: "daio.llm.audit_input.v1",
+    task: "audit",
+    request: {
+      status: envelope.request.status,
     },
+    auditor: envelope.auditor,
+    persona: readEnvPersona("audit") ?? null,
+    targets: envelope.content.targets.map((t) => ({
+      ...t,
+      report: budgetTargetReport(t.report),
+    })),
   };
-  return buildPromptCacheMessages(buildSystemPrompt(AUDIT_INSTRUCTION, "audit"), JSON.stringify(safe));
+  return buildPromptCacheMessages(buildSystemPrompt(AUDIT_INSTRUCTION, buildSharedContext(envelope)), JSON.stringify(input));
 }

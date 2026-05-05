@@ -389,6 +389,8 @@ Per-agent chain/LLM fields:
 | `CONTENT_SERVICE_URL` | yes | overridden to `http://content-service:18002` by bundled compose |
 | `OPENAI_API_KEY` or `LLM_BASE_URL` | yes | OpenAI API key, or an OpenAI-compatible base URL chosen by this operator |
 | `OPENAI_MODEL` or `LLM_MODEL` | yes | GPT/OpenAI-compatible model name |
+| `OPENAI_PROMPT_CACHE_KEY` | optional | override prompt cache routing key; defaults to a derived key from the shared prompt prefix |
+| `OPENAI_PROMPT_CACHE_RETENTION` | optional | OpenAI prompt cache retention policy, `in_memory` or `24h` |
 | `LLM_TIMEOUT_MS` | yes | use a high enough value for long documents |
 | `LLM_MAX_TOKENS` | yes | response token budget |
 | `LLM_PROPOSAL_CHAR_BUDGET` | yes | document budget before prompt construction |

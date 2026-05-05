@@ -283,7 +283,9 @@ export async function runReview(
     log: (msg) => log(`review: ${msg}`),
   });
   const llmLatencyMs = Date.now() - t0;
-  log(`review: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, attempts=${llmAttempts})`);
+  log(
+    `review: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, cachedPrompt=${llm.promptCachedTokens ?? 0}, attempts=${llmAttempts})`,
+  );
   const afterLlmSkipReason = await reviewCommitSkipReason(
     deps,
     requestId,
@@ -320,6 +322,7 @@ export async function runReview(
     reportURI: stored.uri,
     summary: parsed.report.summary,
     promptTokens: llm.promptTokens,
+    promptCachedTokens: llm.promptCachedTokens,
     completionTokens: llm.completionTokens,
     totalTokens: llm.totalTokens,
     llmLatencyMs,

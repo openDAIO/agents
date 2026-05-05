@@ -15,6 +15,8 @@ export interface ChatOptions {
   maxTokens?: number;
   temperature?: number;
   reasoningEffort?: string | null;
+  promptCacheKey?: string | null;
+  promptCacheRetention?: string | null;
   responseFormatJson?: boolean;
   responseCache?: boolean;
   responseCacheTtlSeconds?: number;
@@ -25,6 +27,7 @@ export interface ChatOptions {
 export interface ChatResult {
   content: string;
   promptTokens?: number;
+  promptCachedTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
   cached?: boolean;
@@ -60,6 +63,7 @@ const DEFAULT_LLM_RETRY_BASE_MS = 1_000;
 const DEFAULT_LLM_RETRY_MAX_MS = 8_000;
 const DEFAULT_LOCAL_LLM_MODEL = "gpt-oss-120b";
 const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
+const PROMPT_CACHE_RETENTION_VALUES = new Set(["in_memory", "24h"]);
 let responseCacheDb: Database.Database | undefined;
 let responseCacheDbPathValue: string | undefined;
 
@@ -341,6 +345,42 @@ function chatHeaders(): Record<string, string> {
   return headers;
 }
 
+function derivedPromptCacheKey(model: string, messages: ChatMessage[]): string {
+  const promptCacheMessages = assertPromptCacheMessages(messages);
+  const digest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({
+      schema: "daio.openai.prompt-cache-key.v1",
+      model,
+      systemPrefix: promptCacheMessages[0]!.content,
+    }))
+    .digest("hex")
+    .slice(0, 32);
+  return `daio-${digest}`;
+}
+
+function configuredPromptCacheKey(model: string, messages: ChatMessage[], options: ChatOptions): string | undefined {
+  if (options.promptCacheKey !== undefined) {
+    const value = options.promptCacheKey?.trim();
+    return value || undefined;
+  }
+  const explicit = firstConfiguredEnv("OPENAI_PROMPT_CACHE_KEY", "LLM_PROMPT_CACHE_KEY");
+  return explicit ?? derivedPromptCacheKey(model, messages);
+}
+
+function configuredPromptCacheRetention(options: ChatOptions): string | undefined {
+  const raw =
+    options.promptCacheRetention !== undefined
+      ? options.promptCacheRetention
+      : firstConfiguredEnv("OPENAI_PROMPT_CACHE_RETENTION", "LLM_PROMPT_CACHE_RETENTION");
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (!PROMPT_CACHE_RETENTION_VALUES.has(value)) {
+    throw new Error("prompt cache retention must be one of: in_memory, 24h");
+  }
+  return value;
+}
+
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
   const baseUrl = configuredBaseUrl(options);
   const model = configuredModelName(options);
@@ -375,6 +415,12 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
     options.reasoningEffort !== undefined ? options.reasoningEffort : process.env.LLM_REASONING_EFFORT ?? "low";
   if (typeof reasoningEffort === "string" && reasoningEffort.trim() !== "") {
     body.reasoning_effort = reasoningEffort;
+  }
+  if (useOpenAiChatCompletions) {
+    const promptCacheKey = configuredPromptCacheKey(model, promptCacheMessages, options);
+    if (promptCacheKey) body.prompt_cache_key = promptCacheKey;
+    const promptCacheRetention = configuredPromptCacheRetention(options);
+    if (promptCacheRetention) body.prompt_cache_retention = promptCacheRetention;
   }
 
   const cacheEnabled = options.responseCache !== false;
@@ -412,7 +458,12 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   }
   const json = (await res.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
-    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    usage?: {
+      prompt_tokens?: number;
+      prompt_tokens_details?: { cached_tokens?: number };
+      completion_tokens?: number;
+      total_tokens?: number;
+    };
   };
   const content = json.choices?.[0]?.message?.content;
   if (typeof content !== "string" || content.length === 0) {
@@ -421,6 +472,7 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   const result = {
     content,
     promptTokens: json.usage?.prompt_tokens,
+    promptCachedTokens: json.usage?.prompt_tokens_details?.cached_tokens,
     completionTokens: json.usage?.completion_tokens,
     totalTokens: json.usage?.total_tokens,
   };

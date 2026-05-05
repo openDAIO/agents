@@ -335,6 +335,9 @@ OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.4-mini-2026-03-17
 # Optional proxy/gateway override. Defaults to https://api.openai.com/v1 when OPENAI_API_KEY is set.
 # OPENAI_BASE_URL=https://api.openai.com/v1
+# Optional override. By default the runtime derives a stable key from the shared prompt prefix.
+# OPENAI_PROMPT_CACHE_KEY=
+OPENAI_PROMPT_CACHE_RETENTION=24h
 LLM_BASE_URL=
 LLM_MODEL=
 LLM_TIMEOUT_MS=120000
@@ -576,7 +579,11 @@ prefers `OPENAI_MODEL`. If no OpenAI key is configured, it falls back to
 `LLM_BASE_URL` and `LLM_MODEL` for local or compatible endpoints. The client
 requests JSON mode, uses `max_completion_tokens` for OpenAI and `max_tokens` for
 compatible endpoints, and keeps `reasoning_effort=low` by default so final JSON
-has room in the completion budget.
+has room in the completion budget. For OpenAI calls, the client also sends a
+stable `prompt_cache_key` derived from the shared system prompt prefix and uses
+`OPENAI_PROMPT_CACHE_RETENTION` when set; the bundled env examples set it to
+`24h`. OpenAI cache hits are surfaced as `promptCachedTokens` in immediate usage
+objects and in agent LLM completion status payloads.
 
 ### VRF and sortition
 

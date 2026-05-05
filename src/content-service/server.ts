@@ -936,9 +936,15 @@ function buildRequestFinalReportMessages(input: {
   );
 }
 
-function usageFromLlm(llm: { promptTokens?: number | null; completionTokens?: number | null; totalTokens?: number | null }) {
+function usageFromLlm(llm: {
+  promptTokens?: number | null;
+  promptCachedTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+}) {
   return {
     promptTokens: llm.promptTokens ?? 0,
+    promptCachedTokens: llm.promptCachedTokens ?? 0,
     completionTokens: llm.completionTokens ?? 0,
     totalTokens: llm.totalTokens ?? 0,
   };
@@ -1286,6 +1292,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       model: row.model,
       usage: {
         promptTokens: row.promptTokens ?? 0,
+        promptCachedTokens: 0,
         completionTokens: row.completionTokens ?? 0,
         totalTokens: row.totalTokens ?? 0,
       },
@@ -1302,6 +1309,7 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
       model: row.model,
       usage: {
         promptTokens: row.promptTokens ?? 0,
+        promptCachedTokens: 0,
         completionTokens: row.completionTokens ?? 0,
         totalTokens: row.totalTokens ?? 0,
       },

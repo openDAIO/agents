@@ -28,7 +28,10 @@ export interface AgentConfig {
   finalityFactor: bigint;
   reviewElectionDifficulty: bigint;
   auditElectionDifficulty: bigint;
+  reviewCommitQuorum: bigint;
+  auditCommitQuorum: bigint;
   auditTargetLimit: bigint;
+  participationEnabled?: boolean;
   autoStartRequests?: boolean;
   eventPollIntervalMs?: number;
   eventLookbackBlocks?: number;
@@ -235,6 +238,9 @@ export class ReviewerAgent {
     this.log(
       `started; watching events pollIntervalMs=${eventPollIntervalMs} finalityConfirmations=${this.cfg.eventFinalityConfirmations ?? txFinalityConfirmationsFromEnv()}`,
     );
+    if (this.cfg.participationEnabled === false) {
+      this.log("participation disabled; review/audit commits will be skipped");
+    }
     this.scheduleActiveRefill("startup");
     this.scheduleKeeperReconcile();
   }
@@ -579,6 +585,8 @@ export class ReviewerAgent {
       finalityFactor: this.cfg.finalityFactor,
       reviewElectionDifficulty: this.cfg.reviewElectionDifficulty,
       auditElectionDifficulty: this.cfg.auditElectionDifficulty,
+      reviewCommitQuorum: this.cfg.reviewCommitQuorum,
+      auditCommitQuorum: this.cfg.auditCommitQuorum,
       auditTargetLimit: this.cfg.auditTargetLimit,
       reviewCommitTimeoutMs: fallbackPhaseTimeoutMs,
       reviewRevealTimeoutMs: fallbackPhaseTimeoutMs,
@@ -616,11 +624,11 @@ export class ReviewerAgent {
     const summary = runtimeConfigSummary(resolved.config);
     if (resolved.source === "contract-storage") {
       this.log(
-        `request ${requestId} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
+        `request ${requestId} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} reviewCommitQuorum=${summary.reviewCommitQuorum} auditCommitQuorum=${summary.auditCommitQuorum} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
       );
     } else {
       this.log(
-        `request ${requestId} config fallback finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}; read failed: ${resolved.error ?? "unknown"}`,
+        `request ${requestId} config fallback finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} reviewCommitQuorum=${summary.reviewCommitQuorum} auditCommitQuorum=${summary.auditCommitQuorum} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}; read failed: ${resolved.error ?? "unknown"}`,
       );
     }
     return resolved.config;
@@ -642,7 +650,7 @@ export class ReviewerAgent {
       const summary = runtimeConfigSummary(resolved.config);
       if (resolved.source === "contract-storage") {
         this.log(
-          `tier ${name} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
+          `tier ${name} config from contract storage finality=${summary.finalityFactor} reviewDiff=${summary.reviewElectionDifficulty} auditDiff=${summary.auditElectionDifficulty} reviewCommitQuorum=${summary.reviewCommitQuorum} auditCommitQuorum=${summary.auditCommitQuorum} auditTargetLimit=${summary.auditTargetLimit} reviewCommitTimeoutMs=${summary.reviewCommitTimeoutMs} auditCommitTimeoutMs=${summary.auditCommitTimeoutMs}`,
         );
       } else {
         this.log(`tier ${name} config fallback; storage read failed: ${resolved.error ?? "unknown"}`);
@@ -697,6 +705,8 @@ export class ReviewerAgent {
               documentWaitMs,
               phaseTimeoutMs: runtimeConfig.reviewCommitTimeoutMs,
               minCommitTimeRemainingMs: this.minCommitTimeRemainingMs(),
+              commitQuorum: runtimeConfig.reviewCommitQuorum,
+              participationEnabled: this.cfg.participationEnabled !== false,
             },
           );
           if (!res.committed) {
@@ -758,6 +768,8 @@ export class ReviewerAgent {
               documentWaitMs,
               phaseTimeoutMs: runtimeConfig.auditCommitTimeoutMs,
               minCommitTimeRemainingMs: this.minCommitTimeRemainingMs(),
+              commitQuorum: runtimeConfig.auditCommitQuorum,
+              participationEnabled: this.cfg.participationEnabled !== false,
             },
           );
           if (!res.committed) {

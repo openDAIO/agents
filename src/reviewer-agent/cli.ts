@@ -34,7 +34,11 @@ async function main() {
       "tx-finality-confirmations": { type: "string" },
       "review-election-difficulty": { type: "string" },
       "audit-election-difficulty": { type: "string" },
+      "review-commit-quorum": { type: "string" },
+      "audit-commit-quorum": { type: "string" },
       "audit-target-limit": { type: "string" },
+      "participation-enabled": { type: "boolean" },
+      "disable-participation": { type: "boolean" },
       "auto-start-requests": { type: "boolean" },
       "disable-auto-start-requests": { type: "boolean" },
       "keeper-enabled": { type: "boolean" },
@@ -220,18 +224,35 @@ async function main() {
     reviewElectionDifficulty: bigintSetting(
       values["review-election-difficulty"] as string | undefined,
       "DAIO_REVIEW_ELECTION_DIFFICULTY",
-      8000n,
+      10000n,
     ),
     auditElectionDifficulty: bigintSetting(
       values["audit-election-difficulty"] as string | undefined,
       "DAIO_AUDIT_ELECTION_DIFFICULTY",
       10000n,
     ),
+    reviewCommitQuorum: bigintSetting(
+      values["review-commit-quorum"] as string | undefined,
+      "DAIO_REVIEW_COMMIT_QUORUM",
+      3n,
+    ),
+    auditCommitQuorum: bigintSetting(
+      values["audit-commit-quorum"] as string | undefined,
+      "DAIO_AUDIT_COMMIT_QUORUM",
+      3n,
+    ),
     auditTargetLimit: bigintSetting(
       values["audit-target-limit"] as string | undefined,
       "DAIO_AUDIT_TARGET_LIMIT",
       2n,
     ),
+    participationEnabled: values["disable-participation"]
+      ? false
+      : booleanSetting(
+          values["participation-enabled"] as boolean | undefined,
+          "DAIO_AGENT_PARTICIPATION_ENABLED",
+          true,
+        ),
     autoStartRequests,
     eventPollIntervalMs: integerSetting(
       values["event-poll-interval-ms"] as string | undefined,

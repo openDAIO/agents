@@ -132,6 +132,7 @@ export async function preScreenCommittee(input: PreScreenInput): Promise<PreScre
   const reviewCache = new Map<string, boolean>();
 
   const reviewPass = async (idx: number, req: (typeof requests)[number]): Promise<boolean> => {
+    if (input.reviewElectionDifficulty >= SCALE) return true;
     const addr = wallets[idx]!.address;
     const key = `${req.requestId}|${req.reviewPhaseStartBlock}|${req.committeeEpoch}|${addr}`;
     if (reviewCache.has(key)) return reviewCache.get(key)!;

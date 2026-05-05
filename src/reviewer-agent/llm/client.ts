@@ -14,10 +14,12 @@ export interface ChatOptions {
   timeoutMs?: number;
   maxTokens?: number;
   temperature?: number;
+  reasoningEffort?: string | null;
   responseFormatJson?: boolean;
   responseCache?: boolean;
   responseCacheTtlSeconds?: number;
   responseCacheMaxEntries?: number;
+  validateContent?: (content: string) => void;
 }
 
 export interface ChatResult {
@@ -26,6 +28,21 @@ export interface ChatResult {
   completionTokens?: number;
   totalTokens?: number;
   cached?: boolean;
+}
+
+export interface ChatJsonRetryOptions<T> extends ChatOptions {
+  parse: (raw: unknown) => T;
+  maxAttempts?: number;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  log?: (msg: string) => void;
+}
+
+export interface ChatJsonRetryResult<T> {
+  llm: ChatResult;
+  data: T;
+  attempts: number;
+  retryErrors: string[];
 }
 
 interface ResponseCacheRow {
@@ -38,6 +55,9 @@ interface ResponseCacheRow {
 
 const DEFAULT_RESPONSE_CACHE_TTL_SECONDS = 0;
 const DEFAULT_RESPONSE_CACHE_MAX_ENTRIES = 4096;
+const DEFAULT_LLM_RETRY_ATTEMPTS = 3;
+const DEFAULT_LLM_RETRY_BASE_MS = 1_000;
+const DEFAULT_LLM_RETRY_MAX_MS = 8_000;
 let responseCacheDb: Database.Database | undefined;
 let responseCacheDbPathValue: string | undefined;
 
@@ -168,6 +188,10 @@ function getCachedResponse(key: string, ttlSeconds: number): ChatResult | undefi
   };
 }
 
+function deleteCachedResponse(key: string): void {
+  getResponseCacheDb().prepare("DELETE FROM llm_response_cache WHERE cache_key = ?").run(key);
+}
+
 function pruneResponseCache(maxEntries: number, ttlSeconds: number): void {
   const db = getResponseCacheDb();
   if (maxEntries <= 0) {
@@ -237,6 +261,42 @@ function responseCacheKey(input: {
     .digest("hex");
 }
 
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function retryableChatError(err: unknown): boolean {
+  const message = formatError(err);
+  return (
+    !message.includes("LLM_BASE_URL not configured") &&
+    !message.includes("prompt-cache format requires exactly two messages")
+  );
+}
+
+function retryIntegerEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryMessages(messages: ChatMessage[], reason: string): ChatMessage[] {
+  const promptCacheMessages = assertPromptCacheMessages(messages);
+  const system = promptCacheMessages[0]!;
+  const user = promptCacheMessages[1]!;
+  const safeReason = reason.replace(/\s+/g, " ").slice(0, 500);
+  return buildPromptCacheMessages(
+    system.content,
+    `${user.content}\n\nRetry instruction: the previous LLM response was rejected (${safeReason}). Return ONLY valid JSON in the message content. Do not put the JSON in reasoning_content, tool_calls, markdown fences, or prose.`,
+  );
+}
+
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
   const baseUrl = options.baseUrl ?? process.env.LLM_BASE_URL;
   const model = options.model ?? process.env.LLM_MODEL ?? "gpt-oss-120b";
@@ -262,9 +322,13 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
     body.response_format = { type: "json_object" };
   }
   // gpt-oss models emit reasoning_content before content; "low" effort keeps the
-  // CoT short so the JSON output fits within max_tokens.
-  const reasoningEffort = process.env.LLM_REASONING_EFFORT ?? "low";
-  if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+  // CoT short so the JSON output fits within max_tokens. Retry callers may set an
+  // empty override to omit the field when a server returns reasoning_content only.
+  const reasoningEffort =
+    options.reasoningEffort !== undefined ? options.reasoningEffort : process.env.LLM_REASONING_EFFORT ?? "low";
+  if (typeof reasoningEffort === "string" && reasoningEffort.trim() !== "") {
+    body.reasoning_effort = reasoningEffort;
+  }
 
   const cacheEnabled = options.responseCache !== false;
   const cacheTtlSeconds = responseCacheTtlSeconds(options);
@@ -272,7 +336,14 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
   const cacheKey = responseCacheKey({ baseUrl: normalizedBaseUrl, body });
   if (cacheEnabled && cacheMaxEntries > 0) {
     const cached = getCachedResponse(cacheKey, cacheTtlSeconds);
-    if (cached) return cached;
+    if (cached) {
+      try {
+        options.validateContent?.(cached.content);
+        return cached;
+      } catch (_err) {
+        deleteCachedResponse(cacheKey);
+      }
+    }
   }
 
   const ac = new AbortController();
@@ -306,8 +377,53 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
     completionTokens: json.usage?.completion_tokens,
     totalTokens: json.usage?.total_tokens,
   };
+  options.validateContent?.(content);
   if (cacheEnabled) setCachedResponse(cacheKey, result, cacheMaxEntries, cacheTtlSeconds);
   return result;
+}
+
+export async function chatJsonWithRetry<T>(
+  messages: ChatMessage[],
+  options: ChatJsonRetryOptions<T>,
+): Promise<ChatJsonRetryResult<T>> {
+  const maxAttempts = options.maxAttempts ?? retryIntegerEnv("LLM_RETRY_ATTEMPTS", DEFAULT_LLM_RETRY_ATTEMPTS, 1);
+  const retryBaseMs = options.retryBaseMs ?? retryIntegerEnv("LLM_RETRY_BASE_MS", DEFAULT_LLM_RETRY_BASE_MS, 0);
+  const retryMaxMs = options.retryMaxMs ?? retryIntegerEnv("LLM_RETRY_MAX_MS", DEFAULT_LLM_RETRY_MAX_MS, 0);
+  const retryErrors: string[] = [];
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let parsed: T | undefined;
+    const validateContent = (content: string): void => {
+      parsed = options.parse(extractJson(content));
+    };
+    const { parse, maxAttempts: _maxAttempts, retryBaseMs: _retryBaseMs, retryMaxMs: _retryMaxMs, log: _log, ...chatOptions } =
+      options;
+    try {
+      const llm = await chat(attempt === 1 ? messages : retryMessages(messages, formatError(lastErr)), {
+        ...chatOptions,
+        validateContent,
+        reasoningEffort:
+          attempt > 1 && chatOptions.reasoningEffort === undefined ? "" : chatOptions.reasoningEffort,
+      });
+      return {
+        llm,
+        data: parsed ?? parse(extractJson(llm.content)),
+        attempts: attempt,
+        retryErrors,
+      };
+    } catch (err) {
+      lastErr = err;
+      const message = formatError(err);
+      retryErrors.push(message);
+      if (attempt >= maxAttempts || !retryableChatError(err)) break;
+      const backoffMs =
+        retryMaxMs === 0 ? retryBaseMs * attempt : Math.min(retryMaxMs, retryBaseMs * attempt);
+      options.log?.(`LLM response rejected on attempt ${attempt}/${maxAttempts}: ${message}; retrying in ${backoffMs}ms`);
+      if (backoffMs > 0) await delay(backoffMs);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(formatError(lastErr));
 }
 
 export function extractJson(raw: string): unknown {

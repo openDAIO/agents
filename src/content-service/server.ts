@@ -19,7 +19,12 @@ import {
   waitForTransactionWithRetries,
   withRpcReadRetries,
 } from "../shared/rpc.js";
-import { buildPromptCacheMessages, chat, extractJson, type ChatMessage } from "../reviewer-agent/llm/client.js";
+import {
+  buildPromptCacheMessages,
+  chat,
+  chatJsonWithRetry,
+  type ChatMessage,
+} from "../reviewer-agent/llm/client.js";
 import { budgetProposal } from "../reviewer-agent/llm/prepareInput.js";
 
 export interface ServerOptions {
@@ -1263,8 +1268,12 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     data: z.output<T>;
     llm: Awaited<ReturnType<typeof chat>>;
   }> {
-    const llm = await chat(messages, { responseFormatJson: true });
-    return { llm, data: schema.parse(extractJson(llm.content)) };
+    const { llm, data } = await chatJsonWithRetry(messages, {
+      responseFormatJson: true,
+      parse: (raw) => schema.parse(raw),
+      log: (msg) => app.log.warn({ msg }, "agent context LLM retry"),
+    });
+    return { llm, data };
   }
 
   function serializeAgentScoreReport(row: NonNullable<ReturnType<ContentDB["getAgentScoreReport"]>>, cached: boolean) {

@@ -162,7 +162,7 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       FAST,
       tierConfig({
-        reviewElectionDifficulty: 8000,
+        reviewElectionDifficulty: 10000,
         auditElectionDifficulty: 10000,
         reviewCommitQuorum: 3,
         reviewRevealQuorum: 3,
@@ -210,12 +210,12 @@ export async function deployAll(input: DeployInput): Promise<DeploymentSnapshot>
     await c.setTierConfig(
       CRITICAL,
       tierConfig({
-        reviewCommitQuorum: 5,
-        reviewRevealQuorum: 5,
-        auditCommitQuorum: 5,
-        auditRevealQuorum: 5,
-        auditTargetLimit: 4,
-        minIncomingAudit: 4,
+        reviewCommitQuorum: 4,
+        reviewRevealQuorum: 4,
+        auditCommitQuorum: 4,
+        auditRevealQuorum: 4,
+        auditTargetLimit: 3,
+        minIncomingAudit: 3,
         auditCoverageQuorum: 10000,
         contributionThreshold: 2000,
         reviewEpochSize: 100,

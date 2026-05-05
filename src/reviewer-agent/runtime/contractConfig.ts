@@ -6,6 +6,8 @@ export interface RuntimeConfig {
   finalityFactor: bigint;
   reviewElectionDifficulty: bigint;
   auditElectionDifficulty: bigint;
+  reviewCommitQuorum: bigint;
+  auditCommitQuorum: bigint;
   auditTargetLimit: bigint;
   reviewCommitTimeoutMs: number;
   reviewRevealTimeoutMs: number;
@@ -47,6 +49,8 @@ function decodeRuntimeConfigWords(word0: bigint, word1: bigint): RuntimeConfig {
   return {
     reviewElectionDifficulty: word0 & UINT16_MASK,
     auditElectionDifficulty: (word0 >> 16n) & UINT16_MASK,
+    reviewCommitQuorum: (word0 >> 32n) & UINT16_MASK,
+    auditCommitQuorum: (word0 >> 64n) & UINT16_MASK,
     auditTargetLimit: (word0 >> 96n) & UINT16_MASK,
     finalityFactor: (word0 >> 192n) & UINT16_MASK,
     reviewCommitTimeoutMs: uint32Ms(word1, 80n),
@@ -106,6 +110,8 @@ export function runtimeConfigSummary(config: RuntimeConfig): Record<string, stri
     finalityFactor: config.finalityFactor.toString(),
     reviewElectionDifficulty: config.reviewElectionDifficulty.toString(),
     auditElectionDifficulty: config.auditElectionDifficulty.toString(),
+    reviewCommitQuorum: config.reviewCommitQuorum.toString(),
+    auditCommitQuorum: config.auditCommitQuorum.toString(),
     auditTargetLimit: config.auditTargetLimit.toString(),
     reviewCommitTimeoutMs: config.reviewCommitTimeoutMs.toString(),
     reviewRevealTimeoutMs: config.reviewRevealTimeoutMs.toString(),

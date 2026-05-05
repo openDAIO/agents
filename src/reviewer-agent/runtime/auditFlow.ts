@@ -6,7 +6,7 @@ import type { CoreEventStream } from "../chain/events.js";
 import { RequestStatus } from "../../shared/types.js";
 import { readReviewerMetadata } from "../chain/reviewerMetadata.js";
 import { buildAuditMessages } from "../llm/prompts.js";
-import { chat, extractJson } from "../llm/client.js";
+import { chatJsonWithRetry } from "../llm/client.js";
 import { parseAudit } from "../llm/validate.js";
 import type { AuditArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
@@ -45,6 +45,8 @@ export interface PhaseWorkOptions {
   documentWaitMs?: number;
   phaseTimeoutMs?: number;
   minCommitTimeRemainingMs?: number;
+  commitQuorum?: bigint;
+  participationEnabled?: boolean;
 }
 
 async function hasAuditCommitWindow(
@@ -72,6 +74,33 @@ async function hasAuditCommitWindow(
   }
 }
 
+function participantsInclude(participants: readonly string[], address: string): boolean {
+  const normalized = getAddress(address);
+  return participants.some((addr) => getAddress(addr) === normalized);
+}
+
+function quorumReached(participants: readonly string[], quorum: bigint | undefined): boolean {
+  return quorum !== undefined && quorum > 0n && BigInt(participants.length) >= quorum;
+}
+
+async function auditCommitSkipReason(
+  deps: AuditFlowDeps,
+  requestId: bigint,
+  attempt: bigint,
+  commitQuorum: bigint | undefined,
+  stage: string,
+): Promise<string | undefined> {
+  const participants = (await deps.handles.commitReveal.getAuditParticipants(requestId, attempt)) as readonly string[];
+  if (participantsInclude(participants, deps.wallet.address)) return "already_committed_onchain";
+  if (quorumReached(participants, commitQuorum)) {
+    deps.log(
+      `audit: quorum already full ${stage} request=${requestId} participants=${participants.length}/${commitQuorum!.toString()}`,
+    );
+    return "audit_quorum_full";
+  }
+  return undefined;
+}
+
 export async function runAudit(
   deps: AuditFlowDeps,
   requestId: bigint,
@@ -86,6 +115,9 @@ export async function runAudit(
 
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.AuditCommit);
   if (startBlock === undefined) return { committed: false, reason: "no audit phase start block" };
+  if (options.participationEnabled === false) {
+    return { committed: false, reason: "participation_disabled" };
+  }
 
   const existing = state.load(requestId.toString());
   if (existing?.audit?.commitTx && existing.audit.accepted !== false) {
@@ -112,10 +144,14 @@ export async function runAudit(
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
   const attempt = BigInt(lifecycle[4] as bigint | number);
   const auditEpoch = BigInt(lifecycle[6] as bigint | number);
-  const existingParticipants = (await handles.commitReveal.getAuditParticipants(requestId, attempt)) as readonly string[];
-  if (existingParticipants.some((addr) => getAddress(addr) === getAddress(wallet.address))) {
-    return { committed: false, reason: "already_committed_onchain" };
-  }
+  const earlySkipReason = await auditCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "before target loading",
+  );
+  if (earlySkipReason) return { committed: false, reason: earlySkipReason };
   void auditEpoch;
   void finalityFactor;
   const selectedTargets = candidateTargets;
@@ -182,6 +218,14 @@ export async function runAudit(
   if (!(await hasAuditCommitWindow(deps, requestId, startBlock, options))) {
     return { committed: false, reason: "too_late_for_commit" };
   }
+  const beforeLlmSkipReason = await auditCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "before LLM",
+  );
+  if (beforeLlmSkipReason) return { committed: false, reason: beforeLlmSkipReason };
 
   const reviewerMetadata = await readReviewerMetadata(handles, wallet.address);
 
@@ -219,14 +263,26 @@ export async function runAudit(
   });
 
   const t0 = Date.now();
-  const llm = await chat(messages, { responseFormatJson: true });
-  const llmLatencyMs = Date.now() - t0;
-  log(`audit: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens)`);
-  const parsed = parseAudit(extractJson(llm.content), {
-    requestId: requestId.toString(),
-    auditor: wallet.address,
-    targets: selectedTargets,
+  const { llm, data: parsed, attempts: llmAttempts } = await chatJsonWithRetry(messages, {
+    responseFormatJson: true,
+    parse: (raw) =>
+      parseAudit(raw, {
+        requestId: requestId.toString(),
+        auditor: wallet.address,
+        targets: selectedTargets,
+      }),
+    log: (msg) => log(`audit: ${msg}`),
   });
+  const llmLatencyMs = Date.now() - t0;
+  log(`audit: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, attempts=${llmAttempts})`);
+  const afterLlmSkipReason = await auditCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "after LLM",
+  );
+  if (afterLlmSkipReason) return { committed: false, reason: afterLlmSkipReason };
 
   const targetsArr = parsed.targetEvaluations.map((e) => getAddress(e.targetReviewer));
   const scoresArr = parsed.targetEvaluations.map((e) => e.score);

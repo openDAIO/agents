@@ -3,11 +3,11 @@ import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } 
 import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
-import { REVIEW_SORTITION, RequestStatus } from "../../shared/types.js";
+import { REVIEW_SORTITION, RequestStatus, SCALE } from "../../shared/types.js";
 import { readReviewerMetadata } from "../chain/reviewerMetadata.js";
 import { sortitionPass } from "../chain/sortition.js";
 import { buildReviewMessages } from "../llm/prompts.js";
-import { chat, extractJson } from "../llm/client.js";
+import { chatJsonWithRetry } from "../llm/client.js";
 import { parseReview } from "../llm/validate.js";
 import type { ReviewArtifact } from "../../shared/schemas.js";
 import { canonicalHash } from "../../shared/canonical.js";
@@ -46,7 +46,11 @@ export interface PhaseWorkOptions {
   documentWaitMs?: number;
   phaseTimeoutMs?: number;
   minCommitTimeRemainingMs?: number;
+  commitQuorum?: bigint;
+  participationEnabled?: boolean;
 }
+
+const EMPTY_VRF_PROOF: [bigint, bigint, bigint, bigint] = [0n, 0n, 0n, 0n];
 
 async function hasReviewCommitWindow(
   deps: ReviewFlowDeps,
@@ -73,6 +77,33 @@ async function hasReviewCommitWindow(
   }
 }
 
+function participantsInclude(participants: readonly string[], address: string): boolean {
+  const normalized = getAddress(address);
+  return participants.some((addr) => getAddress(addr) === normalized);
+}
+
+function quorumReached(participants: readonly string[], quorum: bigint | undefined): boolean {
+  return quorum !== undefined && quorum > 0n && BigInt(participants.length) >= quorum;
+}
+
+async function reviewCommitSkipReason(
+  deps: ReviewFlowDeps,
+  requestId: bigint,
+  attempt: bigint,
+  commitQuorum: bigint | undefined,
+  stage: string,
+): Promise<string | undefined> {
+  const participants = (await deps.handles.commitReveal.getReviewParticipants(requestId, attempt)) as readonly string[];
+  if (participantsInclude(participants, deps.wallet.address)) return "already_committed_onchain";
+  if (quorumReached(participants, commitQuorum)) {
+    deps.log(
+      `review: quorum already full ${stage} request=${requestId} participants=${participants.length}/${commitQuorum!.toString()}`,
+    );
+    return "review_quorum_full";
+  }
+  return undefined;
+}
+
 export async function runReview(
   deps: ReviewFlowDeps,
   requestId: bigint,
@@ -84,6 +115,9 @@ export async function runReview(
   const startBlock = events.phaseStartBlock(requestId, RequestStatus.ReviewCommit);
   if (startBlock === undefined) {
     return { committed: false, reason: "no review phase start block" };
+  }
+  if (options.participationEnabled === false) {
+    return { committed: false, reason: "participation_disabled" };
   }
 
   const existing = state.load(requestId.toString());
@@ -139,42 +173,59 @@ export async function runReview(
   const lifecycle = await handles.core.getRequestLifecycle(requestId);
   const committeeEpoch = BigInt(lifecycle[5] as bigint | number);
   const attempt = BigInt(lifecycle[4] as bigint | number);
-  const existingParticipants = (await handles.commitReveal.getReviewParticipants(requestId, attempt)) as readonly string[];
-  if (existingParticipants.some((addr) => getAddress(addr) === getAddress(wallet.address))) {
-    return { committed: false, reason: "already_committed_onchain" };
-  }
+  const earlySkipReason = await reviewCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "before sortition",
+  );
+  if (earlySkipReason) return { committed: false, reason: earlySkipReason };
   const coreAddress = await handles.core.getAddress();
-  const proof = await vrf.proofFor({
-    coreAddress,
-    requestId,
-    phase: REVIEW_SORTITION,
-    epoch: committeeEpoch,
-    participant: wallet.address,
-    phaseStartBlock: BigInt(startBlock),
-    finalityFactor,
-  });
+  let proof = EMPTY_VRF_PROOF;
+  if (reviewElectionDifficulty >= SCALE) {
+    log(`review: sortition skipped for request ${requestId}; difficulty=${reviewElectionDifficulty.toString()}`);
+  } else {
+    proof = await vrf.proofFor({
+      coreAddress,
+      requestId,
+      phase: REVIEW_SORTITION,
+      epoch: committeeEpoch,
+      participant: wallet.address,
+      phaseStartBlock: BigInt(startBlock),
+      finalityFactor,
+    });
 
-  const passed = await sortitionPass({
-    vrfCoordinator: handles.vrfCoordinator,
-    coreAddress,
-    publicKey: vrf.publicKey,
-    proof,
-    requestId,
-    phase: REVIEW_SORTITION,
-    epoch: committeeEpoch,
-    participant: wallet.address,
-    phaseStartBlock: BigInt(startBlock),
-    finalityFactor,
-    difficulty: reviewElectionDifficulty,
-  });
-  if (!passed) {
-    log(`review: sortition NOT passed for request ${requestId}, skip`);
-    return { committed: false, reason: "sortition_fail" };
+    const passed = await sortitionPass({
+      vrfCoordinator: handles.vrfCoordinator,
+      coreAddress,
+      publicKey: vrf.publicKey,
+      proof,
+      requestId,
+      phase: REVIEW_SORTITION,
+      epoch: committeeEpoch,
+      participant: wallet.address,
+      phaseStartBlock: BigInt(startBlock),
+      finalityFactor,
+      difficulty: reviewElectionDifficulty,
+    });
+    if (!passed) {
+      log(`review: sortition NOT passed for request ${requestId}, skip`);
+      return { committed: false, reason: "sortition_fail" };
+    }
   }
   if (!(await hasReviewCommitWindow(deps, requestId, startBlock, options))) {
     return { committed: false, reason: "too_late_for_commit" };
   }
-  log(`review: sortition passed; running review for request ${requestId}`);
+  const beforeLlmSkipReason = await reviewCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "before LLM",
+  );
+  if (beforeLlmSkipReason) return { committed: false, reason: beforeLlmSkipReason };
+  log(`review: sortition accepted; running review for request ${requestId}`);
 
   const proposal = document.proposal;
 
@@ -222,13 +273,25 @@ export async function runReview(
   });
 
   const t0 = Date.now();
-  const llm = await chat(messages, { responseFormatJson: true });
-  const llmLatencyMs = Date.now() - t0;
-  log(`review: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens)`);
-  const parsed = parseReview(extractJson(llm.content), {
-    requestId: requestId.toString(),
-    reviewer: wallet.address,
+  const { llm, data: parsed, attempts: llmAttempts } = await chatJsonWithRetry(messages, {
+    responseFormatJson: true,
+    parse: (raw) =>
+      parseReview(raw, {
+        requestId: requestId.toString(),
+        reviewer: wallet.address,
+      }),
+    log: (msg) => log(`review: ${msg}`),
   });
+  const llmLatencyMs = Date.now() - t0;
+  log(`review: LLM ok (${llmLatencyMs}ms, ${llm.totalTokens ?? "?"} tokens, attempts=${llmAttempts})`);
+  const afterLlmSkipReason = await reviewCommitSkipReason(
+    deps,
+    requestId,
+    attempt,
+    options.commitQuorum,
+    "after LLM",
+  );
+  if (afterLlmSkipReason) return { committed: false, reason: afterLlmSkipReason };
 
   const artifact: ReviewArtifact = {
     schema: "daio.review.artifact.v1",

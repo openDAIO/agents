@@ -1,8 +1,12 @@
 import cgi
+import hashlib
 import json
 import mimetypes
 import os
+import sqlite3
 import tempfile
+import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Tuple
@@ -18,7 +22,12 @@ except Exception:  # pragma: no cover - optional runtime helper
 HOST = os.environ.get("MARKITDOWN_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MARKITDOWN_PORT", "18003"))
 MAX_UPLOAD_BYTES = int(os.environ.get("MARKITDOWN_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-MARKITDOWN = MarkItDown(enable_plugins=os.environ.get("MARKITDOWN_ENABLE_PLUGINS", "false").lower() in {"1", "true", "yes", "on"})
+ENABLE_PLUGINS = os.environ.get("MARKITDOWN_ENABLE_PLUGINS", "false").lower() in {"1", "true", "yes", "on"}
+MARKITDOWN_CACHE_DB_PATH = os.environ.get("MARKITDOWN_CACHE_DB_PATH", "/app/data/markitdown-cache.sqlite")
+MARKITDOWN_CACHE_TTL_SECONDS = int(os.environ.get("MARKITDOWN_CACHE_TTL_SECONDS", "0"))
+MARKITDOWN_CACHE_MAX_ENTRIES = int(os.environ.get("MARKITDOWN_CACHE_MAX_ENTRIES", "4096"))
+MARKITDOWN = MarkItDown(enable_plugins=ENABLE_PLUGINS)
+CACHE_SCHEMA = "daio.markitdown.cache.v1"
 
 
 def env_setting(names: Tuple[str, ...], fallback: str) -> str:
@@ -61,6 +70,150 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: object)
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def cache_enabled() -> bool:
+    return MARKITDOWN_CACHE_MAX_ENTRIES > 0
+
+
+def cache_conn() -> sqlite3.Connection:
+    if MARKITDOWN_CACHE_DB_PATH != ":memory:":
+        Path(MARKITDOWN_CACHE_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(MARKITDOWN_CACHE_DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS markitdown_response_cache (
+          cache_key TEXT PRIMARY KEY,
+          markdown TEXT NOT NULL,
+          byte_count INTEGER NOT NULL,
+          webp_converted INTEGER NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          accessed_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_markitdown_response_cache_accessed_at "
+        "ON markitdown_response_cache(accessed_at_ms)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_markitdown_response_cache_created_at "
+        "ON markitdown_response_cache(created_at_ms)"
+    )
+    return conn
+
+
+def cache_key(raw: bytes, suffix: str, content_type: str) -> str:
+    body = {
+        "schema": CACHE_SCHEMA,
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "suffix": suffix.lower(),
+        "content_type": content_type.split(";")[0].strip().lower(),
+        "enable_plugins": ENABLE_PLUGINS,
+        "webp_supported": Image is not None,
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def get_cached_response(key: str) -> dict[str, object] | None:
+    if not cache_enabled():
+        return None
+    try:
+        with closing(cache_conn()) as conn:
+            row = conn.execute(
+                """
+                SELECT markdown, byte_count, webp_converted, created_at_ms
+                FROM markitdown_response_cache
+                WHERE cache_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            markdown, byte_count, webp_converted, created_at_ms = row
+            if MARKITDOWN_CACHE_TTL_SECONDS > 0 and now_ms() - int(created_at_ms) >= MARKITDOWN_CACHE_TTL_SECONDS * 1000:
+                conn.execute("DELETE FROM markitdown_response_cache WHERE cache_key = ?", (key,))
+                conn.commit()
+                return None
+            conn.execute(
+                "UPDATE markitdown_response_cache SET accessed_at_ms = ? WHERE cache_key = ?",
+                (now_ms(), key),
+            )
+            conn.commit()
+            return {
+                "markdown": markdown,
+                "bytes": int(byte_count),
+                "webpConverted": bool(webp_converted),
+            }
+    except Exception as exc:
+        print(f"[markitdown] cache read skipped: {exc}", flush=True)
+        return None
+
+
+def prune_cache(conn: sqlite3.Connection) -> None:
+    if MARKITDOWN_CACHE_MAX_ENTRIES <= 0:
+        conn.execute("DELETE FROM markitdown_response_cache")
+        return
+    if MARKITDOWN_CACHE_TTL_SECONDS > 0:
+        conn.execute(
+            "DELETE FROM markitdown_response_cache WHERE created_at_ms <= ?",
+            (now_ms() - MARKITDOWN_CACHE_TTL_SECONDS * 1000,),
+        )
+    row = conn.execute("SELECT COUNT(*) FROM markitdown_response_cache").fetchone()
+    count = int(row[0]) if row else 0
+    excess = count - MARKITDOWN_CACHE_MAX_ENTRIES
+    if excess <= 0:
+        return
+    conn.execute(
+        """
+        DELETE FROM markitdown_response_cache
+        WHERE cache_key IN (
+          SELECT cache_key
+          FROM markitdown_response_cache
+          ORDER BY accessed_at_ms ASC
+          LIMIT ?
+        )
+        """,
+        (excess,),
+    )
+
+
+def set_cached_response(key: str, markdown: str, byte_count: int, webp_converted: bool) -> None:
+    if not cache_enabled():
+        return
+    try:
+        with closing(cache_conn()) as conn:
+            timestamp = now_ms()
+            conn.execute(
+                """
+                INSERT INTO markitdown_response_cache (
+                  cache_key,
+                  markdown,
+                  byte_count,
+                  webp_converted,
+                  created_at_ms,
+                  accessed_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                  markdown = excluded.markdown,
+                  byte_count = excluded.byte_count,
+                  webp_converted = excluded.webp_converted,
+                  created_at_ms = excluded.created_at_ms,
+                  accessed_at_ms = excluded.accessed_at_ms
+                """,
+                (key, markdown, byte_count, int(webp_converted), timestamp, timestamp),
+            )
+            prune_cache(conn)
+            conn.commit()
+    except Exception as exc:
+        print(f"[markitdown] cache write skipped: {exc}", flush=True)
 
 
 def extension_for(filename: str, content_type: str | None) -> str:
@@ -155,6 +308,20 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
 
         suffix = extension_for(filename, content_type)
+        key = cache_key(raw, suffix, content_type)
+        cached = get_cached_response(key)
+        if cached is not None:
+            json_response(
+                self,
+                200,
+                {
+                    "filename": filename,
+                    **cached,
+                    "cached": True,
+                },
+            )
+            return
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         converted_path = None
         try:
@@ -163,6 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             input_path, converted = maybe_convert_webp(tmp.name)
             converted_path = input_path if converted else None
             result = MARKITDOWN.convert_local(input_path)
+            set_cached_response(key, result.markdown, len(raw), converted)
             json_response(
                 self,
                 200,
@@ -171,6 +339,7 @@ class Handler(BaseHTTPRequestHandler):
                     "markdown": result.markdown,
                     "bytes": len(raw),
                     "webpConverted": converted,
+                    "cached": False,
                 },
             )
         except Exception as exc:
@@ -186,5 +355,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"[markitdown] listening http://{HOST}:{PORT}", flush=True)
+    print(
+        f"[markitdown] listening http://{HOST}:{PORT} cacheDb={MARKITDOWN_CACHE_DB_PATH} "
+        f"cacheTtlSeconds={MARKITDOWN_CACHE_TTL_SECONDS} cacheMaxEntries={MARKITDOWN_CACHE_MAX_ENTRIES}",
+        flush=True,
+    )
     server.serve_forever()

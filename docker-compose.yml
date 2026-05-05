@@ -116,6 +116,9 @@ services:
       MARKITDOWN_PORT: "18003"
       MARKITDOWN_MAX_UPLOAD_BYTES: ${MARKITDOWN_MAX_UPLOAD_BYTES:-52428800}
       MARKITDOWN_ENABLE_PLUGINS: ${MARKITDOWN_ENABLE_PLUGINS:-false}
+      MARKITDOWN_CACHE_DB_PATH: ${MARKITDOWN_CACHE_DB_PATH:-/app/data/markitdown-cache.sqlite}
+      MARKITDOWN_CACHE_TTL_SECONDS: ${MARKITDOWN_CACHE_TTL_SECONDS:-0}
+      MARKITDOWN_CACHE_MAX_ENTRIES: ${MARKITDOWN_CACHE_MAX_ENTRIES:-4096}
       CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:-*}
       CORS_ALLOW_METHODS: ${CORS_ALLOW_METHODS:-GET,POST,OPTIONS}
       CORS_ALLOW_HEADERS: ${CORS_ALLOW_HEADERS:-Content-Type,Authorization,X-Requested-With,X-Filename}
@@ -124,6 +127,8 @@ services:
       CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
     ports:
       - "${MARKITDOWN_BIND:-127.0.0.1}:${MARKITDOWN_PORT:-18003}:18003"
+    volumes:
+      - ./.data:/app/data
     healthcheck:
       test: ["CMD-SHELL", "python - <<'PY'\nimport sys, urllib.request\ntry:\n    urllib.request.urlopen('http://127.0.0.1:18003/health', timeout=3)\nexcept Exception:\n    sys.exit(1)\nPY"]
       interval: 10s

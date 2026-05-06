@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } from "ethers";
+import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Provider, type Wallet } from "ethers";
 import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
@@ -20,7 +20,7 @@ import {
   RequestDocumentWaitAbortedError,
   waitForRequestDocument,
 } from "./document.js";
-import { waitForTransactionWithRetries } from "../../shared/rpc.js";
+import { txFeeOverridesFromEnv, waitForTransactionWithRetries } from "../../shared/rpc.js";
 import { phaseHasMinimumRemaining } from "./phaseTiming.js";
 
 export interface ReviewFlowDeps {
@@ -28,6 +28,7 @@ export interface ReviewFlowDeps {
   events: CoreEventStream;
   content: ContentServiceClient;
   state: StateStore;
+  provider: Provider;
   wallet: Wallet;
   txSigner: ContractRunner;
   vrf: VrfProofProvider;
@@ -368,7 +369,8 @@ export async function runReview(
     1_000_000n,
   );
   const receipt = await deps.txQueue(async () => {
-    const tx = await cr.commitReview(...commitArgs, { gasLimit });
+    const fees = await txFeeOverridesFromEnv(deps.provider);
+    const tx = await cr.commitReview(...commitArgs, { gasLimit, ...fees });
     return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
@@ -420,9 +422,10 @@ export async function runReviewReveal(
   ] as const;
   const gasLimit = await gasLimitWithHeadroom(cr.revealReview, args, "DAIO_REVIEW_REVEAL_GAS_FLOOR", 2_000_000n);
   const receipt = await deps.txQueue(async () => {
+    const fees = await txFeeOverridesFromEnv(deps.provider);
     const tx = await cr.revealReview(
       ...args,
-      { gasLimit },
+      { gasLimit, ...fees },
     );
     return waitForTransactionWithRetries(tx);
   });

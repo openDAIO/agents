@@ -2,14 +2,14 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { Interface, Wallet, getAddress, keccak256, toUtf8Bytes, type LogDescription } from "ethers";
+import { Interface, Wallet, getAddress, keccak256, toUtf8Bytes, type LogDescription, type Provider } from "ethers";
 import { ContentServiceClient } from "../shared/content-client.js";
 import { Artifacts } from "../shared/abis.js";
 import type { DeploymentSnapshot } from "../shared/types.js";
 import { RequestStatus } from "../shared/types.js";
 import { loadContracts } from "../reviewer-agent/chain/contracts.js";
 import { makeChainContext } from "../reviewer-agent/chain/provider.js";
-import { waitForTransactionWithRetries } from "../shared/rpc.js";
+import { txFeeOverridesFromEnv, waitForTransactionWithRetries } from "../shared/rpc.js";
 
 type Mode = "relayed" | "direct";
 
@@ -115,12 +115,14 @@ async function submitDirect(input: {
   const paymentRouter = getAddress(input.deployment.contracts.paymentRouter);
   const allowance = (await handles.usdaio.allowance(input.requester.address, paymentRouter)) as bigint;
   if (allowance < requiredUsdaio) {
-    const approveTx = await handles.usdaio.approve(paymentRouter, requiredUsdaio);
+    const fees = await txFeeOverridesFromEnv(input.requester.provider!);
+    const approveTx = await handles.usdaio.approve(paymentRouter, requiredUsdaio, fees);
     const approveReceipt = await waitForTransactionWithRetries(approveTx);
     if (!approveReceipt || approveReceipt.status !== 1) throw new Error(`USDAIO approve failed: ${approveTx.hash}`);
     process.stdout.write(`[live-e2e] approved USDAIO tx=${approveReceipt.hash}\n`);
   }
 
+  const fees = await txFeeOverridesFromEnv(input.requester.provider!);
   const tx = await handles.paymentRouter.createRequestWithUSDAIO(
     proposalURI,
     proposalHash,
@@ -128,6 +130,7 @@ async function submitDirect(input: {
     input.domainMask,
     input.tier,
     input.priorityFee,
+    fees,
   );
   const receipt = await waitForTransactionWithRetries(tx);
   if (!receipt || receipt.status !== 1) throw new Error(`direct request tx failed: ${tx.hash}`);
@@ -159,13 +162,14 @@ async function submitDirect(input: {
   return { requestId, txHash: receipt.hash };
 }
 
-async function maybeStartQueued(handles: ReturnType<typeof loadContracts>): Promise<string | undefined> {
+async function maybeStartQueued(handles: ReturnType<typeof loadContracts>, provider: Provider): Promise<string | undefined> {
   try {
     await handles.core.startNextRequest.staticCall();
   } catch (_err) {
     return undefined;
   }
-  const tx = await handles.core.startNextRequest();
+  const fees = await txFeeOverridesFromEnv(provider);
+  const tx = await handles.core.startNextRequest(fees);
   const receipt = await waitForTransactionWithRetries(tx);
   if (!receipt || receipt.status !== 1) throw new Error(`startNextRequest failed: ${tx.hash}`);
   return receipt.hash;
@@ -174,6 +178,7 @@ async function maybeStartQueued(handles: ReturnType<typeof loadContracts>): Prom
 async function waitFinalized(input: {
   handles: ReturnType<typeof loadContracts>;
   startHandles?: ReturnType<typeof loadContracts>;
+  provider: Provider;
   requestId: bigint;
   manualStart: boolean;
   timeoutMs: number;
@@ -190,7 +195,7 @@ async function waitFinalized(input: {
       throw new Error(`request ended as ${statusName}`);
     }
     if (status === RequestStatus.Queued && input.manualStart) {
-      const txHash = await maybeStartQueued(input.startHandles ?? input.handles);
+      const txHash = await maybeStartQueued(input.startHandles ?? input.handles, input.provider);
       if (txHash) process.stdout.write(`[live-e2e] manual startNextRequest tx=${txHash}\n`);
     }
     await delay(input.pollMs);
@@ -270,6 +275,7 @@ async function main(): Promise<void> {
   const lifecycle = await waitFinalized({
     handles,
     startHandles,
+    provider: ctx.provider,
     requestId: submitted.requestId,
     manualStart: Boolean(values["manual-start"]),
     timeoutMs,

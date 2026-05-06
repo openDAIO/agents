@@ -1,4 +1,4 @@
-import { FallbackProvider, JsonRpcProvider, type Provider, type TransactionReceipt } from "ethers";
+import { FallbackProvider, JsonRpcProvider, parseUnits, type Provider, type TransactionReceipt } from "ethers";
 
 const DEFAULT_TX_FINALITY_CONFIRMATIONS = 1;
 const DEFAULT_TX_FINALITY_WAIT_TIMEOUT_MS = 300_000;
@@ -14,6 +14,11 @@ export interface RpcFailoverOptions {
   readRetryBaseMs?: number;
   txWaitRetries?: number;
   txWaitRetryBaseMs?: number;
+}
+
+export interface TxFeeOverrides {
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
 }
 
 export function parseRpcUrls(primary?: string, alternates?: string): string[] {
@@ -53,6 +58,26 @@ function positiveInteger(value: number | undefined, fallback: number, min = 1): 
   return Math.floor(value);
 }
 
+function firstConfiguredEnv(env: NodeJS.ProcessEnv, names: readonly string[]): { name: string; value: string } | undefined {
+  for (const name of names) {
+    const value = env[name];
+    if (value !== undefined && value.trim() !== "") return { name, value: value.trim() };
+  }
+  return undefined;
+}
+
+function parseGweiEnv(env: NodeJS.ProcessEnv, names: readonly string[]): bigint | undefined {
+  const setting = firstConfiguredEnv(env, names);
+  if (!setting) return undefined;
+  try {
+    const value = parseUnits(setting.value, "gwei");
+    if (value < 0n) throw new Error("negative value");
+    return value;
+  } catch (_err) {
+    throw new Error(`${setting.name} must be a non-negative gwei value`);
+  }
+}
+
 export function txFinalityConfirmationsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return parseNonNegativeIntegerEnv(
     env,
@@ -67,6 +92,38 @@ export function txFinalityWaitTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.
     ["DAIO_TX_FINALITY_WAIT_TIMEOUT_MS"],
     DEFAULT_TX_FINALITY_WAIT_TIMEOUT_MS,
   );
+}
+
+export async function txFeeOverridesFromEnv(
+  provider: Provider,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<TxFeeOverrides> {
+  const configuredPriorityFee = parseGweiEnv(env, [
+    "DAIO_TX_PRIORITY_FEE_GWEI",
+    "DAIO_TX_MAX_PRIORITY_FEE_GWEI",
+  ]);
+  const configuredMaxFee = parseGweiEnv(env, ["DAIO_TX_MAX_FEE_GWEI"]);
+  if (configuredPriorityFee === undefined && configuredMaxFee === undefined) return {};
+
+  const [feeData, latestBlock] = await Promise.all([
+    provider.getFeeData(),
+    configuredMaxFee === undefined ? provider.getBlock("latest") : Promise.resolve(null),
+  ]);
+  const providerPriorityFee = feeData.maxPriorityFeePerGas ?? 0n;
+  const maxPriorityFeePerGas = configuredPriorityFee ?? providerPriorityFee;
+  let maxFeePerGas = configuredMaxFee;
+  if (maxFeePerGas === undefined) {
+    const inferredBaseFee =
+      feeData.maxFeePerGas !== null && feeData.maxFeePerGas > providerPriorityFee
+        ? feeData.maxFeePerGas - providerPriorityFee
+        : 0n;
+    const baseFeePerGas = latestBlock?.baseFeePerGas ?? inferredBaseFee;
+    maxFeePerGas = baseFeePerGas * 2n + maxPriorityFeePerGas;
+  }
+  if (maxFeePerGas < maxPriorityFeePerGas) {
+    throw new Error("DAIO_TX_MAX_FEE_GWEI must be greater than or equal to the priority fee");
+  }
+  return { maxFeePerGas, maxPriorityFeePerGas };
 }
 
 export function rpcFailoverOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): RpcFailoverOptions {

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Wallet } from "ethers";
+import { getAddress, keccak256, toUtf8Bytes, type ContractRunner, type Provider, type Wallet } from "ethers";
 import { ContentServiceClient, type RequestDocumentRecord } from "../../shared/content-client.js";
 import type { ContractHandles } from "../chain/contracts.js";
 import type { CoreEventStream } from "../chain/events.js";
@@ -19,7 +19,7 @@ import {
   RequestDocumentWaitAbortedError,
   waitForRequestDocument,
 } from "./document.js";
-import { waitForTransactionWithRetries } from "../../shared/rpc.js";
+import { txFeeOverridesFromEnv, waitForTransactionWithRetries } from "../../shared/rpc.js";
 import { phaseHasMinimumRemaining } from "./phaseTiming.js";
 
 export interface AuditFlowDeps {
@@ -27,6 +27,7 @@ export interface AuditFlowDeps {
   events: CoreEventStream;
   content: ContentServiceClient;
   state: StateStore;
+  provider: Provider;
   wallet: Wallet;
   txSigner: ContractRunner;
   vrf: VrfProofProvider;
@@ -359,7 +360,8 @@ export async function runAudit(
     1_500_000n,
   );
   const receipt = await deps.txQueue(async () => {
-    const tx = await cr.commitAudit(...commitArgs, { gasLimit });
+    const fees = await txFeeOverridesFromEnv(deps.provider);
+    const tx = await cr.commitAudit(...commitArgs, { gasLimit, ...fees });
     return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {
@@ -398,7 +400,8 @@ export async function runAuditReveal(
   const args = [requestId, cur.audit.targets, cur.audit.scores, BigInt(seed)] as const;
   const gasLimit = await gasLimitWithHeadroom(cr.revealAudit, args, "DAIO_AUDIT_REVEAL_GAS_FLOOR", 8_000_000n);
   const receipt = await deps.txQueue(async () => {
-    const tx = await cr.revealAudit(...args, { gasLimit });
+    const fees = await txFeeOverridesFromEnv(deps.provider);
+    const tx = await cr.revealAudit(...args, { gasLimit, ...fees });
     return waitForTransactionWithRetries(tx);
   });
   if (!receipt || receipt.status !== 1) {

@@ -10,6 +10,7 @@ import type { StateStore } from "./state.js";
 import type { Provider } from "ethers";
 import { SerialQueue } from "./serialQueue.js";
 import {
+  txFeeOverridesFromEnv,
   txFinalityConfirmationsFromEnv,
   waitForTransactionWithRetries,
   withRpcReadRetries,
@@ -421,7 +422,8 @@ export class ReviewerAgent {
             "DAIO_START_NEXT_REQUEST_GAS_FLOOR",
             300_000n,
           );
-          const tx = await core.startNextRequest({ gasLimit });
+          const fees = await txFeeOverridesFromEnv(this.provider);
+          const tx = await core.startNextRequest({ gasLimit, ...fees });
           return waitForTransactionWithRetries(tx);
         });
         if (receipt === undefined) break;
@@ -516,7 +518,8 @@ export class ReviewerAgent {
           "DAIO_SYNC_REQUEST_GAS_FLOOR",
           2_000_000n,
         );
-        const tx = await core.syncRequest(requestId, { gasLimit });
+        const fees = await txFeeOverridesFromEnv(this.provider);
+        const tx = await core.syncRequest(requestId, { gasLimit, ...fees });
         const receipt = await waitForTransactionWithRetries(tx);
         return { receipt, liveStatus: queuedLiveStatus, predictedStatus: queuedPredictedStatus };
       });
@@ -666,6 +669,7 @@ export class ReviewerAgent {
       events: this.events,
       content: this.content,
       state: this.state,
+      provider: this.provider,
       wallet: this.wallet,
       txSigner: this.agentTxSigner,
       vrf: this.cfg.vrf,

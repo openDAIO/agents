@@ -14,6 +14,7 @@ import {
   makeRpcProvider,
   parseRpcUrls,
   rpcFailoverOptionsFromEnv,
+  txFeeOverridesFromEnv,
   txFinalityConfirmationsFromEnv,
   waitForTransactionHashWithRetries,
   waitForTransactionWithRetries,
@@ -1581,8 +1582,10 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; db: Co
     } catch (err) {
       throw new Error(`relayed request preflight failed: ${formatError(err)}`);
     }
-    const send = async () =>
-      handles.paymentRouter.createRequestWithUSDAIOBySig(...args);
+    const send = async () => {
+      const fees = await txFeeOverridesFromEnv(chainProvider());
+      return handles.paymentRouter.createRequestWithUSDAIOBySig(...args, fees);
+    };
     let tx;
     try {
       tx = await send();

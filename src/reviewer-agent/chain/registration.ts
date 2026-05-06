@@ -1,6 +1,6 @@
 import { ZeroHash, namehash, NonceManager, type Wallet } from "ethers";
 import type { ContractHandles } from "./contracts.js";
-import { waitForTransactionWithRetries } from "../../shared/rpc.js";
+import { txFeeOverridesFromEnv, waitForTransactionWithRetries } from "../../shared/rpc.js";
 
 export interface RegisterParams {
   ensName: string;
@@ -44,6 +44,7 @@ export async function registerReviewerIfNeeded(
   wallet: Wallet,
   params: RegisterParams,
 ): Promise<RegisterResult> {
+  const fees = async () => wallet.provider ? txFeeOverridesFromEnv(wallet.provider) : {};
   const maxActiveRequests = BigInt((await handles.core.maxActiveRequests()) as bigint | number);
   const minStake = BigInt((await handles.reviewerRegistry.minStake()) as bigint | number);
   const desiredStake = params.stakeAmount ?? minStake * (maxActiveRequests > 0n ? maxActiveRequests : 1n);
@@ -76,12 +77,12 @@ export async function registerReviewerIfNeeded(
   const stakeVaultAddr = await handles.stakeVault.getAddress();
   const allowance = (await handles.usdaio.allowance(wallet.address, stakeVaultAddr)) as bigint;
   if (allowance < stakeDelta) {
-    const tx = await usdaio.approve(stakeVaultAddr, stakeDelta);
+    const tx = await usdaio.approve(stakeVaultAddr, stakeDelta, await fees());
     await waitForTransactionWithRetries(tx);
   }
 
   const registry = handles.reviewerRegistry.connect(managed);
-  const register = (identity: { ensName: string; ensNode: string; agentId: bigint }) =>
+  const register = async (identity: { ensName: string; ensNode: string; agentId: bigint }) =>
     registry.registerReviewer(
       identity.ensName,
       identity.ensNode,
@@ -89,6 +90,7 @@ export async function registerReviewerIfNeeded(
       params.domainMask,
       params.vrfPublicKey,
       stakeDelta,
+      await fees(),
     );
   try {
     const tx = await register(identity);

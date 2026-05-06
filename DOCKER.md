@@ -349,6 +349,8 @@ Content API fields:
 | `CONTENT_RELAYER_CONFIRMATIONS` | optional | confirmation wait count after relayer tx, default `1` |
 | `DAIO_TX_FINALITY_CONFIRMATIONS` | optional | tx/event finality confirmations before dependent reads/actions, default `1` |
 | `DAIO_TX_FINALITY_WAIT_TIMEOUT_MS` | optional | max wait for externally supplied tx hashes to reach finality, default `300000` |
+| `DAIO_TX_PRIORITY_FEE_GWEI` | optional | EIP-1559 priority fee override in gwei; `0.01` is a small Sepolia demo bump |
+| `DAIO_TX_MAX_FEE_GWEI` | optional | EIP-1559 max fee override in gwei; when blank, runtime uses `2 * baseFee + priorityFee` |
 | `CONTENT_REQUIRE_AGENT_SIGNATURES` | yes | keep `true`; requires reviewer wallet signatures on agent-written artifacts/status |
 
 MarkItDown fields:
@@ -399,6 +401,8 @@ Per-agent chain/LLM fields:
 | `LLM_RESPONSE_CACHE_MAX_ENTRIES` | optional | response cache size cap; default `4096`, evicts least-recently accessed entries |
 | `LLM_RESPONSE_CACHE_DB_PATH` | optional | SQLite response cache path; agents default under `AGENT_STATE_DIR`, content-service defaults under `/app/data` |
 | `DAIO_TX_FINALITY_CONFIRMATIONS` | optional | tx/event finality confirmations before LLM/cache-dependent work, default `1` |
+| `DAIO_TX_PRIORITY_FEE_GWEI` | optional | EIP-1559 priority fee override in gwei; `0.01` is a small Sepolia demo bump |
+| `DAIO_TX_MAX_FEE_GWEI` | optional | EIP-1559 max fee override in gwei; when blank, runtime uses `2 * baseFee + priorityFee` |
 
 Per-agent secret and identity fields:
 
